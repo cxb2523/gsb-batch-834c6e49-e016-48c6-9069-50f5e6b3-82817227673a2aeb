@@ -1,0 +1,20 @@
+{
+  "name": "Everything at the limits",
+  "design": "psp",
+  "background": {
+    "colors": ["#101010", "#202020", "#303030", "#404040", "#505050", "#606060", "#707070"],
+    "seconds": 4
+  },
+  "defaults": { "size": 9, "align": "left", "color": "#FFFFFF" },
+  "areas": [
+    { "rect": [4, 4, 100, 30], "lines": [["title"], ["artist"], ["album"], ["track"], ["playlist"]] },
+    { "rect": [4, 40, 100, 30], "lines": [["title", " / ", "artist", " / ", "album", " / ", "track", " / "]] },
+    { "rect": [4, 76, 100, 30], "lines": ["title"] },
+    { "rect": [4, 112, 100, 30], "lines": ["title"] },
+    { "rect": [4, 148, 100, 30], "lines": ["title"] },
+    { "rect": [4, 184, 100, 30], "lines": ["title"] },
+    { "rect": [4, 220, 100, 30], "lines": ["title"] },
+    { "rect": [4, 250, 100, 18], "lines": ["title"] },
+    { "rect": [4, 260, 100, 12], "lines": ["this ninth area must be ignored"] }
+  ]
+}

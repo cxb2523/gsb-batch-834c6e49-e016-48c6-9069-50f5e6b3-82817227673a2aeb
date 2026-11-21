@@ -1,0 +1,14 @@
+{
+  "name": "Step background, four colours",
+  "design": "psp",
+  "background": {
+    "colors": ["#FF0000", "#00FF00", "#0000FF", "#FFFF00"],
+    "seconds": 10,
+    "blend": "step",
+    "while": "always"
+  },
+  "defaults": { "size": 12, "color": "#FFFFFF" },
+  "areas": [
+    { "rect": [40, 40, 400, 24], "lines": ["title"] }
+  ]
+}

@@ -411,6 +411,7 @@ figcaption { font-size: 0.88rem; color: var(--muted); margin-bottom: 16px; }
       <li><a href="#folder">The skin folder</a></li>
       <li><a href="#example">A complete example</a></li>
       <li><a href="#top">Top level</a></li>
+      <li><a href="#design">Design and screen size</a></li>
       <li><a href="#background">background</a></li>
       <li><a href="#areas">areas</a></li>
       <li><a href="#lines">lines and fields</a></li>
@@ -435,10 +436,10 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
     skin.json                <span class="c">optional: the label and background</span>
     hub.png                  <span class="c">optional: this skin's own hub</span></pre></div>
       <p>The picture is the PNG named after the folder. Failing that, TRAX uses <code>skin.png</code>, and failing that, the only other picture in the folder.</p>
-      <p><strong>Draw it at the screen's own size,</strong> so it is shown pixel for pixel: <strong>480 × 272</strong> for a PSP, <strong>960 × 544</strong> for a Vita. Any other size is stretched to fit.</p>
-      <div class="note"><strong>A skin is drawn for one machine, not both.</strong> Every number in <code>skin.json</code> is a screen pixel, so the same file cannot serve two screens of different sizes — a PSP's label geometry lands in the top-left quarter of a Vita. Making a skin for both means two folders, with the Vita's picture at twice the size and every position in its <code>skin.json</code> doubled.</div>
+      <p><strong>Draw it at one screen's size and say which.</strong> A skin declares the screen its <code>skin.json</code> was drawn for, with the <a href="#design"><code>design</code></a> key — <strong>480 × 272</strong> for a PSP, <strong>960 × 544</strong> for a Vita. On the screen it was drawn for it is shown pixel for pixel; on the other, the picture and every number in <code>skin.json</code> are scaled to the screen together. One folder, one file, both machines.</p>
+      <div class="note"><strong>A skin without a <code>design</code> key is a PSP skin.</strong> That is what every skin written before this key existed is, so old folders keep working unchanged. If the picture is not the same size as the declared design it is stretched to the design, then to the screen.</div>
       <p>The picture is drawn over the turning reels. Wherever it's transparent, the reels, the tape and the <a href="#background">background</a> show through.</p>
-      <p>All positions in <code>skin.json</code> are screen pixels, measured from the top-left corner of the picture — so they are in that machine's pixels, whichever machine the skin is for.</p>
+      <p>All positions in <code>skin.json</code> are pixels in the <em>design's</em> coordinate space, measured from its top-left corner. See <a href="#design">Design and screen size</a> for how they reach a screen of a different size.</p>
     </section>
 
     <section id="example">
@@ -446,6 +447,7 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
       <p>This is the file that ships with the Maxell XLII 90 skin, with the defaults written out:</p>
       <div class="tree-wrap"><pre class="json">{
   <span class="k">"name"</span>: <span class="s">"Maxell XLII 90"</span>,
+  <span class="k">"design"</span>: <span class="s">"psp"</span>,
 
   <span class="k">"background"</span>: {
     <span class="k">"colors"</span>: [<span class="s">"#1B0B3A"</span>, <span class="s">"#0B3A5C"</span>, <span class="s">"#0B5C3A"</span>],
@@ -474,7 +476,7 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
           <div class="tag">rect [91, 31, 263, 22]</div>
           <div class="area">Technique: New Order</div>
         </div>
-        <figcaption>The area above, drawn on the screen: across the top of the cassette, where this skin prints its title. The album and artist are centered in it, with the colon between them.</figcaption>
+        <figcaption>The area above, drawn on the screen: across the top of the cassette, where this skin prints its title. The album and artist are centered in it, with the colon between them. Because <code>design</code> is <code>"psp"</code>, the same file on a Vita puts this area at <code>[182, 62, 526, 44]</code>, <code>size</code> 22 — the same label across the same fraction of the screen.</figcaption>
       </figure>
     </section>
 
@@ -485,11 +487,45 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
         <thead><tr><th scope="col">Key</th><th scope="col">Type</th><th scope="col">Meaning</th></tr></thead>
         <tbody>
           <tr><td><code>name</code></td><td class="t">string</td><td>The skin's name. Reserved for now: the name TRAX shows when you switch skins comes from the folder.</td></tr>
+          <tr><td><code>design</code></td><td class="t">string or [width, height]</td><td>The screen this skin was drawn for: <code>"psp"</code> (480 × 272), <code>"vita"</code> (960 × 544), or an explicit size. Left out, the skin is a PSP skin. See <a href="#design">design and screen size</a>.</td></tr>
           <tr><td><code>background</code></td><td class="t">color or object</td><td>What shows behind the cassette. See <a href="#background">background</a>.</td></tr>
           <tr><td><code>defaults</code></td><td class="t">object</td><td><code>size</code>, <code>align</code> and <code>color</code> for every area that doesn't set its own. Any <code>rect</code> or <code>lines</code> here is ignored.</td></tr>
           <tr><td><code>areas</code></td><td class="t">array</td><td>Where text is printed, and what. See <a href="#areas">areas</a>.</td></tr>
         </tbody>
       </table></div>
+    </section>
+
+    <section id="design">
+      <h2>Design and screen size</h2>
+      <p>A skin is drawn against one screen, and <code>design</code> names it:</p>
+      <div class="table-wrap"><table class="ref">
+        <thead><tr><th scope="col">Value</th><th scope="col">The coordinate space</th></tr></thead>
+        <tbody>
+          <tr><td><code>"psp"</code></td><td>480 × 272. The default when <code>design</code> is absent.</td></tr>
+          <tr><td><code>"vita"</code></td><td>960 × 544.</td></tr>
+          <tr><td><code>[width, height]</code></td><td>Any canvas you like, between 1 and 16384 on a side. Useful for an artwork drawn at, say, 640 × 360.</td></tr>
+        </tbody>
+      </table></div>
+      <p>Anything else is read as <code>"psp"</code>, as if the key were not there.</p>
+
+      <p>On a screen of the design's own size, every number is used as written. On a screen of another size, three things are scaled to it and nothing else changes:</p>
+      <ul>
+        <li><strong>Every <code>rect</code></strong> — x, y, width and height — by the screen's width and height over the design's.</li>
+        <li><strong>Every <code>size</code></strong>, and the two-pixel gap between lines, by the ratio of the heights. Type stays in proportion to the area that holds it.</li>
+        <li><strong>The picture</strong>, from the design's size to the screen's.</li>
+      </ul>
+      <p>Each converted value is rounded to a whole pixel. Between a PSP and a Vita the ratio is exactly 2 or exactly ½, so nothing drifts: a label at <code>[91, 31, 263, 22]</code> with <code>size</code> 11 is at <code>[182, 62, 526, 44]</code> with size 22 on a Vita, and a centred line stays centred.</p>
+
+      <h3>What is not scaled</h3>
+      <ul>
+        <li><strong>Colours</strong>, <code>align</code>, the <a href="#lines">field names</a> and the rule for <a href="#lines">missing information</a>.</li>
+        <li><strong>The limits</strong> — 8 areas, 4 lines, 6 pieces a line, 6 colours — which apply to what you wrote, before conversion.</li>
+        <li><strong>How text is fitted</strong>: still three 12% steps and then "...", measured against the converted width at the converted size.</li>
+      </ul>
+
+      <h3>Running off the screen</h3>
+      <p>A converted area that leaves the screen is cut back to its edge; the line keeps the position the design gave it and whatever is past the edge is cropped rather than slid inward. An area with no width or no height — written that way, or rounded to nothing because its design was tiny — is skipped and prints nothing. So is one that lies entirely outside the screen. This is what keeps a design that fills its own canvas correct at either size.</p>
+      <div class="note"><strong>Text is fitted to the area, not the screen.</strong> An area 300 design pixels wide becomes 600 on a Vita, and a line that fitted at size 11 fits at 22 — the same look at twice the pixels. An area that already ran to the screen's edge will, doubled, run past it and be cropped, which is the correct result for a design that filled its canvas.</div>
     </section>
 
     <section id="background">
@@ -507,7 +543,7 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
           <tr><td><code>while</code></td><td class="t"><code>"playing"</code> or <code>"always"</code></td><td class="t"><code>"playing"</code></td><td>With <code>playing</code>, the first color shows whenever the music is paused or stopped. With <code>always</code>, the color it had reached stays.</td></tr>
         </tbody>
       </table></div>
-      <div class="note"><strong>The cycle follows the track, not a clock.</strong> It's timed by the playing position, so it starts again with each track, and scrubbing moves it forward or back with the music.</div>
+      <div class="note"><strong>The cycle follows the track, not a clock.</strong> It's timed by the playing position, so it starts again with each track, and scrubbing moves it forward or back with the music. A pause freezes the position rather than letting the cycle run on: with <code>playing</code> the first color comes back until the music does, and with <code>always</code> the color stops where the track is. Because nothing is timed while the tape deck is off screen, coming back to it shows the color the music has reached and never one left behind by an earlier track.</div>
     </section>
 
     <section id="areas">
@@ -516,9 +552,9 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
       <div class="table-wrap"><table class="ref">
         <thead><tr><th scope="col">Key</th><th scope="col">Type</th><th scope="col">Default</th><th scope="col">Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>rect</code></td><td class="t">[x, y, width, height]</td><td class="t">required</td><td>The area, in screen pixels. An area running off the screen is cut back to its edge. One with no width or height is skipped.</td></tr>
+          <tr><td><code>rect</code></td><td class="t">[x, y, width, height]</td><td class="t">required</td><td>The area, in <a href="#design">design</a> pixels. An area running off the screen is cut back to its edge. One with no width or height is skipped.</td></tr>
           <tr><td><code>lines</code></td><td class="t">array</td><td class="t">none</td><td>The lines of text, top to bottom. Up to 4. See <a href="#lines">lines and fields</a>.</td></tr>
-          <tr><td><code>size</code></td><td class="t">number</td><td class="t"><code>14</code></td><td>The height of the text, in pixels.</td></tr>
+          <tr><td><code>size</code></td><td class="t">number</td><td class="t"><code>14</code></td><td>The height of the text, in design pixels. It, and the two-pixel gap between lines, scale with the screen.</td></tr>
           <tr><td><code>align</code></td><td class="t"><code>"left"</code>, <code>"center"</code> or <code>"right"</code></td><td class="t"><code>"left"</code></td><td>Where each line sits across the area. Anything else means left.</td></tr>
           <tr><td><code>color</code></td><td class="t">color</td><td class="t">chosen</td><td>The text color. Leave it out and TRAX picks dark or light text to suit the picture. See <a href="#color">Colors</a>.</td></tr>
         </tbody>
@@ -543,7 +579,7 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
       <div class="tree-wrap"><pre class="json"><span class="k">"lines"</span>: [ <span class="s">"title"</span>, [<span class="s">"artist"</span>, <span class="s">" — "</span>, <span class="s">"album"</span>] ]</pre></div>
 
       <h3>Missing information</h3>
-      <p>A field the track has nothing for is left out, and so is any text that was only there to separate it. Text between two fields is kept only when both of them have something. Text before or after all the fields is kept only when the field beside it has something.</p>
+      <p>A field the track has nothing for is left out, and so is any text that was only there to separate it. Text between two fields is kept only when both of them have something; text before or after all the fields is kept only when the field beside it has something. A line made only of text, with no field in it at all, is printed as written — there is no missing field to depend on.</p>
       <ul>
         <li><code>["album", ": ", "artist"]</code> with no artist prints just the album, without the colon.</li>
         <li><code>["Side A · ", "title"]</code> with no title prints nothing.</li>
@@ -554,8 +590,8 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
     <section id="fit">
       <h2>How text is fitted</h2>
       <ul>
-        <li><strong>Placement:</strong> the lines are stacked as a block in the middle of the area, top to bottom, each <code>size</code> + 2 pixels below the last.</li>
-        <li><strong>Too wide:</strong> a line that doesn't fit is first made smaller, up to three times, each step 12% smaller, to about two-thirds of <code>size</code>. If it still doesn't fit, it's cut short with "...".</li>
+        <li><strong>Placement:</strong> the lines are stacked as a block in the middle of the area, top to bottom, each <code>size</code> + 2 pixels below the last. Both scale with the screen: on a Vita the gap is four pixels.</li>
+        <li><strong>Too wide:</strong> a line that doesn't fit is first made smaller, up to three times, each step 12% smaller, to about two-thirds of <code>size</code>. If it still doesn't fit, it's cut short with "...". "Doesn't fit" is measured against the area after <a href="#design">conversion</a>, so a line that fitted on a PSP fits, at twice the size, on a Vita.</li>
         <li><strong>Font:</strong> the text uses the PSP's own system font, as the rest of TRAX does. Accented, Japanese and Korean names all print.</li>
       </ul>
     </section>
@@ -581,15 +617,19 @@ ux0:/data/trax/SKINS/      <span class="c">a Vita</span>
         </tbody>
       </table></div>
       <p>If the file isn't valid JSON, the skin still loads, but with no text and a black background.</p>
+      <p>The limits all count what you wrote, before any <a href="#design">conversion</a>: eight areas are eight areas on either screen, and a declared canvas is a coordinate space rather than a second set of limits. The reference implementation in <code>tools/skincheck</code> checks the converted result still obeys every one of them.</p>
     </section>
 
     <section id="testing">
       <h2>Testing a skin</h2>
       <ul>
-        <li>TRAX reads <code>skin.json</code> each time a skin is chosen. After copying a changed file to the memory stick, press <span class="key face" aria-label="Up"><svg><use href="#g-up"/></svg></span> or <span class="key face" aria-label="Down"><svg><use href="#g-down"/></svg></span> in the Tape deck to move to another skin and back.</li>
+        <li>TRAX reads <code>skin.json</code> each time a skin is chosen. After copying a changed file to the memory stick, press <span class="key face" aria-label="Up"><svg><use href="#g-up"/></svg></span> or <span class="key face" aria-label="Down"><svg><use href="#g-down"/></svg></span> in the Tape deck to move to another skin and back. A file that has become unreadable, or gone over a limit, comes back as no text and black background rather than an error; switching again once it is fixed brings it straight back.</li>
+        <li>Try the same skin on both screens. It declares one <code>design</code>, and the other machine shows the same label at its own size.</li>
         <li>Try a track with no album or artist tags, to check the label still reads well when fields drop out.</li>
         <li>Try a long title, to check it shrinks and is cut short neatly within its area.</li>
+        <li>Scrub the progress bar while the tape deck is open: the background should move with the music, not with the clock.</li>
         <li>Check the JSON with any validator first. A stray comma after the last item turns off all of the skin's text.</li>
+        <li><strong>Off the machine:</strong> <code>tools/skincheck</code> is a small, dependency-free reference in Node that reads the same files. <code>node tools/skincheck/cli.js my-skin.json --screen vita --ascii</code> shows where the areas land at either size; <code>npm test</code> checks the limits, the fitting rules and the background timing against the samples in <code>samples/</code>.</li>
       </ul>
     </section>
   </main>

@@ -1,0 +1,16 @@
+{
+  "name": "trax-skincheck",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local reference checks for the TRAX cassette skin format: cross-screen conversion and playback-driven background.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test tools/skincheck/test/skincheck.test.js",
+    "verify": "node tools/skincheck/verify-all.js",
+    "report": "node tools/skincheck/report.js",
+    "png": "node tools/skincheck/make-png.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

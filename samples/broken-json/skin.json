@@ -1,0 +1,8 @@
+{
+  "name": "Maxell XLII 90 — broken on purpose",
+  "design": "psp",
+  "background": { "colors": ["#1B0B3A", "#0B3A5C"] },
+  "areas": [
+    { "rect": [91, 31, 263, 22], "lines": [["album", ": ", "artist"]] },
+  ]
+}

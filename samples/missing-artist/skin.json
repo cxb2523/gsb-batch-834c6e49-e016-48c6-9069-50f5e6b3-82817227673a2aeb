@@ -1,0 +1,22 @@
+{
+  "name": "Missing artist",
+  "design": "psp",
+  "background": {
+    "colors": ["#0A0A14", "#141428"],
+    "seconds": 5,
+    "blend": "fade",
+    "while": "playing"
+  },
+  "defaults": { "size": 13, "color": "#E8EDF1" },
+  "areas": [
+    {
+      "rect": [60, 30, 360, 24],
+      "align": "center",
+      "lines": [
+        ["album", ": ", "artist"],
+        ["Side A · ", "title"],
+        ["artist", " — ", "album"]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "name": "PSP label",
+  "design": "psp",
+
+  "background": {
+    "colors": ["#1B0B3A", "#0B3A5C", "#0B5C3A"],
+    "seconds": 6,
+    "blend": "fade",
+    "while": "playing"
+  },
+
+  "defaults": { "size": 14, "align": "left", "color": "#000000" },
+
+  "areas": [
+    {
+      "rect": [91, 31, 263, 22],
+      "size": 11,
+      "align": "center",
+      "lines": [["album", ": ", "artist"]]
+    },
+    {
+      "rect": [91, 58, 263, 16],
+      "size": 12,
+      "align": "center",
+      "lines": ["title"]
+    },
+    {
+      "rect": [400, 240, 70, 22],
+      "size": 12,
+      "align": "right",
+      "lines": ["track"]
+    }
+  ]
+}

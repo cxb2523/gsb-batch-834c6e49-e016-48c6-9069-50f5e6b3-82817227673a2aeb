@@ -1,0 +1,31 @@
+{
+  "name": "Vita label",
+  "design": "vita",
+
+  "background": {
+    "colors": ["#12233A", "#3A1220", "#123A2A", "#2A2A10"],
+    "seconds": 8,
+    "blend": "fade",
+    "while": "always"
+  },
+
+  "defaults": { "size": 18, "align": "center", "color": "#101010" },
+
+  "areas": [
+    {
+      "rect": [124, 36, 712, 44],
+      "size": 22,
+      "lines": [["album", ": ", "artist"]]
+    },
+    {
+      "rect": [124, 88, 712, 40],
+      "size": 26,
+      "lines": ["title"]
+    },
+    {
+      "rect": [124, 136, 712, 60],
+      "size": 16,
+      "lines": [["artist", " · ", "album"], ["playlist", " · ", "track"]]
+    }
+  ]
+}

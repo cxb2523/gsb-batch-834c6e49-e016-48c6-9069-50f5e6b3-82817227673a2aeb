@@ -62,8 +62,10 @@ meters, an orb, a starfield, ribbons, glowing balls, LED bars, spectrum rays, a
 waveform, a ring, a waterfall, and the words where the track has them.
 
 **Cassette skins in JSON.** The shell, the label, the little window — rebuild a
-tape you actually owned. Each machine gets its own artwork, drawn at its own
-size.
+tape you actually owned. A skin says which screen it was drawn for, so the same
+one serves the PSP and the Vita: the other machine scales the label and the text
+to its own size. The background drifts between colours with the track's playing
+position, not the clock.
 
 **A ten-band equalizer.** 31 Hz to 16 kHz, each band one octave wide and ±12 dB,
 adjustable while the music keeps playing.
@@ -127,6 +129,23 @@ Any card size. Mostly tested with a 64 GB microSD adapter.
 
 The manual, the release notes and the cassette skin format also ship inside
 every release, so they work with no network.
+
+## Checking a skin
+
+`SKINS.html` is the format; `tools/skincheck` is a small, dependency-free
+reference that reads the same files and shows what they mean — on either
+screen, and through a track change, pause or scrub. It needs only Node 18+:
+
+```sh
+node tools/skincheck/cli.js samples/psp-label/skin.json --screen vita --ascii
+node tools/skincheck/cli.js samples/psp-label/skin.json --timeline
+npm test                    # the rules, the limits, and every sample
+```
+
+`samples/REPORT.md` collects the worked examples: a PSP design at Vita size, a
+track with no artist, an over-long title, and the background's colour under
+each of those changes. The sample folders are complete skins — a PNG and a
+`skin.json` — and can be copied straight into `SKINS` on the machine.
 
 ---
 

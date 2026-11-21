@@ -440,7 +440,7 @@ uma0:/MUSIC       <span class="c">the other card, where one is mounted</span></p
       <ul>
         <li><strong>No helper module, and none needed.</strong> The volume keys and the screen are the Vita's own business, and this machine has no ♪ button.</li>
         <li><strong>Lyrics work over Wi-Fi</strong> with nothing extra installed.</li>
-        <li><strong>Skins are drawn for this screen.</strong> A Vita skin is 960x544, and its <code>skin.json</code> names pixels on a screen that size. See <a href="#skins">Cassette skins</a>.</li>
+        <li><strong>Skins travel between the two.</strong> A skin is drawn for one screen &mdash; 480x272 or 960x544 &mdash; and its <code>skin.json</code> says which. The other machine scales the picture, the positions and the text together, so a PSP skin opens a label across the whole Vita screen instead of in one corner. See <a href="#skins">Cassette skins</a>.</li>
         <li><strong>ATRAC3plus plays here too,</strong> through the Vita's own codec module.</li>
         <li><strong>A card taken out may be noticed.</strong> When it is, TRAX empties the list and the gallery and says which folder has gone, and putting the card back brings everything back with nothing pressed. It is unfinished, and the reason is a Vita rather than TRAX: the console keeps answering for a card that has left the slot — the folder still exists, still lists what it used to hold, and will even hand over a file's contents. The only signal that ever changes is the listing going empty, and it does not always change. Moving around the list or the gallery finds out for certain.</li>
       </ul>
@@ -675,8 +675,8 @@ uma0:/MUSIC       <span class="c">the other card, where one is mounted</span></p
     Maxell XLII 90.png       <span class="c">the picture: named after the folder, or skin.png</span>
     skin.json                <span class="c">optional: where to print the title, and colors</span>
     hub.png                  <span class="c">optional: this skin's own hub</span></pre></div>
-      <p>Where the picture is transparent, the turning reels and tape show through. A skin without <code>skin.json</code> shows no text. In the Tape deck, <span class="key face"><svg><use href="#g-up"/></svg></span> <span class="key face"><svg><use href="#g-down"/></svg></span> step through the skins, and TRAX remembers the one you pick.</p>
-      <div class="note"><strong>A skin is drawn for one screen.</strong> The positions in <code>skin.json</code> are pixels, so a PSP&#x27;s skin is 480x272 and a Vita&#x27;s is 960x544, and one file cannot serve both. The skins that ship are made for the machine they ship with; <code>SKINS.html</code> has the format.</div>
+      <p>Where the picture is transparent, the turning reels and tape show through. A skin without <code>skin.json</code> shows no text. In the Tape deck, <span class="key face"><svg><use href="#g-up"/></svg></span> <span class="key face"><svg><use href="#g-down"/></svg></span> step through the skins, and TRAX remembers the one you pick. Each press reads that skin&#x27;s <code>skin.json</code> again, so an edit on the card shows up by stepping away and back.</p>
+      <div class="note"><strong>One skin, both screens.</strong> A skin&#x27;s <code>skin.json</code> says which screen it was drawn for &mdash; <code>&quot;psp&quot;</code> for 480x272, <code>&quot;vita&quot;</code> for 960x544, or the PSP screen if it says nothing. On the screen it was drawn for it is shown as written; on the other machine the picture, the text positions and the text sizes are scaled together, so the label lands where the design put it rather than in a corner. <code>SKINS.html</code> has the format, and a reference checker in the release reads a skin file off the machine.</div>
     </section>
 
     <section id="server">

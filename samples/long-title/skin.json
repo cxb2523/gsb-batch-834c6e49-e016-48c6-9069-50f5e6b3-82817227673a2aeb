@@ -1,0 +1,23 @@
+{
+  "name": "Long title",
+  "design": "psp",
+  "background": "#101820",
+  "defaults": { "size": 14, "color": "#F0F0F0" },
+  "areas": [
+    {
+      "rect": [40, 40, 400, 24],
+      "size": 14,
+      "lines": ["title"]
+    },
+    {
+      "rect": [40, 90, 120, 24],
+      "size": 14,
+      "lines": ["title"]
+    },
+    {
+      "rect": [40, 140, 400, 60],
+      "size": 14,
+      "lines": ["title", ["artist", " — ", "album"], "playlist"]
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "Edges: clipping and a zero-height area",
+  "design": "psp",
+  "background": "#0B3A5C",
+  "defaults": { "size": 12, "color": "#F0F0F0" },
+  "areas": [
+    { "rect": [400, 10, 200, 20], "align": "right", "lines": ["runs off the right edge"] },
+    { "rect": [-40, 120, 120, 20], "lines": ["starts off the left edge"] },
+    { "rect": [20, 240, 200, 50], "lines": ["runs off the bottom edge"] },
+    { "rect": [20, 150, 200, 0], "lines": ["zero height, must be skipped"] },
+    { "rect": [20, 180, 0, 20], "lines": ["zero width, must be skipped"] },
+    { "rect": [900, 400, 50, 20], "lines": ["entirely off-screen, must be skipped"] }
+  ]
+}
