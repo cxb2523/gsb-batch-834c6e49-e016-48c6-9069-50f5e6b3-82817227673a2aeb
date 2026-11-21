@@ -6,6 +6,26 @@ All notable changes to Samovar Lite are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Switching subtitles mid-playback probes each file as UTF-8 first and only falls back to the
+  configured code page when that fails; the probed result is written back to the engine's
+  `sub-codepage` without touching the video track or the audio delay.
+- Main and secondary subtitles now have their own slots: switching one no longer drops the other
+  (a conflicting pick swaps the slots), and both slots are cleared on F4 and on file change, so
+  no subtitle path from the previous file is loaded into the next one.
+- Subtitle delay and visibility chosen by the user survive a subtitle switch; they still reset
+  on file change through `reset_on_next_file` (which now also resets the secondary subtitle).
+- Loading the same subtitle path twice is idempotent — the existing track is re-selected instead
+  of added again — and manual loads share the slot and encoding logic with auto-discovered files.
+- Subtitle load requests issued after playback was closed (or the engine shut down) are dropped
+  instead of being submitted to a dead engine.
+
+### Added
+
+- "Load Secondary Subtitle..." entry in the Subtitles menu, loading a file straight into the
+  secondary slot.
+
 ## [1.0.0] - 2026-10-09
 
 First public release.

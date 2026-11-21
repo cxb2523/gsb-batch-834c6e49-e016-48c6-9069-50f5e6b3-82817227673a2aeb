@@ -271,6 +271,8 @@ def build_main_menu(p) -> QMenu:
     for track in subs:
         tid = track.get("id")
         _add(sec, track_label(track), lambda tid=tid: p.set_secondary_sub(tid), checked=second == tid, group=group)
+    sec.addSeparator()
+    _add(sec, "Load Secondary Subtitle...", p.load_secondary_subtitle_dialog)
     sy = m.addMenu("Subtitle Sync")
     sy.setEnabled(has)
     _add(sy, "0.5 sec Faster", lambda: p.sub_delay(-0.5), ",")

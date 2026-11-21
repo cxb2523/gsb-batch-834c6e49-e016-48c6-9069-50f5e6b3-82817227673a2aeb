@@ -106,7 +106,7 @@ class Engine(QObject):
             "alang": settings["preferred_audio_lang"],
             "audio_display": "embedded-first",
             "reset_on_next_file": "sub-delay,audio-delay,video-zoom,video-pan-x,video-pan-y,"
-            "video-rotate,video-aspect-override,ab-loop-a,ab-loop-b",
+            "video-rotate,video-aspect-override,ab-loop-a,ab-loop-b,secondary-sid",
             "ytdl": True,
         }
         if settings["sub_font"]:

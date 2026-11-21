@@ -21,6 +21,7 @@ from .engine import Engine, VideoWidget
 from .menus import LANGS, build_main_menu, build_track_menu, track_label
 from .playlist import PlaylistPanel
 from .settings import Settings
+from .subs import probe_encoding
 from .util import (
     MEDIA_FILTER,
     PLAYLIST_EXT,
@@ -267,6 +268,11 @@ class Player(QWidget):
         self._gl_ready = False
         self._pending_open: list = []
         self._pending_subs: list[str] = []
+        # Each subtitle slot tracks the external file loaded into it, so a file change or F4 can
+        # forget it and a repeated load of the same path can be skipped instead of duplicated.
+        self._sub_slots: dict = {"main": None, "secondary": None}
+        self._pending_slot_selects: list = []  # (slot, path) waiting for the track to appear
+        self._codepage_setting = settings["sub_codepage"]
         self._autofit_pending = False
         self._resumed_at = None
         self._last_pos = 0.0
@@ -623,7 +629,7 @@ class Player(QWidget):
             if path:
                 self.settings.add_recent(path)
             for sub in self._pending_subs:
-                self.engine.cmd("sub-add", sub, "select")
+                self._load_sub_file(sub, "main")
             self._pending_subs = []
             self._update_title()
             self._update_logo()
@@ -668,6 +674,7 @@ class Player(QWidget):
         self.settings["mute"] = bool(value)
 
     def _p_tracks(self, value):
+        self._reconcile_sub_slots()
         self._update_logo()
         self._update_badges()
 
@@ -861,8 +868,8 @@ class Player(QWidget):
         if append:
             first = self.playlist.add(media)
             if not self.has_file():
-                self._pending_subs = subs
                 self.play_row(first)
+                self._pending_subs = subs
             else:
                 self.osd("Added %d file%s to the playlist" % (len(media), "" if len(media) == 1 else "s"))
             return
@@ -872,8 +879,8 @@ class Player(QWidget):
         else:
             group, row = media, 0
         self.playlist.set_items(group)
-        self._pending_subs = subs
         self.play_row(row)
+        self._pending_subs = subs
 
     def play_row(self, row: int, remember: bool = True):
         path = self.playlist.path(row)
@@ -883,6 +890,7 @@ class Player(QWidget):
             self._remember_position()
         self.playlist.set_current(row)
         self.current_path = path
+        self._clear_sub_slots()  # nothing from the previous file may follow into the new one
         self._file_ready = False
         self._last_pos = 0.0
         self._autofit_pending = True
@@ -894,19 +902,25 @@ class Player(QWidget):
         self.engine.load(path, start)
         self._update_title()
 
-    def add_subtitles(self, paths: list[str]):
+    def add_subtitles(self, paths: list[str], slot: str = "main"):
         if not self.has_file():
             return
-        for path in paths:
-            self.engine.cmd("sub-add", path, "select")
-        self.engine.set("sub-visibility", True)
-        self.settings["last_sub_dir"] = os.path.dirname(paths[-1])
-        self.osd("Subtitle: %s" % title_of(paths[-1]), 2500)
+        loaded = None
+        for path in dict.fromkeys(paths):  # ignore duplicates inside the request itself
+            if self._load_sub_file(path, slot):
+                loaded = path
+        if loaded is None:
+            return
+        if not is_url(loaded):
+            self.settings["last_sub_dir"] = os.path.dirname(loaded)
+        label = "Secondary subtitle" if slot == "secondary" else "Subtitle"
+        self.osd("%s: %s" % (label, title_of(loaded)), 2500)
 
     def stop(self, remember: bool = True):
         if remember:
             self._remember_position()
         self._file_ready = False
+        self._clear_sub_slots()
         self.engine.cmd("stop")
         self.settings.save()
 
@@ -1052,6 +1066,130 @@ class Player(QWidget):
         self.osd("Remember playback position: %s" % ("on" if self.settings["resume"] else "off"))
 
     # -- subtitles -------------------------------------------------------------------------------
+    @staticmethod
+    def _norm_track_id(value):
+        # mpv reports "no selection" as "no" (or False before the first file); id 0 is real.
+        if value is None or value is False or value == "no":
+            return None
+        return value
+
+    def _path_of_track(self, track_id):
+        for track in self.tracks():
+            if track.get("type") == "sub" and track.get("id") == track_id:
+                return track.get("external-filename") if track.get("external") else None
+        return None
+
+    def _abs_path(self, path: str) -> str:
+        """Absolute form of a path; relative ones (mpv can report them) resolve next to the video."""
+        if is_url(path) or os.path.isabs(path):
+            return path
+        if self.current_path and not is_url(self.current_path):
+            return os.path.join(os.path.dirname(self.current_path), path)
+        return os.path.abspath(path)
+
+    def _sub_track_id(self, path: str, tracks: list | None = None):
+        """The id of the external subtitle track for `path`, if it is already loaded."""
+        want = os.path.normcase(self._abs_path(path))
+        for track in (self.tracks() if tracks is None else tracks):
+            if track.get("type") != "sub" or not track.get("external"):
+                continue
+            name = track.get("external-filename")
+            if name and os.path.normcase(self._abs_path(str(name))) == want:
+                return track.get("id")
+        return None
+
+    def _codepage_for(self, path: str) -> str:
+        """Probe UTF-8 first; on failure fall back to the configured code page."""
+        fallback = str(self.settings["sub_codepage"] or "auto")
+        if is_url(path):
+            return fallback
+        return probe_encoding(path, fallback) or fallback
+
+    def _clear_sub_slots(self):
+        """Forget every subtitle of the previous file (F4 and file changes) and hand the
+        configured code page back to the engine, so the next file's auto-discovery starts clean."""
+        self._sub_slots = {"main": None, "secondary": None}
+        self._pending_subs = []
+        self._pending_slot_selects = []
+        self.engine.set("secondary-sid", "no")
+        self.engine.set("sub-codepage", str(self.settings["sub_codepage"] or "auto"))
+
+    def _load_sub_file(self, path: str, slot: str = "main") -> bool:
+        """Load one external subtitle into a slot. Loading the same path twice is a no-op:
+        the existing track is re-selected instead of added again."""
+        if not is_url(path):
+            path = os.path.abspath(path)
+        track_id = self._sub_track_id(path)
+        if track_id is not None:  # auto-discovered or added earlier
+            self._select_sub_track(slot, track_id, path)
+            return True
+        self._pending_slot_selects = [p for p in self._pending_slot_selects if p[1] != path]
+        # Write the probed code page back to the engine before the add; the command queue keeps
+        # the order, and only the subtitle demuxer reads it — video and audio are untouched.
+        self.engine.set("sub-codepage", self._codepage_for(path))
+        if not self.engine.cmd("sub-add", path, "select" if slot == "main" else "auto"):
+            return False
+        self._pending_slot_selects.append((slot, path))
+        return True
+
+    def _select_sub_track(self, slot: str, track_id, path=None):
+        if slot == "main":
+            self._select_main_sub(track_id, path)
+        else:
+            self._select_secondary_sub(track_id, path)
+
+    def _select_main_sub(self, track_id, path=None):
+        eng = self.engine
+        secondary = self._norm_track_id(eng.get("secondary-sid", "no"))
+        main = self._norm_track_id(eng.get("sid", "no"))
+        if track_id in (None, "no"):
+            eng.set("sid", "no")
+            self._sub_slots["main"] = None
+            return
+        eng.set("sid", track_id)
+        if secondary is not None:
+            if secondary == track_id:
+                # The track was in the second slot: swap, so neither subtitle is dropped.
+                eng.set("secondary-sid", main if main is not None else "no")
+                self._sub_slots["secondary"] = self._path_of_track(main) if main is not None else None
+            else:
+                eng.set("secondary-sid", secondary)  # keep the second slot where it was
+        self._sub_slots["main"] = path if path is not None else self._path_of_track(track_id)
+
+    def _select_secondary_sub(self, track_id, path=None):
+        eng = self.engine
+        main = self._norm_track_id(eng.get("sid", "no"))
+        secondary = self._norm_track_id(eng.get("secondary-sid", "no"))
+        if track_id in (None, "no"):
+            eng.set("secondary-sid", "no")
+            self._sub_slots["secondary"] = None
+            return
+        eng.set("secondary-sid", track_id)
+        if main == track_id:
+            # Same track picked for both slots: the main slot takes the old secondary instead.
+            eng.set("sid", secondary if secondary is not None else "no")
+            self._sub_slots["main"] = self._path_of_track(secondary) if secondary is not None else None
+        self._sub_slots["secondary"] = path if path is not None else self._path_of_track(track_id)
+
+    def _reconcile_sub_slots(self):
+        """Resolve pending slot selections once their tracks appear, and put the secondary
+        slot back if the core dropped it while rebuilding the track list."""
+        tracks = self.tracks()
+        if self._pending_slot_selects:
+            pending, self._pending_slot_selects = self._pending_slot_selects, []
+            for slot, path in pending:
+                track_id = self._sub_track_id(path, tracks)
+                if track_id is None:
+                    self._pending_slot_selects.append((slot, path))
+                else:
+                    self._select_sub_track(slot, track_id, path)
+        path = self._sub_slots.get("secondary")
+        if path and self.has_file():
+            track_id = self._sub_track_id(path, tracks)
+            current = self._norm_track_id(self.engine.get("secondary-sid", "no"))
+            if track_id is not None and current != track_id:
+                self.engine.set("secondary-sid", track_id)
+
     def toggle_sub_visibility(self):
         visible = not bool(self.engine.get("sub-visibility", True))
         self.engine.set("sub-visibility", visible)
@@ -1059,14 +1197,15 @@ class Player(QWidget):
         self.osd("Subtitles: %s" % ("show" if visible else "hide"))
 
     def set_track(self, kind: str, track_id):
-        prop = {"sub": "sid", "audio": "aid", "video": "vid"}[kind]
-        self.engine.set(prop, track_id)
+        if kind == "sub":
+            self._select_main_sub(track_id)
+        else:
+            prop = {"audio": "aid", "video": "vid"}[kind]
+            self.engine.set(prop, track_id)
         label = {"sub": "Subtitle", "audio": "Audio", "video": "Video"}[kind]
         if track_id == "no":
             self.osd("%s: off" % label)
             return
-        if kind == "sub":
-            self.engine.set("sub-visibility", True)
         track = next((t for t in self.tracks() if t.get("type") == kind and t.get("id") == track_id), None)
         self.osd("%s: %s" % (label, track_label(track).replace("&&", "&") if track else track_id), 2200)
 
@@ -1083,7 +1222,12 @@ class Player(QWidget):
         self.set_track(kind, choices[(index + 1) % len(choices)])
 
     def set_secondary_sub(self, track_id):
-        self.engine.set("secondary-sid", track_id)
+        self._select_secondary_sub(track_id)
+        if track_id in (None, "no"):
+            self.osd("Secondary subtitle: off")
+            return
+        track = next((t for t in self.tracks() if t.get("type") == "sub" and t.get("id") == track_id), None)
+        self.osd("Secondary subtitle: %s" % (track_label(track).replace("&&", "&") if track else track_id), 2200)
 
     def sub_delay(self, delta):
         value = 0.0 if delta is None else round(float(self.engine.get("sub-delay", 0) or 0) + delta, 3)
@@ -1110,6 +1254,7 @@ class Player(QWidget):
 
     def set_sub_codepage(self, codepage: str):
         self.settings["sub_codepage"] = codepage
+        self._codepage_setting = codepage
         self.engine.set("sub-codepage", codepage)
         if self.has_file():
             self.engine.cmd("sub-reload")
@@ -1572,6 +1717,17 @@ class Player(QWidget):
         if files:
             self.add_subtitles(files)
 
+    def load_secondary_subtitle_dialog(self):
+        if not self.has_file():
+            self.osd("Open a video first")
+            return
+        start = self.settings["last_sub_dir"] or self.settings["last_dir"] or ""
+        if self.current_path and not is_url(self.current_path):
+            start = os.path.dirname(self.current_path)
+        files, _ = QFileDialog.getOpenFileNames(self, "Load Secondary Subtitle", start, SUB_FILTER)
+        if files:
+            self.add_subtitles(files, slot="secondary")
+
     def load_audio_dialog(self):
         if not self.has_file():
             return
@@ -1604,7 +1760,10 @@ class Player(QWidget):
         e.set("sub-auto", s["sub_auto"])
         e.set("slang", s["preferred_sub_lang"])
         e.set("alang", s["preferred_audio_lang"])
-        if e.get("sub-codepage") != s["sub_codepage"]:
+        if s["sub_codepage"] != self._codepage_setting:
+            # The engine's live value is not comparable: loading a subtitle writes the probed
+            # code page back to it. Only a changed setting justifies a reload.
+            self._codepage_setting = s["sub_codepage"]
             e.set("sub-codepage", s["sub_codepage"])
             if self.has_file():
                 e.cmd("sub-reload")
