@@ -4731,9 +4731,12 @@ let sensScale = 1;              // shrinks with ADS zoom so aim stays 1:1 on scr
 addEventListener('keydown', e=>{
   if (e.repeat) { if(['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV'].includes(e.code)) e.preventDefault(); return; }
   keys[e.code]=true;
-  if (e.code==='Space') player.spaceEdge = true;      // consumed by the jump/mantle step
   if (['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV','Tab','ControlLeft'].includes(e.code)) e.preventDefault();
-  if (!G.running) return;
+  /* Every combat input is gated on a live round. Writing spaceEdge above this
+     guard would queue a jump that fires on the first resumed frame — the player
+     would leave the ground for a key pressed while the game was frozen. */
+  if (!G.running || G.over || G.paused) return;
+  if (e.code==='Space') player.spaceEdge = true;      // consumed by the jump/mantle step
   if (e.code==='KeyR') startReload();
   if (e.code==='Digit1') switchWeapon(0);
   if (e.code==='Digit2') switchWeapon(1);
@@ -4824,13 +4827,16 @@ function currentSpreadMult(){
 /* ---- aim down sights ---- */
 function setADS(on){
   if (on === player.ads) return;
-  if (on && (player.dead || !G.running)) return;
+  /* aiming is a live-round action: nothing may change the sight state while
+     the battle is frozen (paused, in the debrief, or on a menu) */
+  if (on && (player.dead || !G.running || G.over || G.paused)) return;
   player.ads = on;
   if (!on){ player.breathHeld = false; player.breathLock = false; }
 }
 function toggleADS(){ setADS(!player.ads); }
 
 function switchWeapon(i){
+  if (!G.running || G.over || G.paused) return;     // swaps are combat state
   if (i===player.weapon && player.switchTo<0) return;
   if (player.switching>0) return;
   if (player.reloadT>0){ player.reloadT=0; }
@@ -4842,6 +4848,7 @@ function switchWeapon(i){
   SFX.boltClick();
 }
 function startReload(){
+  if (!G.running || G.over || G.paused) return;     // a reload started on the pause screen would never tick
   const w = WEAPONS[player.weapon];
   if (player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0) return;
   if (w.mag>=w.magSize || w.res<=0) return;
@@ -4862,6 +4869,9 @@ function finishReload(){
 /** Returns true when the press was consumed — fired or dry-fired — so a
  *  buffered click keeps waiting through a reload instead of being thrown away. */
 function fireWeapon(){
+  /* hard freeze: even a buffered trigger left over from before the pause must
+     not discharge while the simulation is stopped */
+  if (!G.running || G.over || G.paused || player.dead) return false;
   const w = WEAPONS[player.weapon];
   if (player.fireCooldown>0 || player.reloadT>0 || player.switching>0 || player.pumpT>0 || player.boltT>0) return false;
   if (w.mag<=0){
@@ -6318,7 +6328,7 @@ function resetWorldState(){
   UI.feed.innerHTML='';
 
   G.time=180; G.kills=0; G.headshots=0; G.shots=0; G.hits=0; G.elapsed=0;
-  G.over=false; G.dmgFlash=0; G.lowPulse=0; G.hbTimer=0; G.killFlash=0;
+  G.over=false; G.paused=false; G.dmgFlash=0; G.lowPulse=0; G.hbTimer=0; G.killFlash=0;
   G.grace=GRACE_TIME;
   _sweepAt=0; _noiseCd=0;
   UI.killCount.textContent='0';
@@ -6338,7 +6348,7 @@ function restart(){
 }
 function endGame(win){
   if (G.over) return;
-  G.over=true; G.running=false; G.started=false;
+  G.over=true; G.running=false; G.started=false; G.paused=false;
   if (document.pointerLockElement) document.exitPointerLock();
   player.ads=false; player.adsK=0; player.adsEase=0;
   UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
@@ -6417,6 +6427,14 @@ function frame(now){
   if (dt <= 0) return;
   adaptive(dt);
 
+  /* A complete battle freeze. The simulation only advances in the running
+     state; pause, the debrief screen and death all stop the clock. Nothing
+     below this point may accumulate time while frozen, so on resume every
+     timer — reloads, pump/bolt cycles, recoil springs, enemy AI — continues
+     from the exact remainder it had when the freeze began rather than being
+     fast-forwarded through the paused interval. */
+  const frozen = !G.running || G.over;
+
   const mdx = mouseDX, mdy = mouseDY;
 
   if (G.running && !G.over){
@@ -6451,14 +6469,19 @@ function frame(now){
   dustField.camPos.value.copy(camera.position);
   skyUniforms.uTime.value = now*0.001;
   updateSunShafts();
-  updateViewmodel(dt, mdx, mdy);
-  updateShells(dt);
-  updateTracers(dt);
-  updateEnemyFlashes(dt);
-  updateParticles(PS_SPARK, dt);
-  updateParticles(PS_SOFT, dt);
-  updateCrosshair(dt);
-  updateDmgArcs(dt);
+  /* Time-bearing battle effects are frozen with the simulation: a casing,
+     tracer, muzzle flash or impact spark begun before the pause must still be
+     hanging in the same instant when play resumes. Ambient uniforms above keep
+     animating because they carry no combat state. */
+  const fdt = frozen ? 0 : dt;
+  updateViewmodel(fdt, mdx, mdy);
+  updateShells(fdt);
+  updateTracers(fdt);
+  updateEnemyFlashes(fdt);
+  updateParticles(PS_SPARK, fdt);
+  updateParticles(PS_SOFT, fdt);
+  updateCrosshair(fdt);
+  updateDmgArcs(fdt);
 
   /* HUD throttled */
   hudAccum += dt;
@@ -6473,17 +6496,20 @@ function frame(now){
   mapAccum += dt;
   if (mapAccum > 0.055){ mapAccum = 0; if (G.started) drawMinimap(); }
 
-  /* damage / low-health post uniforms */
-  G.dmgFlash = damp(G.dmgFlash, 0, 4.2, dt);
-  const lowT = (G.running && player.hp<20 && player.hp>0) ? 1 : 0;
-  G.lowPulse = damp(G.lowPulse, lowT, 3, dt);
-  if (lowT){
-    G.hbTimer -= dt;
-    if (G.hbTimer<=0){ SFX.heartbeat(); G.hbTimer = 0.95; }
+  /* damage / low-health post uniforms — held, not decayed, while the battle is
+     frozen, so a pause taken right after a hit resumes in the same state */
+  if (!frozen){
+    G.dmgFlash = damp(G.dmgFlash, 0, 4.2, dt);
+    const lowT = (G.running && player.hp<20 && player.hp>0) ? 1 : 0;
+    G.lowPulse = damp(G.lowPulse, lowT, 3, dt);
+    if (lowT){
+      G.hbTimer -= dt;
+      if (G.hbTimer<=0){ SFX.heartbeat(); G.hbTimer = 0.95; }
+    }
+    G.killFlash = damp(G.killFlash, 0, 7, dt);
   }
   const pulse = G.lowPulse * (0.55 + 0.45*Math.sin(now*0.006));
   UI.lowhp.style.opacity = String(pulse*0.8);
-  G.killFlash = damp(G.killFlash, 0, 7, dt);
 
   compMat.uniforms.time.value = now*0.001;
   compMat.uniforms.dmg.value  = G.dmgFlash;
