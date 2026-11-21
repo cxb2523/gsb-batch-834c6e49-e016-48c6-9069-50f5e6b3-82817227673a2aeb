@@ -13,7 +13,7 @@ How `motlab render`, `motlab video` and Export turn scene pages into an MP4, how
 
 A project (`motlab render`, Export) runs these steps once for each scene and transition, three at a time after the first scene, and joins the parts with one more `-c copy` pass ([Rendering a project](projects.md#rendering-a-project)).
 
-Temporary files go to the system temp folder and are removed afterwards. The output is written as `.part` and renamed at the end.
+Temporary files go to the system temp folder and are removed afterwards. The output is written as `.part` and renamed at the end. A project's cached parts are written the same way: each part MP4 and its JSON manifest go to a `.tmp-*` file in the parts folder and are renamed atomically, so an aborted or failed render leaves no half-written part that a later run could mistake for a valid one; leftover `.tmp-*` files are swept when the next render starts. The project render also records every project file the page fetched (shared script, font, picture, footage) from the static server, hashes their contents and folds those hashes into the part's cache key, so changing a fetched file re-renders that scene and the transitions touching it.
 
 The code is plain JavaScript ESM with JSDoc and no TypeScript. Half of it runs inside Chrome and is served straight from disk, so TypeScript would mean two languages or a build step. CDP uses Node's built-in `WebSocket`.
 

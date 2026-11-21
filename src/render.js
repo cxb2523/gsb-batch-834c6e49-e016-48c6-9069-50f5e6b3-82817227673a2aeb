@@ -70,7 +70,7 @@ async function readInfo(page, log) {
 export async function renderVideo(o) {
   const log = o.log || console.log, fps = o.fps ?? 24, scale = o.scale ?? 2, workers = Math.max(1, o.workers ?? 1), started = Date.now();
   const { root, url } = locate(o), out = resolve(o.out), part = out + '.part';   // written here first, renamed when complete
-  const server = await startServer({ root }), tmp = mkdtempSync(join(tmpdir(), 'motlab-render-'));
+  const server = await startServer({ root, trackFetches: true }), tmp = mkdtempSync(join(tmpdir(), 'motlab-render-'));
   let pages = [];
   // o.signal (an AbortSignal) stops the render: closing Chrome rejects whatever the render is waiting on.
   const stop = () => pages.forEach(p => p.chrome.close());
@@ -142,7 +142,9 @@ export async function renderVideo(o) {
     const muxLabel = `${res.mux === 'raw' ? 'raw bitstream' : 'Mediabunny in the page'}, then ffmpeg -c copy${ranges.length > 1 ? ` (concat of ${ranges.length} parts)` : ''}${o.audio ? ' with audio' : ''}`;
     const summary = { out, frames: v.frames, expectedFrames: frames, pageFrames, duration: v.duration, width, height, fps, gpu: info.gpu.renderer, encoder: label(enc), codec: enc.codec, hw: enc.hw,
       rate: rate(enc), mux: muxLabel, fullRange: res.fullRange, workers: ranges.length, encodeSeconds: res.encodeMs / 1000, totalSeconds: (Date.now() - started) / 1000, size: v.size,
-      color: { range: v.color_range, space: v.color_space, transfer: v.color_transfer, primaries: v.color_primaries } };
+      color: { range: v.color_range, space: v.color_space, transfer: v.color_transfer, primaries: v.color_primaries },
+      // project files the page actually fetched (shared scripts, fonts, pictures, footage), relative to the served root
+      fetched: server.fetchedFiles() };
     log(`Mux: ${muxLabel}`);
     log(`Colour tags: ${v.color_space || 'none'} / ${v.color_range || 'none'} (primaries ${v.color_primaries || 'none'}, transfer ${v.color_transfer || 'none'})`);
     if (v.frames !== frames || Math.abs(v.duration - wantDur) > 0.5 / fps) throw new Error(`output check failed: ${v.frames} frames, ${v.duration} s; expected ${frames} frames, ${wantDur} s (${out})`);

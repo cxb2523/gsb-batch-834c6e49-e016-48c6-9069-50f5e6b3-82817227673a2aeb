@@ -5,7 +5,7 @@ import { open } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream';
 import { createRequire } from 'node:module';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 
 const TYPES = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.json': 'application/json',
@@ -48,9 +48,13 @@ export function sendFile(req, res, path) {
 
 const readBody = req => new Promise((ok, no) => { const parts = []; req.on('data', d => parts.push(d)); req.on('end', () => ok(Buffer.concat(parts))); req.on('error', no); });
 
-export async function startServer({ root }) {
+export async function startServer({ root, trackFetches = false }) {
   const ROOT = resolve(root), prefix = `/__motlab/${randomBytes(8).toString('hex')}`;
   const sinks = new Map(); let nextSink = 0;
+  // With trackFetches, every project file the page actually loads (a shared script, a font, a picture, footage...) is
+  // recorded as its path relative to the served root. Built-in /__motlab libraries and sink uploads are not project
+  // files, so they are not recorded. The render's cache key hashes these, so a fetched file changing invalidates the part.
+  const fetched = new Set();
 
   const server = createServer(async (req, res) => {
     try {
@@ -72,6 +76,7 @@ export async function startServer({ root }) {
       if (lib) return sendFile(req, res, lib);
       const path = join(ROOT, decodeURIComponent(u.pathname));
       if ((path !== ROOT && !path.startsWith(ROOT + sep)) || !existsSync(path) || statSync(path).isDirectory()) { res.writeHead(404); return res.end(); }
+      if (trackFetches && req.method === 'GET') fetched.add(relative(ROOT, path).split(sep).join('/'));
       sendFile(req, res, path);
     } catch (e) { res.writeHead(500); res.end(String(e && e.message)); }
   });
@@ -80,6 +85,7 @@ export async function startServer({ root }) {
 
   return {
     origin, base: origin + prefix,
+    fetchedFiles: () => [...fetched],
     // A sink is a file the page may write to: positional writes (MP4 muxer) or appends (raw bitstream, stills).
     async createSink(path) {
       const id = String(++nextSink), sink = { fh: await open(path, 'w'), size: 0, tail: Promise.resolve() };
