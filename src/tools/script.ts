@@ -23,8 +23,9 @@ export const DEFAULT_TIMEOUT = 15000;
  * Loading state is shared by every player on the page.
  * - pending/resolved promise: every player waits for it and gets the same result;
  * - `null`: nothing is loading, the next player starts a new load.
- * After a failure the promise is reset, so the next player can try again
- * without reloading the page.
+ * After a failure the promise is reset, so the next call loads the script
+ * again: a newly mounted player, or a mounted one retrying automatically
+ * (see Loader).
  */
 let shared: Promise<void> | null = null;
 

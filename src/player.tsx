@@ -92,7 +92,8 @@ export type PlayerPropsTypes = {
 	onJSLoad?: () => void;
 	/**
 	 * IFrame API script failed to load (after retries).
-	 * Every player waiting for the script gets this callback.
+	 * Every player waiting for the script gets this callback once per failed
+	 * round; the load is then retried automatically while the player stays mounted.
 	 */
 	onJSLoadError?: (error: JSLoadError) => void;
 	/** IFrame API script URL. Defaults to `https://player.kinescope.io/latest/iframe.player.js`. */

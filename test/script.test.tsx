@@ -245,4 +245,173 @@ describe('IFrame API script loading', () => {
 		await tick();
 		expect(getScriptTag()!.src).toBe(src);
 	});
+
+	it('failed round is retried automatically: the mounted player recovers without a new mount', async () => {
+		const onJSLoad = vi.fn();
+		const onJSLoadError = vi.fn();
+		const onInit = vi.fn();
+		render(
+			<KinescopePlayer
+				videoId="v1"
+				onJSLoad={onJSLoad}
+				onJSLoadError={onJSLoadError}
+				onInit={onInit}
+			/>,
+		);
+		await tick();
+
+		await failAllAttempts();
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+		expect(getScriptTag()).toBeNull();
+
+		/* no new player mounted: the waiting one starts a new round after the retry pause */
+		await tick(DEFAULT_RETRY_DELAY);
+		expect(scriptTags()).toHaveLength(1);
+
+		const api = await loadScript();
+		expect(api.create).toHaveBeenCalledTimes(1);
+		api.pending[0].resolve();
+		await tick();
+		expect(onJSLoad).toHaveBeenCalledTimes(1);
+		expect(onInit).toHaveBeenCalledTimes(1);
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+	});
+
+	it('players waiting through a failed round share one automatic retry', async () => {
+		const onInit1 = vi.fn();
+		const onInit2 = vi.fn();
+		const errors = [vi.fn(), vi.fn()];
+		render(
+			<>
+				<KinescopePlayer videoId="v1" onInit={onInit1} onJSLoadError={errors[0]} />
+				<KinescopePlayer videoId="v2" onInit={onInit2} onJSLoadError={errors[1]} />
+			</>,
+		);
+		await tick();
+
+		await failAllAttempts();
+		errors.forEach(onJSLoadError => expect(onJSLoadError).toHaveBeenCalledTimes(1));
+
+		/* both players retry together: one shared round, not one tag per player */
+		await tick(DEFAULT_RETRY_DELAY);
+		expect(scriptTags()).toHaveLength(1);
+
+		const api = await loadScript();
+		expect(api.create).toHaveBeenCalledTimes(2);
+		api.pending.forEach(p => p.resolve());
+		await tick();
+		expect(onInit1).toHaveBeenCalledTimes(1);
+		expect(onInit2).toHaveBeenCalledTimes(1);
+		errors.forEach(onJSLoadError => expect(onJSLoadError).toHaveBeenCalledTimes(1));
+	});
+
+	it('player mounted during the retry pause joins the same round without an extra tag', async () => {
+		const onInit1 = vi.fn();
+		const onInit2 = vi.fn();
+		render(<KinescopePlayer videoId="v1" onInit={onInit1} />);
+		await tick();
+
+		await failScript();
+		expect(getScriptTag()).toBeNull();
+
+		render(<KinescopePlayer videoId="v2" onInit={onInit2} />);
+		await tick(DEFAULT_RETRY_DELAY);
+		expect(scriptTags()).toHaveLength(1);
+
+		const api = await loadScript();
+		expect(api.create).toHaveBeenCalledTimes(2);
+		api.pending.forEach(p => p.resolve());
+		await tick();
+		expect(onInit1).toHaveBeenCalledTimes(1);
+		expect(onInit2).toHaveBeenCalledTimes(1);
+	});
+
+	it('unmounted player stays silent: no automatic retry, no callbacks', async () => {
+		const onJSLoad = vi.fn();
+		const onJSLoadError = vi.fn();
+		const {unmount} = render(
+			<KinescopePlayer videoId="v1" onJSLoad={onJSLoad} onJSLoadError={onJSLoadError} />,
+		);
+		await tick();
+
+		await failAllAttempts();
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+
+		unmount();
+		await tick(DEFAULT_RETRY_DELAY * 3);
+		expect(getScriptTag()).toBeNull();
+		expect(onJSLoad).not.toHaveBeenCalled();
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+	});
+
+	it('late load of a timed-out tag is ignored: the current attempt decides', async () => {
+		const onJSLoad = vi.fn();
+		const onInit = vi.fn();
+		render(<KinescopePlayer videoId="v1" onJSLoad={onJSLoad} onInit={onInit} />);
+		await tick();
+		const stalled = getScriptTag()!;
+
+		await tick(DEFAULT_TIMEOUT);
+		expect(stalled.isConnected).toBe(false);
+		await tick(DEFAULT_RETRY_DELAY);
+		const current = getScriptTag()!;
+		expect(current).not.toBe(stalled);
+
+		/* the stalled request answers too late: it must not advance the state */
+		await act(async () => {
+			stalled.dispatchEvent(new Event('load'));
+		});
+		await tick();
+		expect(onJSLoad).not.toHaveBeenCalled();
+		expect(getScriptTag()).toBe(current);
+
+		const api = await loadScript();
+		expect(api.create).toHaveBeenCalledTimes(1);
+		api.pending[0].resolve();
+		await tick();
+		expect(onJSLoad).toHaveBeenCalledTimes(1);
+		expect(onInit).toHaveBeenCalledTimes(1);
+	});
+
+	it('late result of a superseded round is discarded after the retry succeeds', async () => {
+		const onJSLoad = vi.fn();
+		const onJSLoadError = vi.fn();
+		const onInit = vi.fn();
+		render(
+			<KinescopePlayer
+				videoId="v1"
+				onJSLoad={onJSLoad}
+				onJSLoadError={onJSLoadError}
+				onInit={onInit}
+			/>,
+		);
+		await tick();
+		const stalled = getScriptTag()!;
+
+		/* every attempt of the first round stalls and times out */
+		await tick(DEFAULT_TIMEOUT + DEFAULT_RETRY_DELAY);
+		await tick(DEFAULT_TIMEOUT + DEFAULT_RETRY_DELAY);
+		await tick(DEFAULT_TIMEOUT);
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+		expect(getScriptTag()).toBeNull();
+
+		/* the automatic retry succeeds */
+		await tick(DEFAULT_RETRY_DELAY);
+		const api = await loadScript();
+		expect(api.create).toHaveBeenCalledTimes(1);
+		api.pending[0].resolve();
+		await tick();
+		expect(onJSLoad).toHaveBeenCalledTimes(1);
+		expect(onInit).toHaveBeenCalledTimes(1);
+
+		/* the stalled tag of the first round answers too late: discarded, nothing changes */
+		await act(async () => {
+			stalled.dispatchEvent(new Event('load'));
+			stalled.dispatchEvent(new Event('error'));
+		});
+		await tick(DEFAULT_RETRY_DELAY * 3);
+		expect(onJSLoad).toHaveBeenCalledTimes(1);
+		expect(onJSLoadError).toHaveBeenCalledTimes(1);
+		expect(api.create).toHaveBeenCalledTimes(1);
+	});
 });
