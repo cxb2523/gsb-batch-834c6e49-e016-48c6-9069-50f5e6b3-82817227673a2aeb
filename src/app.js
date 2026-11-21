@@ -396,20 +396,32 @@
   }
 
   // 合成抓取：把墨画布（WebGL）与沙画布（2D）叠成一张，供录制用。
+  // 墨 / 沙两模式都叠「墨在下、沙在上」——沙粒撒下后就是场景的一部分，
+  // 切回墨模式只是暂停模拟，沙还在，录制要如实收下完整画面。
+  // 精 / 静没有沙层，只录墨。沙层走 compositeOnto：空格透明，纸处透出下面的墨。
+  // 两层分辨率不同时各自缩放到同一输出尺寸（w×h）。
   // 沙模式下额外 re-render 一次墨引擎，确保 WebGL 缓冲此刻有效（drawImage 同帧读取）。
-  const capCv = document.createElement('canvas')
-  const capCtx = capCv.getContext('2d')
+  // 画布惰性创建；停止录制后由 releaseComposite() 释放，不残留。
+  let capCv = null
+  let capCtx = null
   function grabComposite() {
     if (state.mode === 'sand' && engine) engine.render(performance.now())
     const stageCv = engine ? engine.renderer.domElement : null
-    const sandCv = (state.mode === 'sand' && sand) ? sand.canvas : null
-    const w = stageCv ? stageCv.width : (sandCv ? sandCv.width : 800)
-    const h = stageCv ? stageCv.height : (sandCv ? sandCv.height : 600)
-    capCv.width = w; capCv.height = h
+    const withSand = (state.mode === 'ink' || state.mode === 'sand') && sand && sand.compositeOnto
+    const w = stageCv ? stageCv.width : (sand ? sand.canvas.width : 800)
+    const h = stageCv ? stageCv.height : (sand ? sand.canvas.height : 600)
+    if (!capCv) { capCv = document.createElement('canvas'); capCtx = capCv.getContext('2d') }
+    if (capCv.width !== w) capCv.width = w
+    if (capCv.height !== h) capCv.height = h
     capCtx.clearRect(0, 0, w, h)
     if (stageCv) { try { capCtx.drawImage(stageCv, 0, 0, w, h) } catch (e) {} }
-    if (sandCv) { try { capCtx.drawImage(sandCv, 0, 0, w, h) } catch (e) {} }
+    if (withSand) { try { sand.compositeOnto(capCtx, w, h) } catch (e) {} }
     return capCv
+  }
+  function releaseComposite() {
+    if (capCv) { try { capCv.width = 0; capCv.height = 0 } catch (e) {} }
+    capCv = null
+    capCtx = null
   }
 
   // ── 主循环：模拟一直推进，墨才会持续洇开、呼吸 ──
@@ -425,7 +437,7 @@
       sand.step(dt)
       sand.render(now)
     }
-    // 短视频录制：仅在录制态抓取合成画面（Movie 内部节流到 ~10fps）
+    // 短视频录制：仅在录制态抓取合成画面（Movie 内部节流到 ~30fps）
     if (window.Movie && window.Movie.isRecording()) window.Movie.capture(grabComposite())
     aiTick(now)
     if (state.mode === 'sand') advanceAiPour(now)
@@ -799,6 +811,7 @@
       movieBtn.disabled = true
       movieBusy = true
       window.Movie.stop().then((r) => {
+        releaseComposite()       // 释放合成用的临时画布，不残留
         movieBusy = false
         movieBtn.disabled = false
         if (r && r.ok) {
@@ -810,6 +823,11 @@
           movieBtn.textContent = msg
           movieRevert(movieBtn, d.movie, 2000)
         }
+      }, () => {
+        releaseComposite()
+        movieBusy = false
+        movieBtn.disabled = false
+        movieBtn.textContent = d.movie
       })
     } else {
       const res = window.Movie.start(grabComposite)
@@ -877,6 +895,8 @@
   window.__ink = {
     engine, sand, state, aiTick, advanceAiPour, setMode,
     sound: window.Soundscape, movie: window.Movie,
+    grabComposite, releaseComposite,
+    compositeActive: () => !!capCv,
     clearUndoArmed: () => clearUndoArmed, performClearUndo, cancelClearUndo,
     wakeLockSupported: () => !!navigator.wakeLock,
   }

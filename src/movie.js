@@ -84,9 +84,11 @@
     if (window.createImageBitmap) return window.createImageBitmap(b)
     return new Promise(function (res, rej) {
       var img = new Image()
-      img.onload = function () { res(img) }
-      img.onerror = rej
-      img.src = URL.createObjectURL(b)
+      var url = URL.createObjectURL(b)
+      // 解码完（或失败）立刻收回对象 URL，不残留
+      img.onload = function () { URL.revokeObjectURL(url); res(img) }
+      img.onerror = function (e) { URL.revokeObjectURL(url); rej(e) }
+      img.src = url
     })
   }
 
@@ -99,6 +101,8 @@
     _grab: null,          // 提供合成画布的回调
     _capCv: null,
     _capCtx: null,
+    _outW: null,          // 本次录制的固定输出尺寸（第一帧定下，之后不随窗口变化）
+    _outH: null,
 
     supported: supported,
     isRecording: function () { return this._rec },
@@ -127,6 +131,7 @@
 
     start: function (grab) {
       if (!supported()) return { ok: false, reason: 'unsupported' }
+      this._releaseCapture()      // 防御：清掉上一轮可能残留的临时资源
       this._rec = true
       this._frames = []
       this._lastCap = 0
@@ -137,6 +142,16 @@
       return { ok: true }
     },
 
+    // 释放合成用的临时画布与回调引用（停止录制时调用，不残留）。
+    _releaseCapture: function () {
+      if (this._capCv) { try { this._capCv.width = 0; this._capCv.height = 0 } catch (e) {} }
+      this._capCv = null
+      this._capCtx = null
+      this._grab = null
+      this._outW = null
+      this._outH = null
+    },
+
     // 由主循环每帧调用；按 _interval 节流（满 30fps 起步，缓冲满后逐次减半），
     // 把合成画面存成 JPEG Blob。
     capture: function (src) {
@@ -144,16 +159,23 @@
       var now = nowMs()
       if (now - this._lastCap < this._interval) return
       this._lastCap = now
-      var w = src.width || 800, h = src.height || 600
-      var scale = Math.min(1, LONGEST / Math.max(w, h))
-      var cw = Math.max(2, Math.round(w * scale))
-      var ch = Math.max(2, Math.round(h * scale))
+      // 输出尺寸在录制开始后固定：第一帧定下，之后切模式、窗口 resize 都不变。
+      // 否则已录帧与新帧尺寸混杂，编码出来的视频会跳变 / 花屏。
+      if (!this._outW) {
+        var w0 = src.width || 800, h0 = src.height || 600
+        var s0 = Math.min(1, LONGEST / Math.max(w0, h0))
+        this._outW = Math.max(2, Math.round(w0 * s0))
+        this._outH = Math.max(2, Math.round(h0 * s0))
+      }
+      var cw = this._outW, ch = this._outH
       if (!this._capCv) {
         this._capCv = document.createElement('canvas')
         this._capCtx = this._capCv.getContext('2d')
       }
-      this._capCv.width = cw
-      this._capCv.height = ch
+      // 尺寸固定后无需每帧重设（重设会清空画布、重新分配显存）
+      if (this._capCv.width !== cw) this._capCv.width = cw
+      if (this._capCv.height !== ch) this._capCv.height = ch
+      // 源尺寸可能已变（resize / 切模式）：一律缩放到固定输出尺寸
       try { this._capCtx.drawImage(src, 0, 0, cw, ch) } catch (e) { return }
       var self = this
       // toBlob 异步。同一时刻只允许一个在途，保证 push 顺序与抓取顺序一致
@@ -172,6 +194,7 @@
       this._rec = false
       var frames = this._frames
       this._frames = []
+      this._releaseCapture()      // 临时画布 / 回调 / 尺寸锁定，全部释放
       if (!supported()) return Promise.resolve({ ok: false, reason: 'unsupported' })
       if (frames.length < 2) return Promise.resolve({ ok: false, reason: 'too-short', count: frames.length })
       if (!pickMime()) return Promise.resolve({ ok: false, reason: 'no-mime' })

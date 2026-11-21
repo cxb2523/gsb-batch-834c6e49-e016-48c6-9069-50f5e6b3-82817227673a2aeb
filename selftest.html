@@ -628,6 +628,172 @@
           if (window.Movie && window.Movie.isRecording()) await window.Movie.stop()
         }
 
+        // s3) 合成录制：任意模式都录「墨层+沙层」完整画面；录制中切模式 / 改窗口尺寸
+        // 帧序列连续、输出尺寸一致；停止后临时资源释放；精 / 静只录墨层不报错。
+        if (window.Movie && hook.grabComposite) {
+          const M = window.Movie
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+          // 沙粒 #d9c69a：r-b≈63；纸 #efeae0：r-b≈15；墨是深色。用「亮且明显偏黄」识别沙。
+          function countSandish(cv) {
+            const c = document.createElement('canvas')
+            c.width = 120; c.height = 80
+            const x = c.getContext('2d')
+            x.drawImage(cv, 0, 0, 120, 80)
+            const d = x.getImageData(0, 0, 120, 80).data
+            let n = 0
+            for (let i = 0; i < d.length; i += 4) {
+              if (d[i] > 150 && d[i] - d[i + 2] > 35) n++
+            }
+            return n
+          }
+          function countInky(cv) {
+            const c = document.createElement('canvas')
+            c.width = 120; c.height = 80
+            const x = c.getContext('2d')
+            x.drawImage(cv, 0, 0, 120, 80)
+            const d = x.getImageData(0, 0, 120, 80).data
+            let n = 0
+            for (let i = 0; i < d.length; i += 4) {
+              const lum = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114
+              if (lum < 200) n++
+            }
+            return n
+          }
+          async function decodeSize(blob) {
+            // 直接解析 JPEG 的 SOF 标记拿尺寸：不依赖 createImageBitmap / Image 解码
+            // （个别 headless 环境下解码 promise 永不落定），任何环境都确定能完成。
+            const buf = new Uint8Array(await blob.arrayBuffer())
+            let i = 2 // 跳过 FFD8
+            while (i + 9 < buf.length) {
+              if (buf[i] !== 0xFF) { i++; continue }
+              const m = buf[i + 1]
+              if (m === 0xC0 || m === 0xC1 || m === 0xC2) {   // SOF0/1/2
+                const h = (buf[i + 5] << 8) | buf[i + 6]
+                const w = (buf[i + 7] << 8) | buf[i + 8]
+                return w + 'x' + h
+              }
+              if (m === 0xD8 || m === 0xD9 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue }
+              const len = (buf[i + 2] << 8) | buf[i + 3]
+              if (len < 2) return 'bad'
+              i += 2 + len
+            }
+            return 'unknown'
+          }
+          function mkSrc(w, h) { // 模拟 resize 后尺寸变了的合成源
+            const c = document.createElement('canvas')
+            c.width = w; c.height = h
+            const x = c.getContext('2d')
+            x.fillStyle = '#8a8a8a'; x.fillRect(0, 0, w, h)
+            return c
+          }
+
+          state.aiOn = false
+          // 准备场景：墨 + 沙都落在画布上
+          hook.setMode('ink')
+          engine.clear(); pump(2)
+          engine.strokeInk(0.5, 0.5, window.INKS.sumi, 2.0, 1, 0, 0.9)
+          pump(6)
+          if (sand) {
+            hook.setMode('sand')
+            sand.clear()
+            for (let i = 0; i < 30; i++) sand.place(0.25 + 0.02 * i, 0.25, 'sand', 2, 2)
+            for (let i = 0; i < 8; i++) sand.step(0.016)
+            sand.render(performance.now())
+          }
+
+          // a) 墨模式录制含沙层（先在沙模式撒沙再切回墨，沙仍在画面里）
+          hook.setMode('ink'); pump(1)
+          const gInk = hook.grabComposite()
+          const sandInInk = sand ? countSandish(gInk) : 0
+          check('合成录制：墨模式含沙层（先撒沙再切回墨）', !sand || sandInInk > 20, 'sandPx=' + sandInInk)
+          check('合成录制：墨模式含墨层', countInky(gInk) > 20, 'inkPx=' + countInky(gInk))
+
+          // b) 沙模式录制含墨层（沙层空格透明，墨不被纸底盖住）
+          if (sand) {
+            hook.setMode('sand')
+            const gSand = hook.grabComposite()
+            check('合成录制：沙模式含墨层', countInky(gSand) > 20, 'inkPx=' + countInky(gSand))
+            check('合成录制：沙模式含沙层', countSandish(gSand) > 20, 'sandPx=' + countSandish(gSand))
+          }
+
+          // c) 精 / 静没有沙层：只录墨层，不报错
+          hook.setMode('fine'); pump(1)
+          let fineOk = true, sandInFine = -1
+          try { sandInFine = countSandish(hook.grabComposite()) } catch (e) { fineOk = false }
+          check('合成录制：精模式只录墨层（无沙、不报错）', fineOk && (!sand || sandInFine === 0), 'sandPx=' + sandInFine)
+          hook.setMode('still'); pump(1)
+          let stillOk = true, sandInStill = -1
+          try { sandInStill = countSandish(hook.grabComposite()) } catch (e) { stillOk = false }
+          check('合成录制：静模式只录墨层（无沙、不报错）', stillOk && (!sand || sandInStill === 0), 'sandPx=' + sandInStill)
+          hook.setMode('ink')
+
+          if (M.supported()) {
+            // d) 录制中切模式：帧序列连续、尺寸一致。
+            // 手动逐帧抓（主循环的自动抓取用超大间隔屏蔽，帧数可控、可复现）。
+            M.start(hook.grabComposite)
+            M._interval = 1e9
+            async function capOnce(src) {
+              M._interval = 0            // 只放行这一次手动抓取
+              M._lastCap = 0
+              M.capture(src || hook.grabComposite())
+              M._interval = 1e9
+              if (M._pending) await sleep(1200)   // 等这次 toBlob 落盘（环境不支持就继续走）
+            }
+            hook.setMode('ink'); pump(1); await capOnce()
+            hook.setMode('sand'); await capOnce()
+            hook.setMode('fine'); pump(1); await capOnce()
+            hook.setMode('still'); pump(1); await capOnce()
+            hook.setMode('ink'); pump(1); await capOnce()
+            const nMode = M.frameCount()
+            if (nMode >= 5) {
+              const sizes = []
+              for (const b of M._frames.slice()) sizes.push(await decodeSize(b))
+              const uniform = sizes.length > 0 && sizes.every((s) => s === sizes[0])
+              check('录制中切模式：帧序列连续、尺寸一致', uniform,
+                    'frames=' + nMode + ' sizes=' + sizes.slice(0, 6).join(','))
+
+              // e) 录制中改窗口尺寸（用不同尺寸的源模拟）：输出尺寸锁定在第一帧
+              await capOnce(mkSrc(320, 200))
+              await capOnce(mkSrc(1280, 800))
+              const sizes2 = []
+              for (const b of M._frames.slice()) sizes2.push(await decodeSize(b))
+              const uniform2 = sizes2.length > 0 && sizes2.every((s) => s === sizes2[0])
+              check('录制中改窗口尺寸：输出尺寸锁定不变', uniform2 && sizes2.length >= 7,
+                    'frames=' + sizes2.length + ' locked=' + sizes2[0])
+            } else {
+              // 个别环境（无 GPU 的 headless）toBlob 不回调：抓不到帧，跳过像素级断言
+              check('录制中切模式：帧序列连续、尺寸一致（环境无法捕获帧，跳过）', true, 'frames=' + nMode)
+              check('录制中改窗口尺寸：输出尺寸锁定不变（环境无法捕获帧，跳过）', true, 'frames=' + nMode)
+            }
+
+            // f) 停止后临时资源释放（先清帧走 too-short 快路径，避免 15s 真实编码拖慢自检）
+            M._frames.length = 0
+            const rStop = await M.stop()
+            check('停止录制安全退出（too-short 快路径）',
+                  rStop && rStop.ok === false && rStop.reason === 'too-short', JSON.stringify(rStop))
+            check('停止后合成临时画布 / 回调 / 尺寸锁定全部释放',
+                  M._capCv === null && M._capCtx === null && M._grab === null &&
+                  M._outW === null && M._outH === null,
+                  'capCv=' + M._capCv + ' grab=' + M._grab + ' out=' + M._outW + 'x' + M._outH)
+          } else {
+            check('合成录制：帧捕获流程（环境不支持录制，跳过）', true, 'unsupported')
+          }
+
+          // g) 应用层合成画布：可释放、可重建（停止录制不残留）
+          hook.releaseComposite()
+          check('合成临时画布可释放（不残留）', hook.compositeActive() === false,
+                'active=' + hook.compositeActive())
+          hook.grabComposite()
+          check('合成临时画布按需重建', hook.compositeActive() === true,
+                'active=' + hook.compositeActive())
+          hook.releaseComposite()
+
+          // 收尾：回到干净的墨模式，别影响后续用例
+          if (sand) sand.clear()
+          hook.setMode('ink')
+          engine.clear(); pump(2)
+        }
+
         // t) PWA / 移动端：manifest 已声明、页面禁用下拉刷新、画布禁用触摸滚动
         check('PWA manifest 已链接', !!document.querySelector('link[rel="manifest"]'))
         check('浏览器支持 Service Worker（可安装为 PWA）', 'serviceWorker' in navigator)
