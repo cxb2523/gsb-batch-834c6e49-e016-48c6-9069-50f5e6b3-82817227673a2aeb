@@ -81,6 +81,33 @@ engine.onClick = (coords) => {
 
 An update refreshes hit geometry before the scheduled repaint, including for collections larger than 500 items. A point query or rectangle query immediately after `update()` therefore sees the new geometry. During a subscriber callback, other subscribers may not have received the current notification yet; query the engine after the mutation returns when current geometry is required.
 
+## The Layer Data Source
+
+Each live registration is backed by a `CollectionLayerSource`: one ordered item view plus one RBush spatial index, kept in sync with the collection. Rendering culls from that same view and hit testing queries that same index, so what is drawn, what a viewport query returns, and what `hitTest`/`hitTestRect` answer are always the same ordered data.
+
+```ts
+const markers = new ItemCollection<Marker>([{ id: "village", x: 0, y: 0 }], { keyOf: (m) => m.id });
+const handle = engine.drawRect(markers, 1);
+
+const layer = engine.getLayerSource(handle)!;
+layer.query({ minX: 0, maxX: 10, minY: 0, maxY: 10 }); // markers in collection order
+layer.queryPoint(3, 4); // markers whose box contains the point
+
+// Swap the observed collection without re-registering; the old one detaches.
+engine.setLayerCollection(handle, reloadedMarkers);
+```
+
+| Member | Behavior |
+| :-- | :-- |
+| `getLayerSource(handle)` | The source backing a live registration, or `undefined` for ordinary item/array/static drawings and after removal. |
+| `setLayerCollection(handle, collection)` | Replaces the observed collection. The previous subscription is detached first. Throws for a handle that is not a live collection registration. |
+| `source.items` | The same live array the renderer culls from; its identity stays stable. |
+| `source.query(region, padding?)` | Items whose indexed box overlaps the region, in collection order. `padding` is world units. |
+| `source.queryPoint(x, y, padding?)` | Items whose indexed box contains the point, in collection order. |
+| `source.syncCount` | Index sync passes so far: the initial build plus one per delivered notification (a batch counts once). |
+
+Every `insert`, `update`, and `remove` reaches the index synchronously; a `batch` is a single notification and therefore a single sync pass, so a burst of mutations never rebuilds per change. Removed items leave the index immediately and cannot be found or hit. A duplicate-key insert throws before the collection records anything, leaving the collection, the index, and the order unchanged. Creating the source indexes items with `itemsBounds` (cell boxes for anchored kinds, endpoint/vertex boxes for lines and paths); pixel-sized extents and measured text are not part of that box.
+
 ## React and React Native
 
 Keep the collection instance stable. Its updates repaint the canvas without a React render or draw re-registration:
@@ -106,9 +133,9 @@ Render this component inside an existing `<CanvasTileEngine>` provider. For nati
 
 ## Rendering, Lifecycle, and Limits
 
-`engine.requestRender()` coalesces requests into one animation frame, or one microtask when `requestAnimationFrame` is unavailable. Collection updates call it automatically, and React child repaints use the same scheduler. `engine.render()` still paints synchronously and consumes a pending request. Destroying the engine cancels its pending frame and detaches its collection subscriptions. Replacing a registration id, removing a handle, clearing a layer, and clearing all drawings also detach the affected subscriptions. The collection remains reusable.
+`engine.requestRender()` coalesces requests into one animation frame, or one microtask when `requestAnimationFrame` is unavailable. Collection updates call it automatically, and React child repaints use the same scheduler. `engine.render()` still paints synchronously and consumes a pending request. Destroying the engine cancels its pending frame and detaches its collection subscriptions. Replacing a registration id, removing a handle, clearing a layer, and clearing all drawings also detach the affected subscriptions, disposing the registration's layer data source so later mutations of that collection cannot reach its index. The collection remains reusable.
 
-For large indexed collections, item changes update affected spatial entries instead of replacing the draw registration and rebuilding the entire index. Initial registration still creates a per-registration view; first index construction, zoom or font-metric invalidation can still rebuild renderer caches. Removing an item shifts the dense array and takes linear work. This is not a guarantee of constant-time mutation or incremental GPU-buffer uploads.
+For large indexed collections, item changes update affected spatial entries instead of replacing the draw registration and rebuilding the entire index. Initial registration builds the layer source once; first index construction, zoom or font-metric invalidation can still rebuild renderer caches. Removing an item shifts the dense array and takes linear work. This is not a guarantee of constant-time mutation or incremental GPU-buffer uploads.
 
 Single objects and ordinary arrays keep their existing API. Static draw helpers and Sprite accept their existing inputs; they do not observe collections. Use `styleOf` for selection or hover decorations that do not change geometry. If the underlying pixels of an existing WebGL image source change, the existing `invalidateTexture` rule still applies.
 

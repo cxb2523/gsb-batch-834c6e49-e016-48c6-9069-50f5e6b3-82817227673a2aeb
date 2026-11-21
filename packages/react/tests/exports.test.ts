@@ -29,6 +29,13 @@ describe("core type re-exports", () => {
             Core.ReadonlyItemCollection<Core.Rect<Data>>
         >();
         expectTypeOf<Binding.DrawItems<Core.Rect<Data>>>().toEqualTypeOf<Core.DrawItems<Core.Rect<Data>>>();
+        expectTypeOf<typeof Binding.CollectionLayerSource>().toEqualTypeOf<typeof Core.CollectionLayerSource>();
+        expectTypeOf<Binding.LayerDataSourceOptions<Core.Rect<Data>>>().toEqualTypeOf<
+            Core.LayerDataSourceOptions<Core.Rect<Data>>
+        >();
+        expectTypeOf<Binding.ReadonlyCollectionLayerSource<Core.Rect<Data>>>().toEqualTypeOf<
+            Core.ReadonlyCollectionLayerSource<Core.Rect<Data>>
+        >();
     });
 
     it("accepts typed collections through all dynamic draw props and the imperative handle", () => {

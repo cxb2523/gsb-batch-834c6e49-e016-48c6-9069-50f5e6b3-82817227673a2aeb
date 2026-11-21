@@ -317,6 +317,20 @@ them instead of invisible halo items. 500+ item draw calls use a spatial
 index, so hover-rate queries are fine. Usage pattern:
 [events.md](events.md#pattern-item-click--hover-via-hittest).
 
+### Layer data source
+
+| Signature | Notes |
+| :-- | :-- |
+| `getLayerSource<TData>(handle: DrawHandle): CollectionLayerSource<TData> \| undefined` | The ordered view + spatial index behind a live `ItemCollection` registration. `undefined` for ordinary item/array/static draws and after removal. |
+| `setLayerCollection<TData>(handle: DrawHandle, collection: ReadonlyItemCollection<TData>): void` | Swap the observed collection; the previous subscription detaches first. Throws for a non-collection handle. |
+
+`CollectionLayerSource` (core >= 0.13) keeps `items` (the renderer's own
+ordered array), `query(region, padding?)`, `queryPoint(x, y, padding?)`,
+`size`, `keyAt`, `indexOf`, `syncCount`, and `dispose`; queries return items in
+collection order. Insert/update/remove sync the index synchronously; a batch is
+one sync pass. See
+[live item collections](item-collections.md#layer-data-source).
+
 ### Event callbacks (assign as properties)
 
 ```ts

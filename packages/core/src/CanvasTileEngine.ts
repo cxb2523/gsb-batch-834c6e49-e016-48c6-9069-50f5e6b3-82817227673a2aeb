@@ -4,7 +4,13 @@ import { CoordinateTransformer } from "./modules/CoordinateTransformer";
 import { ViewportState } from "./modules/ViewportState";
 import { AnimationController } from "./modules/AnimationController";
 import { HitTester, HitResult, HitTestOptions, HitTestRectOptions, HitItem } from "./modules/HitTester";
-import { isItemCollection, type DrawItems, type ItemCollectionChange } from "./modules/ItemCollection";
+import {
+    isItemCollection,
+    type DrawItems,
+    type ItemCollectionChange,
+    type ReadonlyItemCollection,
+} from "./modules/ItemCollection";
+import { CollectionLayerSource, type ReadonlyCollectionLayerSource } from "./modules/LayerDataSource";
 import { DEFAULT_VALUES } from "./constants";
 import { validateCoords, validateScale } from "./utils/validateConfig";
 import { fitScale } from "./utils/fitScale";
@@ -55,6 +61,10 @@ import {
     PathDecorationStyle,
 } from "./types";
 
+/** Prepared input for a draw helper: the items to hand the renderer, plus the
+ * collection source that owns them when the input was a live collection. */
+type PreparedDrawItems<T extends object> = { data: T | T[]; source?: CollectionLayerSource<T> };
+
 /**
  * Core engine wiring camera, config, renderer, events, and draw helpers.
  */
@@ -70,7 +80,10 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
     private drawIds = new Map<string, { handle: DrawHandle; cacheKey?: string }>();
     private drawIdByHandle = new Map<symbol, string>();
     private eventHandlersListeners = new Set<(handlers: Readonly<EventHandlers>) => void>();
-    private collectionBindings = new Map<symbol, { handle: DrawHandle; unsubscribe: () => void }>();
+    private collectionBindings = new Map<
+        symbol,
+        { handle: DrawHandle; source: CollectionLayerSource<object>; unsubscribe: () => void }
+    >();
     private pendingFrame: number | undefined;
     private renderRequested = false;
     private renderGeneration = 0;
@@ -893,9 +906,9 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
 
     // ─── Draw helpers ───────────
 
-    private prepareDrawItems<T>(items: DrawItems<T>): T | T[] {
+    private prepareDrawItems<T extends object>(items: DrawItems<T>): PreparedDrawItems<T> {
         if (!isItemCollection<T>(items)) {
-            return items;
+            return { data: items };
         }
         if (this.destroyed) {
             throw new Error("[CanvasTileEngine] Cannot register an ItemCollection on a destroyed engine.");
@@ -905,40 +918,67 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
                 "[CanvasTileEngine] This renderer must implement applyDrawChanges to draw an ItemCollection.",
             );
         }
-        // A registration owns one stable view, updated only by delivered
-        // deltas. Reentrant source mutations cannot get ahead of its indexes.
-        return items.items.slice();
+        // One collection-driven source owns the ordered view and the spatial
+        // index. The renderer receives that same live array, so culling, hit
+        // testing, and paint order read a single identity the source keeps in
+        // sync with the collection (never a per-registration copy).
+        const source = new CollectionLayerSource<T>(items);
+        return { data: source.items as T[], source };
     }
 
-    private bindCollection<T>(handle: DrawHandle, items: DrawItems<T>, data: T | T[]): void {
-        if (!isItemCollection<T>(items)) {
+    private bindCollection<T extends object>(handle: DrawHandle, prepared: PreparedDrawItems<T>): void {
+        const source = prepared.source;
+        if (!source) {
             return;
         }
-        const values = data as T[];
-        const keys = values.map((_, index) => items.keyAt(index));
-        this.hitTester.attachCollection(handle, { keyAt: (index) => keys[index] });
+        this.hitTester.attachCollection(handle, { keyAt: (index) => source.keyAt(index) });
+        this.hitTester.attachSource(handle, source as unknown as ReadonlyCollectionLayerSource<object>);
         const draw = this.renderer.getDrawAPI();
-        const unsubscribe = items.subscribe((changes) => {
+        const unsubscribe = source.subscribe((changes) => {
             if (this.destroyed || !this.collectionBindings.has(handle.id)) {
                 return;
-            }
-            for (const change of changes) {
-                if (change.type === "insert") {
-                    values.push(change.item);
-                    keys.push(change.key);
-                } else if (change.type === "update") {
-                    values[change.index] = change.item;
-                } else {
-                    values.splice(change.index, 1);
-                    keys.splice(change.index, 1);
-                }
             }
             // Update geometry synchronously before the coalesced frame.
             this.hitTester.applyChanges(handle, changes as readonly ItemCollectionChange<HitItem>[]);
             draw.applyDrawChanges!(handle, changes);
             this.requestRender();
         });
-        this.collectionBindings.set(handle.id, { handle, unsubscribe });
+        this.collectionBindings.set(handle.id, {
+            handle,
+            // The source is generic over the item kind; the registry only needs
+            // its lifecycle, so erasing T here is safe.
+            source: source as unknown as CollectionLayerSource<object>,
+            unsubscribe,
+        });
+    }
+
+    /**
+     * The collection-driven data source backing a live registration, or
+     * `undefined` for ordinary item/array/static drawings. Its `items` array
+     * is the same one the renderer culls from, and its spatial index is the
+     * one hit testing queries, so `query`/`queryPoint` always agree with what
+     * is drawn and hit. Returns `undefined` after the registration is removed
+     * or its layer is cleared.
+     */
+    getLayerSource<T extends object = Record<string, unknown>>(
+        handle: DrawHandle,
+    ): CollectionLayerSource<T> | undefined {
+        return this.collectionBindings.get(handle.id)?.source as CollectionLayerSource<T> | undefined;
+    }
+
+    /**
+     * Replace the collection observed by an existing live registration. The
+     * previous collection is unsubscribed before the new one is adopted, so
+     * later mutations of the old collection cannot reach the index. The draw
+     * handle, paint order, and layer position stay the same.
+     */
+    setLayerCollection<T extends object>(handle: DrawHandle, collection: ReadonlyItemCollection<T>): void {
+        const binding = this.collectionBindings.get(handle.id);
+        if (!binding) {
+            throw new Error("[CanvasTileEngine] setLayerCollection: handle is not a live collection registration.");
+        }
+        (binding.source as unknown as CollectionLayerSource<T>).setCollection(collection);
+        this.requestRender();
     }
 
     private unbindCollection(handle: DrawHandle): void {
@@ -948,6 +988,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         }
         this.collectionBindings.delete(handle.id);
         binding.unsubscribe();
+        binding.source.dispose();
     }
 
     private clearCollectionBindings(layer?: number): void {
@@ -1028,7 +1069,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 1,
         options?: RectDrawOptions<TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         // TData only narrows the callback's item type for callers; renderers
         // hand back items from this same registration, so widening is safe.
@@ -1045,7 +1087,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             });
         }
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 
@@ -1156,7 +1198,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 1,
         options?: LineDrawOptions<TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         const handle = this.renderer.getDrawAPI().drawLine(data, style, layer, {
             styleOf: options?.styleOf as StyleOf<Line, LineDecorationStyle> | undefined,
@@ -1172,7 +1215,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             });
         }
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 
@@ -1192,7 +1235,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 1,
         options?: CircleDrawOptions<TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         const handle = this.renderer.getDrawAPI().drawCircle(data, layer, {
             styleOf: options?.styleOf as StyleOf<Circle, ShapeDecorationStyle> | undefined,
@@ -1207,7 +1251,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             });
         }
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 
@@ -1242,7 +1286,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 2,
         options?: TextDrawOptions<TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         const handle = this.renderer.getDrawAPI().drawText(data, layer, {
             styleOf: options?.styleOf as StyleOf<Text, TextDecorationStyle> | undefined,
@@ -1250,7 +1295,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             clip: options?.clip,
         });
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 
@@ -1287,7 +1332,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 1,
         options?: PathDrawOptions<TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         const list = Array.isArray(data) ? data : [data];
         const handle = this.renderer.getDrawAPI().drawPath(list, layer, {
@@ -1303,7 +1349,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             });
         }
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 
@@ -1324,7 +1370,8 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
         layer: number = 1,
         options?: ImageDrawOptions<TImage, TData>,
     ): DrawHandle {
-        const data = this.prepareDrawItems(items);
+        const prepared = this.prepareDrawItems(items);
+        const data = prepared.data;
         this.replacePreviousDraw(options?.id);
         const handle = this.renderer.getDrawAPI().drawImage(data, layer, {
             visibleOf: options?.visibleOf as VisibleOf<ImageItem<TImage>> | undefined,
@@ -1338,7 +1385,7 @@ export class CanvasTileEngine<TMount = DefaultMount, TImage = DefaultImage> {
             });
         }
         this.trackDrawId(options?.id, handle);
-        this.bindCollection(handle, items, data);
+        this.bindCollection(handle, prepared);
         return handle;
     }
 

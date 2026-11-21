@@ -46,6 +46,11 @@ export {
     type ItemKey,
     type DrawItems,
 } from "./modules/ItemCollection";
+export {
+    CollectionLayerSource,
+    type LayerDataSourceOptions,
+    type ReadonlyCollectionLayerSource,
+} from "./modules/LayerDataSource";
 export type { HitResult, HitTestOptions, HitTestRectOptions, HitKind } from "./modules/HitTester";
 export { GestureProcessor } from "./modules/GestureProcessor";
 export type {

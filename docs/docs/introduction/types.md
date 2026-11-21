@@ -186,6 +186,8 @@ type DrawItems<T> = T | T[] | ReadonlyItemCollection<T>;
 
 Collection hit results add `key?: ItemKey`; `index` remains the item's current array position. Ordinary single-item and array hits have no `key` field.
 
+Each live registration is backed by a `CollectionLayerSource` — one ordered item view plus one spatial index, reachable through `engine.getLayerSource(handle)` and swappable through `engine.setLayerCollection(handle, collection)`. `ReadonlyCollectionLayerSource<T>` and `LayerDataSourceOptions<T>` describe it; all three are exported by core, React, and React Native. See [The Layer Data Source](../js/item_collections.md#the-layer-data-source).
+
 ### `DrawOptions`
 
 ```ts

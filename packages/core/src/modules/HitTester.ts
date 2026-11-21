@@ -15,6 +15,7 @@ import { maxPxExtent, resolveBoxWorld, resolveSizeWorld } from "../utils/itemSiz
 import { resolveOrigin, computeOriginOffset } from "../utils/origin";
 import { SpatialIndex, type SpatialIndexToken } from "./SpatialIndex";
 import type { ItemCollectionChange, ItemKey, ReadonlyItemCollection } from "./ItemCollection";
+import type { ReadonlyCollectionLayerSource } from "./LayerDataSource";
 
 /** Primitive kinds that participate in hit testing. */
 export type HitKind = "rect" | "circle" | "image" | "path" | "line";
@@ -99,9 +100,13 @@ type HitEntry = {
     indexMap?: Map<HitItem, number>;
     /** Live collection metadata; its stable array is shared with `items`. */
     collection?: Pick<ReadonlyItemCollection<unknown>, "keyAt">;
+    /** Collection-driven spatial source shared with the layer's draw registration. */
+    source?: ReadonlyCollectionLayerSource<object>;
     indexTokens?: Map<HitItem, SpatialIndexToken<BoxedItem>>;
     worldExtents?: ExtentTracker;
     pixelExtents?: ExtentTracker;
+    /** Ordered dense positions maintained by the collection source. */
+    sourceIndexMap?: Map<HitItem, number>;
 };
 
 /** Count extents so removals and size reductions can shrink the query padding. */
@@ -248,7 +253,7 @@ export class HitTester {
         });
     }
 
-    /** Attach metadata after registration, without owning a second subscription. */
+    /** Attach collection metadata after registration, without owning a second subscription. */
     attachCollection(handle: DrawHandle, collection: Pick<ReadonlyItemCollection<unknown>, "keyAt">): void {
         const entry = this.entries.get(handle.id);
         if (!entry) {
@@ -263,6 +268,39 @@ export class HitTester {
         for (const item of entry.items) {
             entry.worldExtents.add(worldExtent(item));
             entry.pixelExtents.add(maxPxExtent(item as Rect));
+        }
+    }
+
+    /**
+     * Attach a collection-driven spatial source. The source owns the spatial
+     * index and the ordered view; point and rectangle queries read both from
+     * it, so culling, hits, and paint order can never diverge. The hit tester
+     * keeps its own per-item extents (the query padding) in sync through
+     * {@link applyChanges}, and for line/path kinds the source supplies only
+     * the ordering, not hit geometry.
+     */
+    attachSource(handle: DrawHandle, source: ReadonlyCollectionLayerSource<object>): void {
+        const entry = this.entries.get(handle.id);
+        if (!entry) {
+            return;
+        }
+        entry.source = source;
+        entry.sourceIndexMap = new Map(entry.items.map((item, index) => [item, index]));
+        if (entry.kind === "path" || entry.kind === "line") {
+            return;
+        }
+        // Line/path geometry is scale-resolved per query and has no anchor
+        // box; everything else uses the source's indexed, ordered view.
+        entry.index = null;
+        entry.indexTokens = undefined;
+        entry.indexMap = undefined;
+        entry.worldExtents ??= new ExtentTracker();
+        entry.pixelExtents ??= new ExtentTracker();
+        if (!entry.collection) {
+            for (const item of entry.items) {
+                entry.worldExtents.add(worldExtent(item));
+                entry.pixelExtents.add(maxPxExtent(item as Rect));
+            }
         }
     }
 
@@ -315,12 +353,23 @@ export class HitTester {
                     entry.indexMap!.set(next, change.index);
                 }
             }
+            if (entry.sourceIndexMap) {
+                if (previous) {
+                    entry.sourceIndexMap.delete(previous);
+                }
+                if (next) {
+                    entry.sourceIndexMap.set(next, change.index);
+                }
+            }
             removed ||= change.type === "remove";
         }
         // Dense array positions shift after removal, while the R-Tree's stable
         // paint order needs no rebuild. Do this once per notification batch.
         if (removed && entry.indexMap) {
             entry.indexMap = new Map(entry.items.map((item, index) => [item, index]));
+        }
+        if (removed && entry.sourceIndexMap) {
+            entry.sourceIndexMap = new Map(entry.items.map((item, index) => [item, index]));
         }
         if (entry.worldExtents && entry.pixelExtents) {
             entry.maxSize = entry.worldExtents.max;
@@ -366,8 +415,27 @@ export class HitTester {
             // Paths and lines have no single anchor point for the R-Tree;
             // they always linear-scan (typically few, geometry-heavy items).
             const indexable = entry.kind !== "path" && entry.kind !== "line";
+            const source = entry.source;
 
-            if (indexable && entry.items.length > SPATIAL_INDEX_THRESHOLD) {
+            if (source && indexable) {
+                // The collection source owns the ordered index. Query it with a
+                // conservative pad (origin shift + pixel extents), so an item
+                // whose drawn box reaches past its anchor box still resolves.
+                const sizePxPad = entry.ignoreSizePx ? 0 : entry.maxSizePx / this.getScale();
+                const pad = 0.5 + entry.maxSize + sizePxPad + padding;
+                const candidates = source.query(
+                    { minX: point.x - pad, maxX: point.x + pad, minY: point.y - pad, maxY: point.y + pad },
+                    0,
+                );
+                const positions = entry.sourceIndexMap!;
+                for (const candidate of candidates) {
+                    const item = candidate as HitItem;
+                    if (!this.testItem(point, item, entry, padding)) {
+                        continue;
+                    }
+                    results.push(this.resultFor(entry, item, positions.get(item)!));
+                }
+            } else if (indexable && entry.items.length > SPATIAL_INDEX_THRESHOLD) {
                 this.ensureIndex(entry);
                 // The index stores anchor-centered boxes; origin modes shift the
                 // drawn box by up to half a cell (or half the item size), so pad
@@ -422,6 +490,7 @@ export class HitTester {
     }
 
     private resultFor(entry: HitEntry, item: HitItem, index: number): HitResult & { seq: number } {
+        const keySource = entry.source ?? entry.collection;
         return {
             item,
             kind: entry.kind,
@@ -429,7 +498,7 @@ export class HitTester {
             handle: entry.handle,
             index,
             seq: entry.seq,
-            ...(entry.collection ? { key: entry.collection.keyAt(index) } : {}),
+            ...(keySource ? { key: keySource.keyAt(index) } : {}),
         };
     }
 
@@ -628,7 +697,28 @@ export class HitTester {
             }
 
             const indexable = entry.kind !== "path" && entry.kind !== "line";
-            if (indexable && entry.items.length > SPATIAL_INDEX_THRESHOLD) {
+            const source = entry.source;
+            if (source && indexable) {
+                // Same conservative anchor padding as the point query.
+                const pad = 0.5 + entry.maxSize + (entry.ignoreSizePx ? 0 : entry.maxSizePx / this.getScale());
+                const candidates = source.query(
+                    {
+                        minX: region.minX - pad,
+                        maxX: region.maxX + pad,
+                        minY: region.minY - pad,
+                        maxY: region.maxY + pad,
+                    },
+                    0,
+                );
+                const positions = entry.sourceIndexMap!;
+                for (const candidate of candidates) {
+                    const item = candidate as HitItem;
+                    if (!this.testItemRect(region, item, entry, mode)) {
+                        continue;
+                    }
+                    results.push(this.resultFor(entry, item, positions.get(item)!));
+                }
+            } else if (indexable && entry.items.length > SPATIAL_INDEX_THRESHOLD) {
                 this.ensureIndex(entry);
                 // Same conservative anchor padding as the point query.
                 const pad = 0.5 + entry.maxSize + (entry.ignoreSizePx ? 0 : entry.maxSizePx / this.getScale());

@@ -73,19 +73,49 @@ Hit geometry updates synchronously before the next paint, also above 500
 items. Existing clip/visibility/interaction rules still apply; Text does
 not hit-test.
 
+## Layer Data Source
+
+Each live registration owns a `CollectionLayerSource`: the ordered item view
+the renderer culls from plus the RBush index hit testing queries. They stay in
+sync with the collection, so culling, hits, and paint order read one ordered
+source.
+
+```ts
+const layer = engine.getLayerSource(handle)!;
+layer.query({ minX: 0, maxX: 10, minY: 0, maxY: 10 }); // collection order
+layer.queryPoint(3, 4);
+engine.setLayerCollection(handle, nextCollection); // swaps, detaches old
+```
+
+- `getLayerSource(handle)` returns the source, or `undefined` for ordinary
+  item/array/static drawings and after removal.
+- `setLayerCollection(handle, collection)` replaces the observed collection;
+  the previous subscription detaches first. Throws for a non-collection handle.
+- `source.items` is the renderer's own array. `source.query` and
+  `source.queryPoint` return items in collection order. `source.syncCount`
+  counts sync passes: initial build plus one per notification (batch = one).
+- Insert/update/remove reach the index synchronously. A batch is one
+  notification and one sync pass. Removed items leave the index immediately.
+  A rejected duplicate-key insert leaves collection, index, and order intact.
+- The source indexes with `itemsBounds` (cell boxes; line/path endpoint/vertex
+  boxes). Pixel extents and measured text are not in that box.
+
+## Cleanup
+
 `engine.requestRender()` coalesces requests into one animation frame, or a
 microtask without rAF. Collections and React child repaints share it.
 `render()` remains synchronous and consumes a pending request. Destroy
 cancels pending frames. Remove, id replacement, clearLayer, clearAll, and
-destroy detach affected subscriptions. Sources remain reusable and can be
-shared across engines/registrations.
+destroy detach affected subscriptions and dispose the registration's layer
+source, so later mutations of the old collection cannot reach its index.
+Sources remain reusable and can be shared across engines/registrations.
 
-Each registration copies the initial array once into a stable view. Changes
-update affected cached/indexed entries without replacing the handle. This
-does not promise constant-time removal (dense positions shift), no future
-index rebuild (zoom/font metrics may invalidate caches), or partial GPU
-buffer upload. Keep `styleOf` for non-geometric hover/selection decoration.
-Ordinary arrays still need re-registration after geometry changes.
+Each registration builds its layer source once. Changes update affected
+cached/indexed entries without replacing the handle. This does not promise
+constant-time removal (dense positions shift), no future index rebuild
+(zoom/font metrics may invalidate caches), or partial GPU buffer upload. Keep
+`styleOf` for non-geometric hover/selection decoration. Ordinary arrays still
+need re-registration after geometry changes.
 
 Custom renderer authors implement optional `IDrawAPI.applyDrawChanges` to
 accept collections. Core updates the stable registration array first, then

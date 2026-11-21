@@ -59,6 +59,7 @@ export {
     ConfigValidationError,
     ItemCollection,
     isItemCollection,
+    CollectionLayerSource,
     gridToSize,
     fitScale,
     itemsBounds,
@@ -79,6 +80,8 @@ export type {
     ItemCollectionChange,
     ReadonlyItemCollection,
     DrawItems,
+    LayerDataSourceOptions,
+    ReadonlyCollectionLayerSource,
 } from "@canvas-tile-engine/core";
 
 // Re-export the rest of core's app-facing types (everything but the
