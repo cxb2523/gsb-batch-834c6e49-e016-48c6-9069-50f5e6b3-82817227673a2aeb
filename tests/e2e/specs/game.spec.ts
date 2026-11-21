@@ -1,5 +1,99 @@
 import { expect, test, type Page } from '@playwright/test';
 
+const BOARD_SIZE = 8;
+
+interface StoredSessionPiece {
+  cells: Array<[number, number]>;
+}
+
+interface StoredSession {
+  board: Array<Array<string | null>>;
+  combo: number;
+  gameOver: boolean;
+  pieces: Array<StoredSessionPiece | null>;
+  score: number;
+}
+
+async function readAudioPlays(page: Page) {
+  return page.evaluate(
+    () =>
+      (window as Window & { __superBlocksAudioPlays?: string[] })
+        .__superBlocksAudioPlays ?? []
+  );
+}
+
+async function readSession(page: Page): Promise<StoredSession> {
+  const session = await page.evaluate(() => {
+    const stored = window.sessionStorage.getItem('block-blast-active-game');
+    return stored ? JSON.parse(stored) : null;
+  });
+  expect(session).not.toBeNull();
+  return session as StoredSession;
+}
+
+async function injectSession(page: Page, session: unknown) {
+  await page.evaluate((value) => {
+    window.sessionStorage.setItem(
+      'block-blast-active-game',
+      JSON.stringify(value)
+    );
+  }, session);
+}
+
+function findValidPlacement(session: StoredSession) {
+  for (
+    let pieceIndex = 0;
+    pieceIndex < session.pieces.length;
+    pieceIndex += 1
+  ) {
+    const piece = session.pieces[pieceIndex];
+    if (!piece) continue;
+    for (let row = 0; row < BOARD_SIZE; row += 1) {
+      for (let column = 0; column < BOARD_SIZE; column += 1) {
+        const fits = piece.cells.every(([cellRow, cellColumn]) => {
+          const targetRow = row + cellRow;
+          const targetColumn = column + cellColumn;
+          return (
+            targetRow < BOARD_SIZE &&
+            targetColumn < BOARD_SIZE &&
+            session.board[targetRow][targetColumn] === null
+          );
+        });
+        if (fits) return { column, pieceIndex, row };
+      }
+    }
+  }
+  return null;
+}
+
+function createCraftedSession(
+  overrides: Record<string, unknown> & {
+    board: Array<Array<string | null>>;
+    pieces: unknown;
+  }
+) {
+  return {
+    challengeComplete: false,
+    combo: 0,
+    dailyDate: null,
+    elapsedSeconds: 12,
+    gameOver: false,
+    generation: 4,
+    mode: 'classic',
+    movesWithoutClear: 0,
+    score: 100,
+    seed: 99,
+    version: 4,
+    ...overrides,
+  };
+}
+
+function createEmptyBoard() {
+  return Array.from({ length: BOARD_SIZE }, () =>
+    Array<string | null>(BOARD_SIZE).fill(null)
+  );
+}
+
 async function preparePage(page: Page) {
   const errors: string[] = [];
   page.on('console', (message) => {
@@ -284,6 +378,262 @@ test.describe('Super Blocks', () => {
     await page.goto('/play/not-a-mode');
     await expect(page).toHaveURL('/');
     await expect(page.getByTestId('start-classic')).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
+  test('restores the settled state when refreshing during the clear animation', async ({
+    page,
+  }) => {
+    const errors = await openHome(page);
+    await page.getByTestId('start-classic').click();
+    await placePiece(page, 0, 0, 0);
+    await placePiece(page, 1, 0, 3);
+    await placePiece(page, 2, 0, 6);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+    await expect(page.getByTestId('game-score')).toHaveText('18');
+
+    await page.reload();
+
+    // The restored session is the settled state: the cleared line stays
+    // cleared, the score is kept, and no animation replays.
+    await expect(page.getByTestId('block-game')).toHaveAttribute(
+      'data-ready',
+      'true'
+    );
+    await expect(page.getByTestId('game-score')).toHaveText('18');
+    await expect(page.getByTestId('clear-effect')).toHaveCount(0);
+    await expect(page.locator('.board-cell.is-occupied')).toHaveCount(0);
+    await expect(page.locator('.board-cell.is-clearing')).toHaveCount(0);
+
+    const session = await readSession(page);
+    expect(session.score).toBe(18);
+    expect(session.combo).toBe(1);
+
+    // The clear sound is not replayed after the reload.
+    const plays = await readAudioPlays(page);
+    expect(plays.filter((src) => src.endsWith('line-clear.mp3'))).toEqual([]);
+
+    // The board is immediately playable again.
+    const move = findValidPlacement(session);
+    expect(move).not.toBeNull();
+    if (!move) return;
+    const placedCells = session.pieces[move.pieceIndex]?.cells.length ?? 0;
+    await placePiece(page, move.pieceIndex, move.row, move.column);
+    await expect(page.getByTestId('game-score')).toHaveText(
+      String(18 + placedCells)
+    );
+    expect(errors).toEqual([]);
+  });
+
+  test('keeps the board playable when leaving for settings during the clear animation', async ({
+    page,
+  }) => {
+    const errors = await openHome(page);
+    await page.getByTestId('start-classic').click();
+    await placePiece(page, 0, 0, 0);
+    await placePiece(page, 1, 0, 3);
+    await placePiece(page, 2, 0, 6);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+
+    await page.getByRole('link', { name: 'Settings' }).click();
+    await expect(page).toHaveURL(/\/settings$/);
+    await page.getByRole('button', { name: 'Go back' }).click();
+
+    await expect(page).toHaveURL(/\/play\/classic$/);
+    await expect(page.getByTestId('game-score')).toHaveText('18');
+    await expect(page.getByTestId('clear-effect')).toHaveCount(0);
+
+    // The settlement lock is released: pieces can be placed again.
+    const session = await readSession(page);
+    const move = findValidPlacement(session);
+    expect(move).not.toBeNull();
+    if (!move) return;
+    const placedCells = session.pieces[move.pieceIndex]?.cells.length ?? 0;
+    await expect(
+      page.getByTestId(`game-piece-${move.pieceIndex}`)
+    ).toBeEnabled();
+    await placePiece(page, move.pieceIndex, move.row, move.column);
+    await expect(page.getByTestId('game-score')).toHaveText(
+      String(18 + placedCells)
+    );
+    expect(errors).toEqual([]);
+  });
+
+  test('settles consecutive clears exactly once and plays the combo sound with the clear', async ({
+    page,
+  }) => {
+    const errors = await openHome(page);
+    const board = createEmptyBoard();
+    // Row 0 is one cell short of a clear, row 1 is two cells short.
+    for (let column = 1; column < BOARD_SIZE; column += 1) {
+      board[0][column] = 'red';
+    }
+    for (let column = 2; column < BOARD_SIZE; column += 1) {
+      board[1][column] = 'blue';
+    }
+    await injectSession(
+      page,
+      createCraftedSession({
+        board,
+        pieces: [
+          {
+            color: 'red',
+            cells: [[0, 0]],
+            id: 'crafted-single',
+            key: 'single',
+          },
+          {
+            color: 'blue',
+            cells: [
+              [0, 0],
+              [0, 1],
+            ],
+            id: 'crafted-line',
+            key: 'line-2-h',
+          },
+          null,
+        ],
+        score: 100,
+      })
+    );
+    await page.goto('/play/classic');
+    await expect(page.getByTestId('block-game')).toHaveAttribute(
+      'data-ready',
+      'true'
+    );
+    await expect(page.getByTestId('game-score')).toHaveText('100');
+
+    // First clear: 1 placement point + 10 clear points at combo level 1.
+    await placePiece(page, 0, 0, 0);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+    await expect(page.getByTestId('game-score')).toHaveText('111');
+    await expect(page.getByTestId('clear-effect')).toHaveCount(0);
+    await expect(page.getByTestId('game-score')).toHaveText('111');
+
+    // Second consecutive clear: 2 placement points + 10 clear points
+    // doubled by combo level 2.
+    await placePiece(page, 1, 1, 0);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+    await expect(page.getByTestId('game-score')).toHaveText('133');
+    await expect(page.getByTestId('clear-effect')).toHaveCount(0);
+    await expect(page.getByTestId('game-score')).toHaveText('133');
+
+    const plays = await readAudioPlays(page);
+    expect(plays.filter((src) => src.endsWith('line-clear.mp3'))).toHaveLength(
+      2
+    );
+    expect(plays.filter((src) => src.endsWith('combo-2.mp3'))).toHaveLength(1);
+    expect(errors).toEqual([]);
+  });
+
+  test('restores a settled game over when refreshing during the clear animation', async ({
+    page,
+  }) => {
+    const errors = await openHome(page);
+    // Row 0 is empty only at (0,0), and a scattered set of holes keeps every
+    // other row and column incomplete. Placing the single block completes
+    // row 0; afterwards no 4-cell vertical run of empty cells exists, so
+    // the remaining vertical pieces cannot fit and the move ends the game.
+    const board = createEmptyBoard();
+    for (let row = 0; row < BOARD_SIZE; row += 1) {
+      for (let column = 0; column < BOARD_SIZE; column += 1) {
+        board[row][column] = (row + column) % 2 === 0 ? 'red' : 'blue';
+      }
+    }
+    board[0][0] = null;
+    const holes: Array<[number, number]> = [
+      [1, 0],
+      [2, 1],
+      [3, 2],
+      [4, 3],
+      [5, 4],
+      [6, 5],
+      [7, 6],
+      [1, 7],
+    ];
+    for (const [row, column] of holes) {
+      board[row][column] = null;
+    }
+    await injectSession(
+      page,
+      createCraftedSession({
+        board,
+        pieces: [
+          {
+            color: 'red',
+            cells: [[0, 0]],
+            id: 'crafted-single',
+            key: 'single',
+          },
+          {
+            color: 'blue',
+            cells: [
+              [0, 0],
+              [1, 0],
+              [2, 0],
+              [3, 0],
+              [4, 0],
+            ],
+            id: 'crafted-line-5v',
+            key: 'line-5-v',
+          },
+          {
+            color: 'green',
+            cells: [
+              [0, 0],
+              [1, 0],
+              [2, 0],
+              [3, 0],
+            ],
+            id: 'crafted-line-4v',
+            key: 'line-4-v',
+          },
+        ],
+        score: 50,
+      })
+    );
+    await page.goto('/play/classic');
+    await expect(page.getByTestId('game-score')).toHaveText('50');
+
+    await placePiece(page, 0, 0, 0);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+
+    await page.reload();
+
+    // The game-over settlement was part of the move, so the restored
+    // session shows the result directly instead of a dead board.
+    await expect(page.getByTestId('block-game')).toHaveAttribute(
+      'data-ready',
+      'true'
+    );
+    await expect(page.getByTestId('game-score')).toHaveText('61');
+    await expect(page.getByRole('dialog')).toBeVisible();
+    const session = await readSession(page);
+    expect(session.gameOver).toBe(true);
+
+    // The game-over sound is not replayed after the reload.
+    const plays = await readAudioPlays(page);
+    expect(plays.filter((src) => src.endsWith('game-over.ogg'))).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test('produces no audio playback while sound and music are disabled', async ({
+    page,
+  }) => {
+    const errors = await openHome(page);
+    await page.getByTestId('home-settings').click();
+    await page.getByRole('button', { name: /Background music/ }).click();
+    await page.getByRole('button', { name: /Sound effects/ }).click();
+    await page.getByRole('button', { name: 'Go back' }).click();
+
+    await page.getByTestId('start-classic').click();
+    await placePiece(page, 0, 0, 0);
+    await placePiece(page, 1, 0, 3);
+    await placePiece(page, 2, 0, 6);
+    await expect(page.getByTestId('clear-effect')).toBeVisible();
+    await expect(page.getByTestId('game-score')).toHaveText('18');
+
+    expect(await readAudioPlays(page)).toEqual([]);
     expect(errors).toEqual([]);
   });
 });

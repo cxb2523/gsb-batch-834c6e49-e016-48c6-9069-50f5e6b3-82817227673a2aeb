@@ -146,7 +146,11 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     () => () => {
       if (clearEffectTimerRef.current !== null) {
         window.clearTimeout(clearEffectTimerRef.current);
+        clearEffectTimerRef.current = null;
       }
+      // Never leave the settlement lock engaged: a remounted or reused game
+      // must accept placements again instead of staying disabled forever.
+      isResolvingRef.current = false;
     },
     []
   );
@@ -194,6 +198,13 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       setChallengeComplete(false);
     }
 
+    // A restored session is always the settled state: no clear animation
+    // replays and no settlement lock or timer may survive the restore.
+    if (clearEffectTimerRef.current !== null) {
+      window.clearTimeout(clearEffectTimerRef.current);
+      clearEffectTimerRef.current = null;
+    }
+    isResolvingRef.current = false;
     setExitConfirmationOpen(false);
     setClearEffect(null);
     setScreen('game');
@@ -238,6 +249,37 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
   useEffect(() => {
     persistActiveGame();
   }, [persistActiveGame]);
+
+  // Writes the settled outcome of a move synchronously, inside the same
+  // event handler that settles it. A refresh or a navigation to the settings
+  // page landing before the passive persist effect must still restore the
+  // post-settlement board, score, combo, pieces, and elapsed time.
+  const persistSettledRound = useCallback(
+    (
+      settledRound: GameRound,
+      settledFlags: { challengeComplete: boolean; gameOver: boolean }
+    ) => {
+      if (isReturningHomeRef.current || !isSessionReady || screen !== 'game') {
+        return;
+      }
+      writeActiveGameSession({
+        board: settledRound.board,
+        challengeComplete: settledFlags.challengeComplete,
+        combo: settledRound.combo,
+        dailyDate: dailyDateRef.current,
+        elapsedSeconds,
+        gameOver: settledFlags.gameOver,
+        generation: settledRound.generation,
+        mode,
+        movesWithoutClear: settledRound.movesWithoutClear,
+        pieces: settledRound.pieces,
+        score: settledRound.score,
+        seed: settledRound.seed,
+        version: 4,
+      });
+    },
+    [elapsedSeconds, isSessionReady, mode, screen]
+  );
 
   useEffect(() => {
     if (
@@ -307,25 +349,6 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
     });
   }, []);
 
-  const finishGame = useCallback(
-    (finalScore: number) => {
-      const nextBest = Math.max(bestScore, finalScore);
-      setBestScore(nextBest);
-      setGameOver(true);
-      recordScore(finalScore, mode);
-      stopMusic();
-      playSound('gameOver');
-      vibrate([50, 40, 90]);
-
-      try {
-        window.localStorage.setItem(BEST_SCORE_KEY, String(nextBest));
-      } catch {
-        // Keep the in-memory best score when storage is unavailable.
-      }
-    },
-    [bestScore, mode, playSound, recordScore, stopMusic, vibrate]
-  );
-
   const placePiece = useCallback(
     (pieceIndex: number, row: number, column: number) => {
       if (isResolvingRef.current) return false;
@@ -388,37 +411,37 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
       }
       vibrate(lineCount > 0 ? [20, 30, 35] : 12);
 
+      // End-of-game states settle together with the move itself, exactly
+      // once. The clear animation only gates when the result modals appear;
+      // it never defers score, sound, or session settlement.
       const target = GAME_MODE_TARGETS[mode];
-      if (target !== null && nextRound.score >= target) {
-        const completeChallenge = () => {
-          setChallengeComplete(true);
-          recordScore(nextRound.score, mode);
-          stopMusic();
-          playSound('challengeComplete');
-        };
-        if (lineCount > 0 && !preferences.reducedMotion) {
-          window.setTimeout(completeChallenge, CLEAR_EFFECT_DURATION);
-        } else {
-          completeChallenge();
-        }
-        return true;
+      const nextChallengeComplete =
+        target !== null && nextRound.score >= target;
+      const settledGameOver = !nextChallengeComplete && nextGameOver;
+      if (nextChallengeComplete) {
+        setChallengeComplete(true);
+        recordScore(nextRound.score, mode);
+        stopMusic();
+        playSound('challengeComplete');
+      } else if (settledGameOver) {
+        setGameOver(true);
+        recordScore(nextRound.score, mode);
+        stopMusic();
+        playSound('gameOver');
+        vibrate([50, 40, 90]);
       }
 
-      if (nextGameOver) {
-        window.setTimeout(
-          () => finishGame(nextRound.score),
-          lineCount > 0 && !preferences.reducedMotion
-            ? CLEAR_EFFECT_DURATION
-            : 220
-        );
-      }
+      persistSettledRound(nextRound, {
+        challengeComplete: nextChallengeComplete,
+        gameOver: settledGameOver,
+      });
       return true;
     },
     [
       bestScore,
-      finishGame,
       gameOver,
       mode,
+      persistSettledRound,
       playSound,
       preferences.reducedMotion,
       recordScore,
@@ -554,7 +577,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         </div>
       )}
 
-      {gameOver && (
+      {gameOver && clearEffect === null && (
         <div className="game-modal-backdrop">
           <section
             className={joinClasses(
@@ -614,7 +637,7 @@ export function BlockPuzzleGame({ routeMode }: { routeMode?: GameMode } = {}) {
         </div>
       )}
 
-      {challengeComplete && (
+      {challengeComplete && clearEffect === null && (
         <div className="game-modal-backdrop">
           <section
             className="game-modal game-over-modal challenge-complete-modal"
