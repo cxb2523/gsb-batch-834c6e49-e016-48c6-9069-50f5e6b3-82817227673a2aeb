@@ -1,0 +1,228 @@
+import { describe, expect, it } from "vitest";
+import {
+	backoffMs,
+	type ControllerMessage,
+	type HostMessage,
+	isControllerMessage,
+	isHostMessage,
+	parseControllerMessage,
+	parseHostMessage,
+} from "./protocol.ts";
+
+describe("isControllerMessage", () => {
+	it("accepts each variant of the union", () => {
+		const valid: ControllerMessage[] = [
+			{ t: "hello", v: 1 },
+			{ t: "hello", v: 1, resume: "p_abc" },
+			{ t: "ready", ready: true },
+			{ t: "aim", yaw: 0.2, pitch: -1.1 },
+			{ t: "swing", kind: "forehand", power: 0.75, at: 1234.5 },
+			{ t: "swing", kind: "overhead", power: 0.9, at: 1 },
+		];
+		for (const message of valid) {
+			expect(isControllerMessage(message), JSON.stringify(message)).toBe(true);
+		}
+	});
+
+	it("rejects malformed payloads", () => {
+		const invalid: unknown[] = [
+			null,
+			"hello",
+			42,
+			{},
+			{ t: "unknown" },
+			{ t: "ready", ready: "yes" },
+			{ t: "aim", yaw: 0 }, // pitch missing
+			{ t: "swing", kind: "volley", power: 0.5, at: 1 }, // not a SwingKind
+			{ t: "swing", kind: "serve", power: 1.5, at: 1 }, // power out of range
+			{ t: "hello", v: 1, resume: 7 },
+		];
+		for (const message of invalid) {
+			expect(isControllerMessage(message), JSON.stringify(message)).toBe(false);
+		}
+	});
+
+	// NaN survives JSON.parse as `null`, but arrives intact from an in-process
+	// sender. Either way it must never reach the simulation.
+	it("rejects non-finite numbers", () => {
+		expect(isControllerMessage({ t: "aim", yaw: Number.NaN, pitch: 0 })).toBe(
+			false,
+		);
+		expect(
+			isControllerMessage({
+				t: "swing",
+				kind: "serve",
+				power: 0.5,
+				at: Number.POSITIVE_INFINITY,
+			}),
+		).toBe(false);
+	});
+
+	it("narrows the union for the caller", () => {
+		const message: unknown = { t: "swing", kind: "backhand", power: 1, at: 0 };
+		expect(isControllerMessage(message)).toBe(true);
+		if (isControllerMessage(message) && message.t === "swing") {
+			// Compiles only if the guard narrows — this test is half type-level.
+			const kind: "forehand" | "backhand" | "overhead" | "serve" = message.kind;
+			expect(kind).toBe("backhand");
+		}
+	});
+});
+
+describe("parseControllerMessage", () => {
+	it("round-trips a valid message", () => {
+		expect(parseControllerMessage('{"t":"ready","ready":false}')).toEqual({
+			t: "ready",
+			ready: false,
+		});
+	});
+
+	it("returns null for invalid JSON rather than throwing", () => {
+		expect(parseControllerMessage("{not json")).toBeNull();
+	});
+
+	it("returns null for valid JSON that is not a message", () => {
+		expect(parseControllerMessage('{"t":"drop-tables"}')).toBeNull();
+	});
+});
+
+describe("isHostMessage", () => {
+	it("accepts each variant of the union", () => {
+		const valid: HostMessage[] = [
+			{ t: "host-hello", v: 1 },
+			{ t: "feedback", playerId: "p_abc", kind: "hit" },
+			{ t: "feedback", playerId: "p_abc", kind: "point" },
+		];
+		for (const message of valid) {
+			expect(isHostMessage(message), JSON.stringify(message)).toBe(true);
+		}
+	});
+
+	it("rejects malformed payloads", () => {
+		const invalid: unknown[] = [
+			null,
+			{ t: "host-hello" },
+			{ t: "host-hello", v: Number.NaN },
+			{ t: "feedback", kind: "hit" }, // playerId missing
+			{ t: "feedback", playerId: "p", kind: "explode" },
+			{ t: "swing", kind: "serve", power: 1, at: 0 }, // controller message
+		];
+		for (const message of invalid) {
+			expect(isHostMessage(message), JSON.stringify(message)).toBe(false);
+		}
+	});
+
+	// The score line the phones show. Presentation only, but it still comes
+	// over a socket anyone on the LAN can open, so it is checked like the rest.
+	const score = {
+		games: { near: 3, far: 2 },
+		points: { near: "30", far: "AD" },
+		serving: "far",
+		ball: "toss",
+	};
+	it("accepts a match announcement with or without a score line", () => {
+		expect(
+			isHostMessage({ t: "match", phase: "playing", server: "near" }),
+		).toBe(true);
+		expect(
+			isHostMessage({ t: "match", phase: "playing", server: "near", score }),
+		).toBe(true);
+	});
+
+	it.each([
+		["a NaN game count", { ...score, games: { near: Number.NaN, far: 0 } }],
+		["a negative game count", { ...score, games: { near: -1, far: 0 } }],
+		[
+			"a point that is not a tennis point",
+			{ ...score, points: { near: "99999", far: "0" } },
+		],
+		[
+			"a point that is not a string",
+			{ ...score, points: { near: 15, far: "0" } },
+		],
+		["no server", { ...score, serving: "middle" }],
+		["a ball that is nowhere", { ...score, ball: "lost" }],
+		["no games at all", { ...score, games: null }],
+	])("rejects a score line with %s", (_, bad) => {
+		expect(
+			isHostMessage({
+				t: "match",
+				phase: "playing",
+				server: "near",
+				score: bad,
+			}),
+		).toBe(false);
+	});
+
+	// The two inbound directions must not accept each other's traffic, or a
+	// misrouted socket would look like a working one.
+	it("does not accept controller messages, and vice versa", () => {
+		const controller: unknown = { t: "ready", ready: true };
+		const host: unknown = { t: "host-hello", v: 1 };
+		expect(isHostMessage(controller)).toBe(false);
+		expect(isControllerMessage(host)).toBe(false);
+	});
+});
+
+describe("parseHostMessage", () => {
+	it("round-trips a valid message", () => {
+		expect(parseHostMessage('{"t":"host-hello","v":1}')).toEqual({
+			t: "host-hello",
+			v: 1,
+		});
+	});
+
+	it("returns null for invalid JSON rather than throwing", () => {
+		expect(parseHostMessage("{nope")).toBeNull();
+	});
+});
+
+describe("swing spin", () => {
+	const swing = (extra: Record<string, unknown>) => ({
+		t: "swing",
+		kind: "forehand",
+		power: 0.5,
+		at: 12,
+		...extra,
+	});
+
+	it("accepts a swing with no spin at all — an older phone is still a phone", () => {
+		expect(isControllerMessage(swing({}))).toBe(true);
+	});
+
+	it("accepts spin across its full range", () => {
+		for (const spin of [-1, -0.25, 0, 0.5, 1]) {
+			expect(isControllerMessage(swing({ spin }))).toBe(true);
+		}
+	});
+
+	it("rejects spin outside [-1, 1] or not a number", () => {
+		for (const spin of [
+			-1.01,
+			1.01,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			"1",
+		]) {
+			expect(isControllerMessage(swing({ spin }))).toBe(false);
+		}
+	});
+});
+
+describe("backoffMs", () => {
+	it("doubles from half a second", () => {
+		expect([0, 1, 2, 3, 4].map(backoffMs)).toEqual([
+			500, 1000, 2000, 4000, 8000,
+		]);
+	});
+
+	// A phone in a pocket for ten minutes must not queue a reconnect storm,
+	// and must still come back promptly when it wakes.
+	it("caps so a long absence does not back off forever", () => {
+		expect(backoffMs(20)).toBe(8000);
+	});
+
+	it("never returns a negative or zero delay", () => {
+		for (let i = 0; i < 30; i++) expect(backoffMs(i)).toBeGreaterThan(0);
+	});
+});

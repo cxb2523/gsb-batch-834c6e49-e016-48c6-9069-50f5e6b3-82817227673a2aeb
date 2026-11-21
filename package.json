@@ -1,0 +1,41 @@
+{
+	"name": "couchcourt",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Motion controlled tennis for your living room, no console required.",
+	"license": "MIT",
+	"engines": {
+		"node": ">=24.3"
+	},
+	"config": {
+		"port": 5173
+	},
+	"scripts": {
+		"dev": "vite",
+		"start": "vite build && vite preview",
+		"build": "vite build",
+		"check": "biome ci .",
+		"format": "biome check --write .",
+		"typecheck": "tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.test.json",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"certs": "node scripts/setup-certs.ts",
+		"vault:check": "node scripts/check-vault.mjs"
+	},
+	"dependencies": {
+		"@phosphor-icons/core": "^2.1.1",
+		"qrcode-generator": "^2.0.4",
+		"three": "^0.186.0",
+		"ws": "^8.21.3"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.14",
+		"@types/node": "^24.13.6",
+		"@types/three": "^0.186.0",
+		"@types/ws": "^8.18.1",
+		"typescript": "^7.0.2",
+		"vite": "^8.3.0",
+		"vitest": "^5.0.1"
+	}
+}

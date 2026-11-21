@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<!-- Without an icon link the browser asks for /favicon.ico and 404s. -->
+		<link rel="icon" type="image/svg+xml" href="../logo.svg" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="dark" />
+		<meta name="theme-color" content="#05080c" />
+		<title>CouchCourt</title>
+		<!-- Every style on this page: tokens, lobby, score, settings. -->
+		<link rel="stylesheet" href="./host.css" />
+	</head>
+	<body>
+		<!-- Host display: runs the authoritative simulation and renders it
+		     (`src/host/render/`). -->
+		<canvas id="scene"></canvas>
+		<div id="ui"></div>
+		<script type="module" src="./main.ts"></script>
+	</body>
+</html>
