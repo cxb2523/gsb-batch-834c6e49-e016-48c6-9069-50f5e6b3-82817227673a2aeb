@@ -1,4 +1,5 @@
 import Plyr from 'plyr';
+import { getMessage } from '../../../shared/services/i18n.service';
 import type { ClipData } from '../../../entities/clip.entity';
 import plyrSprite from '../assets/plyr-sprite.svg?raw';
 import type { Preferences } from '../../../entities/preferences.entity';
@@ -15,8 +16,9 @@ export const getReviewPlayerMode = (): ReviewPlayerMode => { try { return sessio
 // A shell keeps its non-configurable HTML5 `quality` accessor off Video.js's tech.
 interface PlyrHtml5Internals extends Plyr {
   media: HTMLVideoElement;
-  elements: Plyr.Elements & { original: HTMLVideoElement };
+  elements: Plyr.Elements & { original: HTMLVideoElement; markers?: { points: DocumentFragment; tip: Element | null } };
   eventListeners: Array<{ element: EventTarget; type: string; callback: EventListener; options: AddEventListenerOptions | boolean }>;
+  config: Plyr.Options & { markers?: { enabled: boolean; points: Array<{ time: number; label: string }> } };
 }
 
 export class PlyrInstanceController {
@@ -28,11 +30,13 @@ export class PlyrInstanceController {
   private progress: PreciseProgressController | null = null;
   private mode: ReviewPlayerMode = getReviewPlayerMode();
   private nativeShell: HTMLVideoElement | null = null;
+  private isDisposed = false;
   constructor(private readonly playerHost: ReviewVideoHostPort) {}
   get video(): HTMLVideoElement | null { return this.host?.video ?? null; }
   get element(): HTMLDivElement | null { return this.host?.element ?? null; }
   get isPlyr(): boolean { return this.plyr !== null; }
   ensureMounted(preferences: Preferences | null, clip: ClipData | null, markerLabel: string, labels: PlayerControlLabels, addListeners: (video: HTMLVideoElement) => void): HTMLVideoElement {
+    if (this.isDisposed) throw new Error(getMessage('errVideoJsUnavailable'));
     if (this.host?.video.isConnected) return this.host.video;
     this.host = this.playerHost.mount(); addListeners(this.host.video); this.applyPreferences(preferences);
     if (this.mode === 'native-fallback') return this.host.video;
@@ -63,8 +67,12 @@ export class PlyrInstanceController {
         }
         // Plyr proxies media events as bubbling CustomEvents. Video.js already
         // forwards the tech events to #video; do not run site handlers twice.
+        // Bind this mount's Plyr instance explicitly: after a dispose/rebuild
+        // the media node's `plyr` back-reference may be missing (or stale).
+        const mountedPlyr = this.plyr;
+        const stopProxy = (event: Event): void => this.stopNativeProxyEvent(event, mountedPlyr);
         const types = new Set(internals.eventListeners.filter((listener) => listener.element === this.host?.video).map((listener) => listener.type));
-        for (const type of types) this.host.element.addEventListener(type, this.stopNativeProxyEvent);
+        for (const type of types) this.host.element.addEventListener(type, stopProxy);
         // Refresh Plyr's time/play state without dispatching a synthetic media
         // event through the site's watched-progress or freeze handlers.
         for (const listener of internals.eventListeners) {
@@ -78,10 +86,47 @@ export class PlyrInstanceController {
     } catch (error) { this.disposeControllers(); try { this.destroyPlyr(); } catch (disposeError) { console.warn('player-dispose-failed', disposeError); } this.plyr = null; this.mode = 'native-fallback'; this.host.video.controls = true; console.warn('player-init-failed-native-fallback', error); }
     return this.host.video;
   }
-  updateMarker(clip: ClipData | null, markerLabel: string): void { if (!this.plyr || !this.host?.element) return; const progress = this.host.element.querySelector('.plyr__progress'); if (!progress) return; progress.querySelectorAll('.plyr__progress__marker').forEach((el) => el.remove()); if (clip && clip.eventTime >= 0 && this.host.video.duration) { const marker = document.createElement('span'); marker.className = 'plyr__progress__marker'; marker.title = markerLabel; marker.style.left = `${(clip.eventTime / this.host.video.duration) * 100}%`; progress.appendChild(marker); } }
+  updateMarker(clip: ClipData | null, markerLabel: string): void {
+    if (!this.plyr || !this.host?.element || !this.host.video.isConnected) return;
+    const progress = this.host.element.querySelector('.plyr__progress');
+    if (!progress) return;
+    // Remove every marker — both the ones created by updateMarker on a previous
+    // clip and Plyr's own config markers — so a switched clip never keeps the
+    // previous event time on the progress bar.
+    progress.querySelectorAll('.plyr__progress__marker').forEach((el) => el.remove());
+    const internals = this.plyr as PlyrHtml5Internals;
+    // Plyr skips setMarkers while elements.markers is cached; dropping the cache
+    // makes the next durationchange/loadedmetadata rebuild from the new config.
+    if (internals.elements.markers) internals.elements.markers = undefined;
+    if (clip && clip.eventTime >= 0) {
+      internals.config.markers = { enabled: true, points: [{ time: clip.eventTime, label: markerLabel }] };
+      if (this.host.video.duration) {
+        const marker = document.createElement('span');
+        marker.className = 'plyr__progress__marker';
+        marker.title = markerLabel;
+        marker.style.left = `${(clip.eventTime / this.host.video.duration) * 100}%`;
+        progress.appendChild(marker);
+      }
+    } else {
+      internals.config.markers = { enabled: false, points: [] };
+    }
+  }
   applyPreferences(preferences: Preferences | null): void { if (!preferences || !this.host) return; this.host.element.classList.toggle('vacnet-keep-controls', preferences.keepControlsVisible); if (this.plyr) { if (Math.abs(this.plyr.volume - preferences.volume) > 0.001) this.plyr.volume = preferences.volume; if (this.plyr.muted !== preferences.muted) this.plyr.muted = preferences.muted; } else { if (Math.abs(this.host.video.volume - preferences.volume) > 0.001) this.host.video.volume = preferences.volume; if (this.host.video.muted !== preferences.muted) this.host.video.muted = preferences.muted; } this.volume?.update(); }
   updateVolumePopup(): void { this.volume?.update(); }
-  dispose(removeListeners: (video: HTMLVideoElement) => void): void { const video = this.host?.video; if (video) { if (this.host?.element.dataset.vacnetNativePlayer !== 'true') video.pause(); removeListeners(video); } this.disposeControllers(); try { this.destroyPlyr(); } catch (error) { console.warn('[VACNET] Plyr disposal failed.', error); } this.plyr = null; this.host = null; this.spriteContainer?.remove(); this.spriteContainer = null; this.playerHost.dispose(); }
+  dispose(removeListeners: (video: HTMLVideoElement) => void): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    const video = this.host?.video;
+    if (video) {
+      if (this.host?.element.dataset.vacnetNativePlayer !== 'true') video.pause();
+      removeListeners(video);
+    }
+    this.disposeControllers();
+    try { this.destroyPlyr(); } catch (error) { console.warn('[VACNET] Plyr disposal failed.', error); }
+    this.plyr = null; this.host = null;
+    this.spriteContainer?.remove(); this.spriteContainer = null;
+    this.playerHost.dispose();
+  }
   private destroyPlyr(): void {
     // The constructor stores this reference before wrapping/building. Recover it
     // when construction throws so partially registered listeners are released.
@@ -112,9 +157,9 @@ export class PlyrInstanceController {
     this.nativeShell?.remove();
     this.nativeShell = null;
   }
-  private readonly stopNativeProxyEvent = (event: Event): void => {
-    if (event instanceof CustomEvent && event.detail?.plyr === this.plyr) event.stopPropagation();
-  };
+  private stopNativeProxyEvent(event: Event, plyr: Plyr | null): void {
+    if (event instanceof CustomEvent && event.detail?.plyr === plyr) event.stopPropagation();
+  }
   private disposeControllers(): void { this.progress?.dispose(); this.share?.dispose(); this.volume?.dispose(); this.progress = null; this.share = null; this.volume = null; }
   private ensureSprite(): void { if (document.getElementById('vacnet-plyr-sprite')) return; const container = document.createElement('div'); container.id = 'vacnet-plyr-sprite'; container.style.display = 'none'; const svg = new DOMParser().parseFromString(plyrSprite, 'image/svg+xml').documentElement; if (svg instanceof SVGElement) container.appendChild(document.importNode(svg, true)); document.body.prepend(container); this.spriteContainer = container; }
 }

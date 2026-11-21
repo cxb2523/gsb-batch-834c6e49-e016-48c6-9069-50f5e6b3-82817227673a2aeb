@@ -96,7 +96,7 @@ export class VideoJsAdapter implements ReviewPlayerPort {
   async load(source: string, clip: ClipData, signal: AbortSignal): Promise<void> {
     if (signal.aborted) throw createAbortError();
     const generation = this.lifecycle.nextGeneration();
-    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal]);
+    const operationSignal = this.lifecycle.operationSignal(signal);
     const player = this.instance.getPlayer();
     if (!player) throw new Error(getMessage("errVideoJsUnavailable"));
     this.range = normalizeReviewRange(clip.range);

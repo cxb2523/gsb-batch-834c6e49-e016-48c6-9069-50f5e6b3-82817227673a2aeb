@@ -32,12 +32,14 @@ export class PlyrAdapter implements ReviewPlayerPort {
   private triggerOverlay: Extract<PlayerOverlayEvent, { kind: 'trigger' }> = { kind: 'trigger', phase: 'hidden', text: '' };
   private readonly lifecycle = new PlayerLifecycle();
   private readonly instance: PlyrInstanceController;
+  private isDisposed = false;
 
   constructor(private readonly options: PlyrAdapterOptions) {
     this.instance = new PlyrInstanceController(options.playerHost);
   }
 
   configure(preferences: Preferences, clip: ClipData): void {
+    if (this.isDisposed) return;
     this.preferences = { ...preferences };
     this.clip = clip;
     this.requireVideo();
@@ -88,14 +90,19 @@ export class PlyrAdapter implements ReviewPlayerPort {
   }
 
   async load(source: string, clip: ClipData, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) throw createAbortError();
+    if (this.isDisposed || signal.aborted) throw createAbortError();
+    // Every load takes over the lifecycle: waits registered by an older load are
+    // aborted here and their continuation checks below stop every late write.
     const generation = this.lifecycle.nextGeneration();
-    const operationSignal = AbortSignal.any([signal, this.lifecycle.signal]);
+    const operationSignal = this.lifecycle.operationSignal(signal);
     this.clip = clip;
     const video = this.requireVideo();
     this.range = normalizeReviewRange(clip.range);
     if (clip.reviewType === 'cheating') {
       // The site owns source selection, playback position and watched progress.
+      // Take over any loading mask left by a superseded legacy load, but never
+      // reload, pause or seek the site's own media.
+      this.instance.element?.classList.remove('vacnet-video-loading');
       this.instance.updateMarker(clip, this.options.catalog()?.triggerMarkerLabel ?? '');
       return;
     }
@@ -104,20 +111,26 @@ export class PlyrAdapter implements ReviewPlayerPort {
     this.instance.element?.classList.add('vacnet-video-loading');
 
     try {
-       const catalog = this.options.catalog();
-       if (!catalog) throw new Error(getMessage('errVideoJsEarlyConfig'));
-       const metadata = waitForPlyrMetadata(video, operationSignal, catalog);
+      const catalog = this.options.catalog();
+      if (!catalog) throw new Error(getMessage('errVideoJsEarlyConfig'));
+      const metadata = waitForPlyrMetadata(video, operationSignal, catalog);
       video.src = source;
-       video.load();
-       await metadata;
-        if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
-       video.currentTime = this.range.start;
-        this.instance.updateMarker(clip, catalog.triggerMarkerLabel);
-        await waitForPlyrTargetData(video, this.range.start, operationSignal, catalog);
-        if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
-       await this.play(video);
+      video.load();
+      await metadata;
+      if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
+      video.currentTime = this.range.start;
+      this.instance.updateMarker(clip, catalog.triggerMarkerLabel);
+      await waitForPlyrTargetData(video, this.range.start, operationSignal, catalog);
+      if (!this.lifecycle.isCurrent(generation)) throw createAbortError();
+      await this.play(video, generation);
+      if (!this.lifecycle.isCurrent(generation)) return;
     } finally {
-      if (this.lifecycle.isCurrent(generation)) this.instance.element?.classList.remove('vacnet-video-loading');
+      // Only the owning generation may touch the mask; a cancelled/superseded
+      // load leaves it for the load that replaced it instead of removing it
+      // from underneath a clip that is still loading.
+      if (this.lifecycle.isCurrent(generation)) {
+        this.instance.element?.classList.remove('vacnet-video-loading');
+      }
     }
   }
 
@@ -139,10 +152,15 @@ export class PlyrAdapter implements ReviewPlayerPort {
   }
 
   dispose(): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    // Aborts every pending metadata/seek wait so no late continuation can
+    // touch the host elements released below.
     this.lifecycle.dispose();
     if (this.stepTimeoutId !== null) window.clearTimeout(this.stepTimeoutId);
     this.stepTimeoutId = null;
     this.stepTargetTime = null;
+    this.instance.element?.classList.remove('vacnet-video-loading');
     this.instance.dispose((video) => this.removeVideoListeners(video));
   }
 
@@ -246,11 +264,18 @@ private readonly onEnded = (): void => {
   }
 
 
-  private async play(video: HTMLVideoElement): Promise<void> {
+  private async play(video: HTMLVideoElement, generation?: number): Promise<void> {
     try {
       await video.play();
     } catch (error) {
       console.error('video-playback-failed', error);
+      return;
+    }
+    // A play() promise resolved late: a newer clip may have paused the media in
+    // the meantime. Only the generation that requested playback may unpause it,
+    // and a disposed adapter must not touch the host it has already released.
+    if (generation !== undefined && !this.isDisposed && !this.lifecycle.isCurrent(generation)) {
+      video.pause();
     }
   }
 }

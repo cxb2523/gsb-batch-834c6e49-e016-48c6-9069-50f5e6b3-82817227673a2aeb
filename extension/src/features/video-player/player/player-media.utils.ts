@@ -9,13 +9,34 @@ export const createAbortError = (): DOMException => new DOMException(ABORT_ERROR
 export class PlayerLifecycle {
   private generation = 0;
   private readonly disposeController = new AbortController();
+  private generationController: AbortController | null = null;
 
   get signal(): AbortSignal { return this.disposeController.signal; }
-  nextGeneration(): number { return ++this.generation; }
+
+  /**
+   * Opens a new generation and aborts every wait owned by the previous one.
+   * The returned signal also covers disposal, so metadata/seek waits cannot
+   * outlive the player they were started for.
+   */
+  nextGeneration(): number {
+    this.generation += 1;
+    this.generationController?.abort();
+    this.generationController = new AbortController();
+    return this.generation;
+  }
+
   isCurrent(generation: number): boolean { return generation === this.generation && !this.signal.aborted; }
+
+  /** Signal aborted when this generation is superseded, cancelled externally or disposed. */
+  operationSignal(external: AbortSignal): AbortSignal {
+    const generationSignal = this.generationController?.signal ?? this.disposeController.signal;
+    return AbortSignal.any([external, generationSignal, this.disposeController.signal]);
+  }
 
   dispose(): void {
     this.generation += 1;
+    this.generationController?.abort();
+    this.generationController = null;
     this.disposeController.abort();
   }
 }
