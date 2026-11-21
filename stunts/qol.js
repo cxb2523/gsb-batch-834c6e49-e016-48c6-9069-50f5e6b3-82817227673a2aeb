@@ -783,12 +783,12 @@
       msg(r.full.length ? 'Browser storage full' : r.added.length ? 'Added ' + n : 'Not added');
       if (r.added.length) pickTrack(n + '.TRK');   // (the new track on the menu at once)
     });
-    // shown on the track menu (its 3D overview up)
+    // shown on the track menu (its 3D overview up and really on screen: hidden while a dialog covers it)
     // (placed every frame, from the 3D view's own canvas: from the page's HUD, hidden for a moment as the menu came up,
     // it was first placed by the 4:3 picture and then jumped)
     let drawn = '';
     const place = () => {
-      const on = !!(typeof view !== 'undefined' && view && view.previewView && !document.getElementById('setup'));
+      const on = !!(typeof view !== 'undefined' && view && view.previewCtl && view.previewCtl.active && !document.getElementById('setup'));
       const d = on ? 'block' : 'none'; if (btn.style.display !== d) btn.style.display = d;
       if (!on) return;
       const r = document.getElementById('screen').getBoundingClientRect(), u = r.height / 200;

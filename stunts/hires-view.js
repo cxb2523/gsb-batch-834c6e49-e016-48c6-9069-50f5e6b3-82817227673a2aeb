@@ -219,6 +219,9 @@ void main() {
       this.aoPass = !OG && root.StuntsAO && /[?&](ao|full)\b/.test(root.location.search) ?   // (off unless ?ao or ?full: a pass over the whole picture each frame, for little to see, issue 37)
          new root.StuntsAO(r) : null;
       this.seq = -1; this.lastFrame = 0;
+      // the track menu's overview interaction: an explicit enter/exit lifecycle (see preview-ctl.js)
+      this.previewCtl = root.StuntsPreviewCtl ? new root.StuntsPreviewCtl() : null;
+      this.pointer = null;
       this.prewarm();
     }
 
@@ -972,7 +975,7 @@ void main() {
       // period after the last, pulled gently towards when it arrived) and the view plays a little behind,
       // always between the two frames around its clock: motion never jumps when a frame comes early or late.
       if (seq !== this.seq) {
-        this.seq = seq; this.lastFrame = now; this.previewShown = false;
+        this.seq = seq; this.lastFrame = now;
         const f = this.snapshot(now), h = this.hist || (this.hist = []), last = h[h.length - 1];
         this.placeModern(f); this.preciseCars(f); this.addOpponent(f); this.sinkCars(f);
         // (the game's horizon now and then not matched for a frame: the last match stands (its colour bands are the
@@ -1027,7 +1030,12 @@ void main() {
       const cur = this.cur = hist[j], prev = this.prev = j > 0 ? hist[j - 1] : null, race = this.raceView = !!cur.cam;
       this.previewView = cur.preview;
       if (cur.preview) return this.renderPreview(now);
-      this.pvT0 = null; this.stage.visible = true; if (this.pvFrame) this.pvFrame.visible = false;
+      // (the overview has left the screen: release its drag and zoom at once, so a later visit starts fresh
+      // and a held button can never keep turning a picture that is no longer there)
+      if (this.previewCtl) this.previewCtl.exit();
+      this.pointer = null;
+      this.pvFrozen = null;   // (no held-over camera: the next visit computes its own default framing)
+      this.stage.visible = true; if (this.pvFrame) this.pvFrame.visible = false;
       // (OG mode: nothing eased, the original's own frame, for the ghost laid on its picture: ogGhostDraw)
       const a = this.easeA = prev && !this.ogHide ? Math.max(0, Math.min(1, (rt - prev.t) / Math.max(1, cur.t - prev.t))) : 1;
       // ease moving shapes from the same shape in the previous frame (nearest in the world)
@@ -2082,16 +2090,31 @@ void main() {
 
     // The track menu's overview in 3D: the whole track (the static meshes) on its land under the scenery's
     // sky and horizon, seen from above and slowly circled. Shown in the 4:3 frame like the menu around it.
+    // onScreen: whether the overview's see-through picture is really on the screen this frame. It is the
+    // single source of the interaction's lifecycle (enter when it appears, release-and-freeze when it goes),
+    // so input can never outlive the picture or be refused while the picture is still there.
+    setPreviewOnScreen(onScreen, now) {
+      const ctl = this.previewCtl;
+      if (!ctl) return;
+      if (onScreen) ctl.enter(now);
+      else ctl.exit();
+    }
+
+    // the page's latest pointer over the picture (null: the pointer is gone or the overview is not live).
+    // Kept here rather than in a loose property, and forwarded only to an active overview controller.
+    setPointer(pt) {
+      this.pointer = pt;
+      if (this.previewCtl) this.previewCtl.setPointer(pt);
+    }
+
     renderPreview(now) {
       const B = this.worldBox;
       if (!B) return false;
+      const ctl = this.previewCtl;
       for (let i = 0; i < NROOF; i++) ROOF.a.value[i].set(1, 1, 0, 0);   // (no tunnel shade from the last race on this overview)
       if (this.carSuns) { this.carSunsAt(false, [], null, SUN_DIR.value); this.nearSunAt(false); }   // (nor the cars' shadows, nor the near map's)
       this.domeEased = false;   // (its own sky colours: the next race's are put straight in, not eased from these)
       if (this.marks) { const X = this.marks; X.n = 0; X.head = 0; X.last.clear(); X.g.setDrawRange(0, 0); X.mesh.visible = false; }   // (no tyre marks from the last race)
-      if (this.pvT0 == null) { this.pvT0 = this.pvLast = now; this.pvAuto = 0; this.pvZoom = this.pvZoomTo = 1; this.pvHov = this.pvHovTo = 0; this.pvEl = this.pvElTo = null; this.pvDragAt = null; this.pvDragT = 0; }
-      const k = this.wide || 1, cx = (B.x0 + B.x1) / 2, cz = (B.z0 + B.z1) / 2;
-      const r = Math.max(2500, Math.hypot(B.x1 - B.x0, B.z1 - B.z0) / 2 + 600);
       // looking down el, the frame's centre a little below the view axis: more sky above, the horizon in view
       // the track midway between the title and the buttons, the skyline above it; as close as fits the frame's
       // width (the whole canvas, widescreen too) and the space between title and buttons
@@ -2099,28 +2122,25 @@ void main() {
       const pv = (/[?&]pv=([-\d.,]+)/.exec(root.location.search) || [])[1], [el0, shift, zoom] = pv ? pv.split(',').map(Number) : [0.19, -0.1, 0.96];
       const fov = 54 * Math.PI / 180, f = 1 / Math.tan(fov / 2);
       LINE_PX.value = 0.1;
-      // a turn in about 80 seconds; the pointer over the track (between the title and the buttons, moved in the
-      // last few seconds) turns it instead, half a turn across the picture, and it stays where it was left
-      const pt = this.pointer, dt = Math.min(100, now - this.pvLast); this.pvLast = now;
-      if (this.pvEl == null) this.pvEl = this.pvElTo = el0;
-      // dragged with the button held (over the track, between the title and the buttons): left and right turn it,
-      // up and down tilt it; let go, and it turns on its own again from there
-      const drag = pt && (pt.b & 1) && pt.y > 0.1 && pt.y < 0.82;
-      if (drag && this.pvDragAt) {
-        this.pvHovTo -= (pt.x - this.pvDragAt.x) * Math.PI * 1.5;
-        this.pvElTo = Math.max(0.08, Math.min(0.53, this.pvElTo + (pt.y - this.pvDragAt.y) * 0.6));
+      const k = this.wide || 1;
+      let az, el, dist, cx, cy, cz;
+      if (ctl && ctl.active) {
+        // the overview is really on screen: the controller owns heading, tilt and zoom (with their limits)
+        const fr = ctl.frame(now, B, k, f, el0, shift, zoom);
+        az = fr.az; el = fr.el; dist = fr.dist; cx = fr.cx; cy = fr.cy; cz = fr.cz;
+      } else {
+        // covered or between visits: hold the last framing, move nothing and take no input
+        const f0 = this.pvFrozen;
+        const r0 = Math.max(2500, Math.hypot(B.x1 - B.x0, B.z1 - B.z0) / 2 + 600);
+        cx = f0 ? f0.cx : (B.x0 + B.x1) / 2;
+        cy = f0 ? f0.cy : B.y1 * 0.3;
+        cz = f0 ? f0.cz : (B.z0 + B.z1) / 2;
+        az = f0 ? f0.az : 0.7;
+        el = f0 ? f0.el : el0;
+        dist = f0 ? f0.dist : zoom * Math.max(2 * r0 * f / (4 / 3) / k / 1.5, 2 * r0 * Math.sin(el0) * f / 0.8);
       }
-      this.pvDragAt = drag ? { x: pt.x, y: pt.y } : null;
-      if (drag) this.pvDragT = now;
-      if (!drag) this.pvAuto += dt * 0.00008;   // (turning on its own whenever it is not held)
-      const ease = 1 - Math.exp(-dt / 180);
-      this.pvHov += (this.pvHovTo - this.pvHov) * ease; this.pvEl += (this.pvElTo - this.pvEl) * ease;
-      const el = this.pvEl;
-      this.pvZoom = (this.pvZoom || 1) + ((this.pvZoomTo || 1) - (this.pvZoom || 1)) * ease;
-      const dist = zoom * this.pvZoom * Math.max(2 * r * f / (4 / 3) / k / 1.5, 2 * r * Math.sin(el) * f / 0.8);
-      const az = 0.7 + this.pvAuto + this.pvHov;
       const eye = new T.Vector3(cx + Math.sin(az) * Math.cos(el) * dist, B.y1 * 0.5 + Math.sin(el) * dist, cz + Math.cos(az) * Math.cos(el) * dist);
-      const target = new T.Vector3(cx, B.y1 * 0.3, cz);
+      const target = new T.Vector3(cx, cy, cz);
       this.cam.projectionMatrix.set(
         f / (4 / 3) / k, 0, 0, 0,
         0, f, shift, 0,
@@ -2130,6 +2150,7 @@ void main() {
       const camWorld = new T.Matrix4().lookAt(eye, target, new T.Vector3(0, 1, 0)).setPosition(eye);
       this.cam.matrixWorld.copy(camWorld); this.cam.matrixWorldInverse.copy(camWorld).invert();
       this.camPos = eye;
+      if (ctl && ctl.active) this.pvFrozen = { az, el, dist, cx, cy, cz };   // (where to hold while covered)
       // only the track and its land
       for (const h of this.hidden) { h.im.setMatrixAt(h.j, h.m); h.im.instanceMatrix.needsUpdate = true; }
       this.hidden = [];

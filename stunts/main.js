@@ -36,29 +36,54 @@ function pointer(e) {
   // rows narrow (see the clip in frame()), showing black boxes beside the picture
   const over = e.clientX >= r.left && e.clientX < r.right && e.clientY >= r.top && e.clientY < r.bottom;
   // (let go outside the picture: the drag and the game's button end all the same)
-  if (!over && e.type === 'pointerup') { pointer.drag = pointer.downInMenu = false; Atomics.store(mouseI, 3, 0); if (typeof view !== 'undefined' && view && view.pointer) view.pointer = { ...view.pointer, b: 0, t: performance.now() }; return; }
+  if (!over && e.type === 'pointerup') { endOverviewDrag(); pointer.downInMenu = false; Atomics.store(mouseI, 3, 0); if (typeof view !== 'undefined' && view && view.setPointer) view.setPointer(null); return; }
   // (a replay playing is a race view too, but its panel is worked with the mouse: the pointer stays the game's there)
   const driving = typeof view !== 'undefined' && view && view.raceView && performance.now() - (view.lastFrame || 0) < 300
     && !mem[(StuntsCode.DSEG << 4) + StuntsCode.SYM.game_replay_mode];
-  if (!over || driving) return;
+  if (!over || driving) {
+    // (the pointer left the picture while an overview drag was in flight: the drag ends there, it does not
+    // wait to resume when the pointer comes back; the game's own pointer outside the picture is untouched)
+    if (!over && e.type === 'pointermove' && pointer.drag) { endOverviewDrag(); Atomics.store(mouseI, 3, 0); }
+    return;
+  }
   Atomics.store(mouseI, 1, Math.max(0, Math.min(65535, Math.round((e.clientX - r.left) / r.width * 65535))));
   Atomics.store(mouseI, 2, Math.max(0, Math.min(65535, Math.round((e.clientY - r.top) / r.height * 65535))));
-  // (the track menu's 3D overview is turned by dragging: presses over it, between the title and the buttons, are not
-  // the game's, which would open the track picker)
-  // (only where the overview itself shows: the track picker or any dialog over it takes its clicks as before)
   const rx = (e.clientX - r.left) / r.width, ry = (e.clientY - r.top) / r.height;
-  let onPreview = typeof view !== 'undefined' && view && view.previewView && ry > 0.1 && ry < 0.82 && overviewAt(rx, ry);
+  // the overview's interaction is live only while its picture is really on screen (set each frame from
+  // the see-through pixels, frame()). A drag can start only there, and only with the pointer on the picture.
+  const pvLive = !!(typeof view !== 'undefined' && view && view.previewCtl && view.previewCtl.active);
+  // (only where the overview itself shows: the track picker or any dialog over it takes its clicks as before)
+  let onPreview = pvLive && ry > 0.1 && ry < 0.82 && overviewAt(rx, ry);
   // (a drag that began on the overview stays the overview's until let go, wherever it passes: not a press on a button)
-  if (e.type === 'pointerdown') pointer.drag = !!onPreview; else if (!e.buttons) pointer.drag = false;
-  if (pointer.drag && e.buttons) onPreview = true;
+  if (e.type === 'pointerdown') pointer.drag = !!onPreview; else if (!e.buttons) endOverviewDrag();
+  if (pointer.drag && e.buttons && pvLive) onPreview = true;
+  if (!pvLive) endOverviewDrag();   // (the picture went away mid-gesture: the drag dies with it)
   // (and a press that began before the track menu came up, as the click on the main menu's Track sign: not a click in it)
   const inMenu = typeof view !== 'undefined' && view && view.previewView;
   if (e.type === 'pointerdown') pointer.downInMenu = inMenu; else if (!e.buttons) pointer.downInMenu = false;
   if (e.buttons != null) Atomics.store(mouseI, 3, onPreview || (inMenu && !pointer.downInMenu) ? 0 : (e.buttons & 1 ? 1 : 0) | (e.buttons & 2 ? 2 : 0));
-  // (and for the track menu's 3D overview, turned by dragging: 0..1 across the picture, and the buttons held)
-  if (typeof view !== 'undefined' && view) view.pointer = { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height, t: performance.now(), b: onPreview ? e.buttons || 0 : 0 };
+  // (and for the track menu's 3D overview, turned by dragging: 0..1 across the picture, and the buttons held.
+  // b is zero unless the overview is the thing being touched, so a covered or hidden overview never turns)
+  if (typeof view !== 'undefined' && view && view.setPointer) {
+    view.setPointer(pvLive ? { x: rx, y: ry, t: performance.now(), b: onPreview ? e.buttons || 0 : 0 } : null);
+  } else if (typeof view !== 'undefined' && view) view.pointer = { x: rx, y: ry, t: performance.now(), b: onPreview ? e.buttons || 0 : 0 };
+}
+// release the overview's drag state outright (pointer up, pointer cancel, the window losing focus, the
+// picture leaving the screen): whatever happens afterwards, a held button can no longer turn the view
+function endOverviewDrag() {
+  pointer.drag = false;
+  if (typeof view !== 'undefined' && view) {
+    if (view.previewCtl) view.previewCtl.release();
+    if (view.setPointer && view.pointer) view.setPointer(null);
+    else view.pointer = null;
+  }
 }
 addEventListener('pointermove', pointer); addEventListener('pointerdown', pointer); addEventListener('pointerup', pointer);
+// (a gesture the browser takes back — touch interrupted, the pointer captured elsewhere — must end the drag too)
+addEventListener('pointercancel', () => { endOverviewDrag(); pointer.downInMenu = false; Atomics.store(mouseI, 3, 0); });
+// (Alt-Tab, another window or devtools opening while the button is held: no further pointer events may arrive,
+// so the drag and the game's button are released on losing the window)
+addEventListener('blur', () => { endOverviewDrag(); pointer.downInMenu = false; Atomics.store(mouseI, 3, 0); });
 // is the track menu's 3D overview showing at this point (0..1 across the picture)? The game's own cursor is drawn at the
 // pointer, its arrow down and to the right of the tip, so the pixel there is the cursor's: the ones just up and left of
 // it tell (over the track picker or a dialog, those are the box's own)
@@ -72,18 +97,23 @@ function overviewAt(rx, ry) {
 }
 // (the button still held from a click before the track menu came up: let go for the game at once)
 setInterval(() => { if (typeof view !== 'undefined' && view && view.previewView && !pointer.downInMenu && Atomics.load(mouseI, 3)) Atomics.store(mouseI, 3, 0); }, 15);
-// the wheel zooms the track menu's 3D overview (in: closer; clamped in renderPreview)
+let wheelAcc = 0;
+// the wheel has one owner per notch: the overview's zoom while its picture is under the pointer, the
+// dialog's list scroll over a dialog, and nothing (default page behaviour) anywhere else. The two never
+// respond together: preventDefault runs only inside the branch that actually handles the wheel.
 addEventListener('wheel', e => {
-  const r = canvas.getBoundingClientRect();
-  if (typeof view === 'undefined' || !view || view.pvT0 == null) return;
   if (document.querySelector('#trkio[open]')) return;   // (the import / export box: its own text boxes scroll)
+  const r = canvas.getBoundingClientRect();
   if (e.clientX < r.left || e.clientX >= r.right || e.clientY < r.top || e.clientY >= r.bottom) return;
-  const d = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
-  e.preventDefault();
-  // over a dialog on the overview (the track picker): the wheel scrolls its list, a step per notch, as the arrow keys do
+  if (typeof view === 'undefined' || !view || !view.previewCtl) return;
+  const ctl = view.previewCtl;
   const wx = (e.clientX - r.left) / r.width, wy = (e.clientY - r.top) / r.height;
-  if (view.previewView && !overviewAt(wx, wy)) {   // (under the pointer: not the overview)
+  const d = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+  // over a dialog on the overview (the track picker): its list scrolls, a step per notch, as the arrow keys do.
+  // ctl inactive means the overview's picture is not on screen there, so the wheel must never zoom it.
+  if (view.previewView && !ctl.active) {
     if (wy < 0.1 || wy >= 0.82) return;   // (the title or the menu's buttons: the wheel does nothing there)
+    e.preventDefault();
     wheelAcc += d; const step = 100;   // (a mouse wheel's notch: one line)
     while (Math.abs(wheelAcc) >= step) {
       const code = wheelAcc > 0 ? 'ArrowDown' : 'ArrowUp'; wheelAcc -= Math.sign(wheelAcc) * step;
@@ -92,9 +122,12 @@ addEventListener('wheel', e => {
     return;
   }
   wheelAcc = 0;
-  view.pvZoomTo = Math.max(0.1, Math.min(1.25, (view.pvZoomTo || 1) * Math.exp(d * 0.0012)));   // (in close enough to look round the scenery)
+  // the overview itself under the pointer, between the title and the buttons: zoom, clamped in the controller
+  if (ctl.active && wy > 0.1 && wy < 0.82 && overviewAt(wx, wy)) {
+    e.preventDefault();
+    ctl.wheel(d);
+  }
 }, { passive: false });
-let wheelAcc = 0;
 addEventListener('contextmenu', e => e.preventDefault());
 const worker = new Worker('worker.js?v=__BUILD__');
 worker.onmessage = e => {
@@ -557,7 +590,13 @@ function frame(t) {   // t: the display frame's time (steadier than reading the 
   // gone (a menu or picture over it): a dialog or message over a paused view keeps its marks, so the view
   // shows again when it closes
   if (idle && shown < marked * 0.4) for (let i = 0; i < 64000; i++) if (scr[i] !== StuntsHires.KEY) { bgU8[128000 + i] = 0; mk[i] = 0; }
-  if (view && view.previewView && (keyed ? (view.previewShown = true, false) : view.previewShown && !anyKey)) view.previewView = false;   // (left the menu)
+  // The overview's interaction lifecycle follows the picture's real on-screen presence, not the published
+  // frame flag. While a preview frame stands and a see-through pixel of it is on screen, the overview is live
+  // (enter once: default view). A dialog covering every such pixel, or leaving the menu, exits it: the drag
+  // and zoom state are released and frozen, and the next appearance enters afresh. Hence no input on a hidden
+  // picture and no refused input while the picture is still there.
+  if (view && view.previewView && view.setPreviewOnScreen) view.setPreviewOnScreen(!!anyKey, t);
+  else if (view && view.previewCtl && view.previewCtl.active) view.setPreviewOnScreen(false, t);
   // the replay and pause panel: the black the game paints round it, below the 3D window, shows the 3D view instead (the
   // black reached from the screen's edges only, so the panel's own black, its clocks, stays), out to the wide edges too
   const hole = frame.hole || (frame.hole = new Uint8Array(64000)); hole.fill(0);
