@@ -7,7 +7,11 @@ import {
   requestPlayerFullscreen,
   requestVideoFullscreen,
 } from './fullscreen';
-import { detectAudioAvailability, formatVideoTime, isAudioAvailabilityPending } from './media';
+import {
+  detectAudioAvailability,
+  formatVideoTime,
+  shouldOptimisticallyAssumeAudio,
+} from './media';
 import { getProgressMetrics, getProgressPercentFromClientX, getProgressXFromPercent } from './progress';
 import { template } from './template';
 import type { Cleanup, PlaybackState } from './types';
@@ -89,6 +93,8 @@ export class SimplePlayer extends HTMLElement {
   #isProgressHoverPreviewing = false;
   #hasAudioTrack = false;
   #hasCheckedAudioTrack = false;
+  #audioProbeUnmutedMs = 0;
+  #audioProbeUnmutedStartedAt: number | null = null;
   #isPointerOverControlSurface = false;
   #lastPointerClientX: number | null = null;
   #lastPointerClientY: number | null = null;
@@ -328,6 +334,9 @@ export class SimplePlayer extends HTMLElement {
   disconnectedCallback() {
     this.#observer?.disconnect();
     this.#observer = null;
+    // Drop any half-finished measurement made while this instance was live; if
+    // it is re-added it will probe the current source from scratch.
+    this.#resetAudioProbe();
     this.#cleanup.forEach((cleanup) => cleanup());
     this.#cleanup = [];
     this.#initialized = false;
@@ -1049,8 +1058,16 @@ export class SimplePlayer extends HTMLElement {
   }
 
   #claimMediaSession() {
-    if (!('mediaSession' in navigator)) return;
+    if (!('mediaSession' in navigator) || !this.isConnected) return;
 
+    if (SimplePlayer.#mediaSessionOwner === this) {
+      this.#syncMediaSessionPlaybackState();
+      return;
+    }
+
+    // The most recently playing instance owns the hardware keys. Installing
+    // these handlers on the shared Media Session replaces the previous
+    // owner's, so a removed or superseded instance stops receiving them.
     SimplePlayer.#mediaSessionOwner = this;
     try {
       navigator.mediaSession.setActionHandler('play', this.#handleMediaSessionPlay);
@@ -1062,7 +1079,12 @@ export class SimplePlayer extends HTMLElement {
   }
 
   #releaseMediaSession() {
-    if (!('mediaSession' in navigator) || SimplePlayer.#mediaSessionOwner !== this) return;
+    // Only the current owner may clear the shared handlers. A superseded
+    // instance must not wipe the handlers the new owner installed.
+    if (SimplePlayer.#mediaSessionOwner !== this) return;
+
+    SimplePlayer.#mediaSessionOwner = null;
+    if (!('mediaSession' in navigator)) return;
 
     try {
       navigator.mediaSession.setActionHandler('play', null);
@@ -1071,11 +1093,14 @@ export class SimplePlayer extends HTMLElement {
     } catch {
       // Ignore partial Media Session implementations.
     }
-    SimplePlayer.#mediaSessionOwner = null;
+  }
+
+  #ownsMediaSession() {
+    return this.isConnected && SimplePlayer.#mediaSessionOwner === this;
   }
 
   #syncMediaSessionPlaybackState() {
-    if (!('mediaSession' in navigator) || SimplePlayer.#mediaSessionOwner !== this) return;
+    if (!('mediaSession' in navigator) || !this.#ownsMediaSession()) return;
 
     try {
       navigator.mediaSession.playbackState = this.#video.paused || this.#video.ended ? 'paused' : 'playing';
@@ -1085,6 +1110,8 @@ export class SimplePlayer extends HTMLElement {
   }
 
   #handleMediaSessionPlay = () => {
+    if (!this.#ownsMediaSession()) return;
+
     if (!this.#video.paused && !this.#video.ended) {
       this.#syncMediaSessionPlaybackState();
       return;
@@ -1095,6 +1122,8 @@ export class SimplePlayer extends HTMLElement {
   };
 
   #handleMediaSessionPause = () => {
+    if (!this.#ownsMediaSession()) return;
+
     if (this.#video.paused || this.#video.ended) {
       this.#syncMediaSessionPlaybackState();
       return;
@@ -1285,6 +1314,8 @@ export class SimplePlayer extends HTMLElement {
       this.#firstFramePresentationPending = false;
       this.#firstFrameRequestToken += 1;
       this.#player.classList.remove('has-visible-frame');
+      // The reload below restarts the same source from scratch, so re-probe it.
+      this.#resetAudioProbe();
 
       if (!this.#player.classList.contains('has-loaded-once')) {
         this.#setProgressVisual(0);
@@ -1703,11 +1734,55 @@ export class SimplePlayer extends HTMLElement {
   }
 
   #detectAudioAvailability() {
-    return detectAudioAvailability(this.#video);
+    return detectAudioAvailability(this.#video, {
+      unmutedPlaybackMs: this.#getAudioProbeUnmutedMs(),
+    });
   }
 
+  /**
+   * How long the current source has played while unmuted. Safari only decodes
+   * audio for unmuted playback, so this is the window in which a zero decode
+   * count can be trusted.
+   */
+  #getAudioProbeUnmutedMs() {
+    if (this.#audioProbeUnmutedStartedAt === null) return this.#audioProbeUnmutedMs;
+    return this.#audioProbeUnmutedMs + (performance.now() - this.#audioProbeUnmutedStartedAt);
+  }
+
+  #syncAudioProbeClock() {
+    const isAccumulating = !this.#video.muted && !this.#video.paused && !this.#video.ended;
+    if (isAccumulating) {
+      if (this.#audioProbeUnmutedStartedAt === null) {
+        this.#audioProbeUnmutedStartedAt = performance.now();
+      }
+      return;
+    }
+
+    if (this.#audioProbeUnmutedStartedAt !== null) {
+      this.#audioProbeUnmutedMs += performance.now() - this.#audioProbeUnmutedStartedAt;
+      this.#audioProbeUnmutedStartedAt = null;
+    }
+  }
+
+  /**
+   * Discard every conclusion and pending measurement about the previous media.
+   * Called whenever the source changes so the next video is judged from
+   * scratch instead of inheriting the last track's result.
+   */
+  #resetAudioProbe() {
+    this.#hasAudioTrack = false;
+    this.#hasCheckedAudioTrack = false;
+    this.#audioProbeUnmutedMs = 0;
+    this.#audioProbeUnmutedStartedAt = null;
+  }
+
+  /**
+   * The volume control is offered while the probe is still unresolved: the
+   * media may carry audio, and on Safari unmuting is exactly what lets the
+   * probe converge. Once a source is confirmed silent the control is withdrawn.
+   */
   #isVolumeAvailable() {
-    return this.volumeEnabled && this.#hasCheckedAudioTrack && this.#hasAudioTrack;
+    return this.volumeEnabled && (!this.#hasCheckedAudioTrack || this.#hasAudioTrack);
   }
 
   #clearVolumeInteractionState() {
@@ -1739,6 +1814,8 @@ export class SimplePlayer extends HTMLElement {
       return;
     }
 
+    this.#syncAudioProbeClock();
+
     const wasChecked = this.#hasCheckedAudioTrack;
 
     if (!this.#hasCheckedAudioTrack) {
@@ -1746,10 +1823,9 @@ export class SimplePlayer extends HTMLElement {
       if (audioAvailability !== 'unknown') {
         this.#hasCheckedAudioTrack = true;
         this.#hasAudioTrack = audioAvailability === 'available';
-      } else if (
-        this.#video.readyState >= HTMLMediaElement.HAVE_METADATA &&
-        !isAudioAvailabilityPending(this.#video)
-      ) {
+      } else if (shouldOptimisticallyAssumeAudio(this.#video)) {
+        // Non-WebKit engines with no readable signal keep the historical
+        // assumption that metadata implies audio.
         this.#hasCheckedAudioTrack = true;
         this.#hasAudioTrack = true;
       }
@@ -2770,6 +2846,8 @@ export class SimplePlayer extends HTMLElement {
     this.#optimisticPlaybackState = null;
     this.#clearPausedVisualProgress();
     if (!this.#isScrubPreviewLocked()) this.#syncVisualProgressClock();
+    this.#syncAudioProbeClock();
+    this.#syncAudioControlState();
     this.#syncVideoState();
     this.#syncMediaSessionPlaybackState();
   };
@@ -2777,6 +2855,8 @@ export class SimplePlayer extends HTMLElement {
   #handleVideoPause = () => {
     this.#optimisticPlaybackState = null;
     if (!this.#isScrubPreviewLocked()) this.#holdPausedVisualProgress();
+    this.#syncAudioProbeClock();
+    this.#syncAudioControlState();
     this.#syncVideoLoading();
     this.#syncVideoState();
     this.#syncMediaSessionPlaybackState();
@@ -2785,6 +2865,8 @@ export class SimplePlayer extends HTMLElement {
   #handleVideoEnded = () => {
     this.#optimisticPlaybackState = null;
     this.#clearPausedVisualProgress();
+    this.#syncAudioProbeClock();
+    this.#syncAudioControlState();
     if (!this.#isScrubPreviewLocked()) this.#syncVisualProgressClock();
     this.#syncVideoState();
     this.#syncMediaSessionPlaybackState();
@@ -2800,6 +2882,7 @@ export class SimplePlayer extends HTMLElement {
 
   #handleVideoLoadedMetadata = () => {
     this.#clearPausedVisualProgress();
+    this.#syncAudioProbeClock();
     this.#syncAudioControlState();
     if (!this.#isScrubPreviewLocked()) this.#syncVisualProgressClock();
     this.#syncVideoLoading();
@@ -2848,6 +2931,9 @@ export class SimplePlayer extends HTMLElement {
   };
 
   #handleVideoVolumeChange = () => {
+    // A mute/unmute transition changes what Safari can observe, so snapshot
+    // the unmuted playback clock before re-evaluating the track.
+    this.#syncAudioProbeClock();
     this.#syncAudioControlState();
   };
 
@@ -2874,8 +2960,10 @@ export class SimplePlayer extends HTMLElement {
     this.#hasInitialProgressSettled = false;
     this.#lastRenderedProgressTime = 0;
     this.#clearPausedVisualProgress();
-    this.#hasAudioTrack = false;
-    this.#hasCheckedAudioTrack = false;
+    this.#resetAudioProbe();
+    // Relinquish the hardware keys: this instance no longer has media to
+    // control until a new source starts playing again.
+    this.#releaseMediaSession();
     this.#syncOptionalControls();
     this.#clearVolumeInteractionState();
     this.#isCommittedScrubPending = false;

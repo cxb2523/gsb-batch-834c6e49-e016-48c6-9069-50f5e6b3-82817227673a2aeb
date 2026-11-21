@@ -141,6 +141,13 @@ npm run dev
 
 The dev playground lives in `dev/` and imports `src/simple-player.ts` directly. Use it when changing the player itself.
 
+`dev/audio-probe.html` is a focused harness for the audio-track probe and hardware media keys. It places two players side by side, generates a video-only and a video+audio sample in the page (no external files needed), and lets you switch sources, unmute, remove/re-add an instance, and fire the Media Session play/pause actions the OS media keys use. Open it through the dev server:
+
+```bash
+npm run dev
+# then visit http://127.0.0.1:5174/audio-probe.html
+```
+
 The hosted demo is separate from the package source. It has its own consumer install in `site/`, then imports the locally built package artifact so deploys always match the current checkout:
 
 ```bash

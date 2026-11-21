@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SimplePlayer Audio Probe Harness</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px;
+        color: #f2f2f2;
+        background: #0f1115;
+        font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      }
+      h1 { margin: 0 0 4px; font-size: 22px; }
+      p.hint { margin: 0 0 18px; color: rgb(255 255 255 / 0.6); }
+      .grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+      .card { display: grid; gap: 12px; padding: 16px; border: 1px solid rgb(255 255 255 / 0.12); border-radius: 12px; background: rgb(255 255 255 / 0.03); }
+      .card h2 { margin: 0; font-size: 15px; }
+      .card small { color: rgb(255 255 255 / 0.55); }
+      simple-player { display: block; width: 100%; }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; }
+      button { padding: 6px 10px; border: 1px solid rgb(255 255 255 / 0.2); border-radius: 7px; color: inherit; background: rgb(255 255 255 / 0.08); cursor: pointer; }
+      button:hover { background: rgb(255 255 255 / 0.16); }
+      button[aria-pressed="true"] { border-color: #6cf; background: rgb(108 204 255 / 0.22); }
+      output { display: block; min-height: 1.4em; color: #9fe; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+      #mslog { color: #ffd27f; }
+      .probe-tag { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 999px; background: rgb(255 255 255 / 0.12); font-size: 11px; }
+    </style>
+  </head>
+  <body>
+    <h1>SimplePlayer audio-probe harness</h1>
+    <p class="hint">
+      Two independently addressable players. Use the buttons to switch sources, remove/re-add an
+      instance, and fire the same actions the OS media keys would. Volume visibility is read from
+      the live shadow DOM; media-key ownership from the page-level Media Session shim below.
+    </p>
+
+    <div class="grid">
+      <section class="card" id="card-a">
+        <h2>Player A <span class="probe-tag" data-probe="A"></span></h2>
+        <small>starts with a video-only source</small>
+        <simple-player id="player-a" controls show-time></simple-player>
+        <div class="row">
+          <button data-action="audio" data-player="a">load with audio</button>
+          <button data-action="silent" data-player="a">load silent</button>
+          <button data-action="unmute" data-player="a">unmute</button>
+          <button data-action="pause" data-player="a">pause</button>
+          <button data-action="play" data-player="a">play</button>
+          <button data-action="remove" data-player="a">remove from DOM</button>
+          <button data-action="append" data-player="a">append back</button>
+        </div>
+        <output data-out="a">—</output>
+      </section>
+
+      <section class="card" id="card-b">
+        <h2>Player B <span class="probe-tag" data-probe="B"></span></h2>
+        <small>starts with a source that has audio</small>
+        <simple-player id="player-b" controls show-time></simple-player>
+        <div class="row">
+          <button data-action="audio" data-player="b">load with audio</button>
+          <button data-action="silent" data-player="b">load silent</button>
+          <button data-action="unmute" data-player="b">unmute</button>
+          <button data-action="pause" data-player="b">pause</button>
+          <button data-action="play" data-player="b">play</button>
+          <button data-action="remove" data-player="b">remove from DOM</button>
+          <button data-action="append" data-player="b">append back</button>
+        </div>
+        <output data-out="b">—</output>
+      </section>
+
+      <section class="card">
+        <h2>Hardware media keys</h2>
+        <small>These dispatch through the same Media Session action handlers the OS uses.</small>
+        <div class="row">
+          <button data-ms="play">media play</button>
+          <button data-ms="pause">media pause</button>
+        </div>
+        <output id="mslog">—</output>
+      </section>
+
+      <section class="card">
+        <h2>State snapshot</h2>
+        <button id="snapshot">copy JSON to output</button>
+        <output id="snapshot-out">—</output>
+      </section>
+    </div>
+
+    <script type="module">
+      // Media Session shim: remember the handlers the page last installed so the
+      // harness can invoke them exactly like an OS media key would.
+      const msHandlers = { play: null, pause: null };
+      window.__msHandlers = msHandlers;
+      window.__harnessMode = 'dev-server';
+      const realMediaSession = 'mediaSession' in navigator ? navigator.mediaSession : null;
+
+      function notes(label) {
+        const el = document.querySelector('#mslog');
+        el.textContent = `${new Date().toLocaleTimeString()} ${label}`;
+      }
+
+      if (realMediaSession) {
+        const realSet = realMediaSession.setActionHandler.bind(realMediaSession);
+        realMediaSession.setActionHandler = (action, handler) => {
+          if (action === 'play' || action === 'pause') {
+            msHandlers[action] = handler;
+            notes(`handler ${action} -> ${handler ? 'installed' : 'cleared'}`);
+          }
+          try { realSet(action, handler); } catch { /* ignore */ }
+        };
+      } else {
+        Object.defineProperty(navigator, 'mediaSession', {
+          configurable: true,
+          value: {
+            playbackState: 'none',
+            setActionHandler(action, handler) {
+              if (action === 'play' || action === 'pause') {
+                msHandlers[action] = handler;
+                notes(`handler ${action} -> ${handler ? 'installed' : 'cleared'}`);
+              }
+            },
+            setPositionState() {},
+          },
+        });
+      }
+
+      (async () => {
+        await import('../src/simple-player');
+      })().then(() => {
+        window.__harnessMode = 'dev-server';
+        document.title += ' (dev-server)';
+        boot();
+      }).catch((error) => {
+        window.__harnessImportError = String((error && error.stack) || error);
+        const out = document.querySelector('#snapshot-out');
+        if (out) out.textContent = window.__harnessImportError;
+      });
+
+      function boot() {
+        // --- media samples -------------------------------------------------
+        // Generate one video-only and one video+audio sample in the page, so the
+        // harness needs no external files (and no CORS in the way of captureStream).
+        async function makeSample(withAudio) {
+          const canvas = document.createElement('canvas');
+          canvas.width = 320;
+          canvas.height = 180;
+          const ctx = canvas.getContext('2d');
+          let tick = 0;
+          const timer = setInterval(() => {
+            tick += 1;
+            ctx.fillStyle = tick % 2 ? '#12394f' : '#1d5f86';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#fff';
+            ctx.font = '20px monospace';
+            ctx.fillText(`${withAudio ? 'AUDIO' : 'SILENT'} ${tick}`, 16, 36);
+          }, 100);
+
+          const videoStream = canvas.captureStream(15);
+          let audioStream = null;
+          let audioContext = null;
+          if (withAudio) {
+            audioContext = new AudioContext();
+            const oscillator = audioContext.createOscillator();
+            oscillator.frequency.value = 440;
+            const destination = audioContext.createMediaStreamDestination();
+            oscillator.connect(destination);
+            oscillator.start();
+            audioStream = destination.stream;
+          }
+
+          const stream = new MediaStream([
+            ...videoStream.getVideoTracks(),
+            ...(audioStream ? audioStream.getAudioTracks() : []),
+          ]);
+          const mime = withAudio ? 'video/webm;codecs=vp8,opus' : 'video/webm;codecs=vp8';
+          const recorder = new MediaRecorder(stream, { mimeType: mime });
+          const chunks = [];
+          recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+          const stopped = new Promise((resolve) => {
+            recorder.onstop = () => resolve(URL.createObjectURL(new Blob(chunks, { type: 'video/webm' })));
+          });
+          recorder.start();
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          recorder.stop();
+          clearInterval(timer);
+          if (audioContext) await audioContext.close();
+          return stopped;
+        }
+
+        // --- reading live player state -------------------------------------
+        function readPlayer(player) {
+          const root = player.shadowRoot;
+          const volume = root?.querySelector('[data-sp-volume-control]');
+          const slot = root?.querySelector('[data-sp-volume-slot]');
+          const video = root?.querySelector('video');
+          const hasVolumeClass = root?.querySelector('.sp-player')?.classList.contains('has-volume-control') ?? false;
+          const unavailable = root?.querySelector('.sp-player')?.classList.contains('is-volume-unavailable') ?? false;
+          return {
+            hasVolumeControl: hasVolumeClass,
+            volumeDisplayed: slot ? getComputedStyle(slot).display !== 'none' : false,
+            volumeDisabled: volume ? volume.disabled : null,
+            volumeAriaDisabled: volume ? volume.getAttribute('aria-disabled') : null,
+            volumeLabel: volume ? volume.getAttribute('aria-label') : null,
+            unavailableClass: unavailable,
+            videoMuted: video ? video.muted : null,
+            videoPaused: video ? video.paused : null,
+            videoCurrentTime: video ? +video.currentTime.toFixed(2) : null,
+            videoReadyState: video ? video.readyState : null,
+            videoSrc: video ? (video.currentSrc || video.dataset.src || '') : null,
+            connected: player.isConnected,
+          };
+        }
+
+        const players = {
+          a: document.querySelector('#player-a'),
+          b: document.querySelector('#player-b'),
+        };
+        const cards = {
+          a: document.querySelector('#card-a'),
+          b: document.querySelector('#card-b'),
+        };
+        const outs = {
+          a: document.querySelector('[data-out="a"]'),
+          b: document.querySelector('[data-out="b"]'),
+        };
+
+        function renderSummary() {
+          for (const key of ['a', 'b']) {
+            const player = players[key];
+            const tag = document.querySelector(`[data-probe="${key.toUpperCase()}"]`);
+            if (!player.isConnected) {
+              tag.textContent = 'removed';
+              outs[key].textContent = 'removed from DOM';
+              continue;
+            }
+            const state = readPlayer(player);
+            tag.textContent = state.hasVolumeControl ? (state.volumeDisabled ? 'volume disabled' : 'volume live') : 'no volume';
+            outs[key].textContent = JSON.stringify(state, null, 1);
+          }
+        }
+
+        function observePlayer(player) {
+          const observer = new MutationObserver(renderSummary);
+          observer.observe(player.shadowRoot, { attributes: true, subtree: true, attributeFilter: ['class', 'hidden', 'disabled', 'aria-disabled'] });
+          observer.observe(player, { attributes: true });
+          return observer;
+        }
+
+        const samples = { audio: null, silent: null };
+        let ready = false;
+        const currentSource = { a: 'silent', b: 'audio' };
+        let detachObserver = { a: null, b: null };
+
+        // --- wiring ---------------------------------------------------------
+        document.querySelectorAll('[data-action]').forEach((button) => {
+          button.addEventListener('click', async () => {
+            const key = button.dataset.player;
+            const action = button.dataset.action;
+            const player = players[key];
+
+            if (action === 'remove') {
+              player.remove();
+              cards[key].dataset.removed = 'true';
+              button.closest('.row').querySelector('[data-action="append"]').disabled = false;
+            } else if (action === 'append') {
+              if (!player.isConnected) cards[key].insertBefore(player, cards[key].querySelector('.row'));
+              player.src = samples[currentSource[key]] ?? '';
+              player.autoplayEnabled = true;
+            } else if (action === 'audio' || action === 'silent') {
+              if (!ready) return;
+              currentSource[key] = action;
+              player.src = samples[action];
+              player.autoplayEnabled = true;
+            } else if (action === 'unmute' || action === 'play') {
+              const video = player.shadowRoot?.querySelector('video');
+              if (video) {
+                video.muted = false;
+                if (action === 'play') video.play().catch(() => {});
+              }
+            } else if (action === 'pause') {
+              const video = player.shadowRoot?.querySelector('video');
+              if (video) video.pause();
+            }
+
+            renderSummary();
+          });
+        });
+
+        document.querySelectorAll('[data-ms]').forEach((button) => {
+          button.addEventListener('click', () => {
+            const action = button.dataset.ms;
+            const handler = msHandlers[action];
+            if (handler) { handler({ action }); notes(`invoked ${action}`); }
+            else { notes(`no handler for ${action}`); }
+            renderSummary();
+          });
+        });
+
+        document.querySelector('#snapshot').addEventListener('click', () => {
+          document.querySelector('#snapshot-out').textContent = JSON.stringify({
+            mode: window.__harnessMode,
+            a: players.a.isConnected ? readPlayer(players.a) : 'removed',
+            b: players.b.isConnected ? readPlayer(players.b) : 'removed',
+            mediaHandlers: Object.fromEntries(Object.entries(msHandlers).map(([k, v]) => [k, Boolean(v)])),
+          }, null, 1);
+        });
+
+        // --- boot -----------------------------------------------------------
+        Promise.all([makeSample(true), makeSample(false)]).then(([audioUrl, silentUrl]) => {
+          samples.audio = audioUrl;
+          samples.silent = silentUrl;
+          ready = true;
+
+          Object.values(detachObserver).forEach((observer) => observer?.disconnect());
+          detachObserver = { a: null, b: null };
+
+          players.a.src = samples.silent;
+          players.b.src = samples.audio;
+          currentSource.a = 'silent';
+          currentSource.b = 'audio';
+
+          detachObserver.a = observePlayer(players.a);
+          detachObserver.b = observePlayer(players.b);
+          setInterval(renderSummary, 250);
+          renderSummary();
+        });
+      }
+    </script>
+  </body>
+</html>
