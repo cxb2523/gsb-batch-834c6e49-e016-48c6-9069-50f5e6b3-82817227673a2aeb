@@ -93,6 +93,29 @@ describe('DecodeRun', () => {
     run.abort();
   });
 
+  it('reaches the end when one track is shorter, the longer one fully consumed', async () => {
+    const run = DecodeRun.start(
+      {
+        ...parts(3),
+        frameSources: [0, 1].map(
+          (trackIndex) =>
+            new FakeVideoTrack({
+              trackIndex,
+              frameRate: 10,
+              frameCount: trackIndex === 0 ? 5 : 3,
+              framesPerGop: 10,
+            }),
+        ),
+      },
+      seconds(0),
+      QUIET,
+    );
+    await settle();
+    expect(run.takePairAt(seconds(9))?.timestamp).toBeCloseTo(0.2, 9);
+    expect(run.isDrained).toBe(true);
+    run.abort();
+  });
+
   it('drops what arrives and tells nothing once aborted', async () => {
     let progress = 0;
     const run = DecodeRun.start(parts(3), seconds(0), {

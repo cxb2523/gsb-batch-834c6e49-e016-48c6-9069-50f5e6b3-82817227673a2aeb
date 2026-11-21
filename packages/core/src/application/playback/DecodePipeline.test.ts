@@ -263,6 +263,19 @@ describe('DecodePipeline', () => {
     await run;
   });
 
+  it('closes the decoders of a run aborted while they open, as soon as they are there', async () => {
+    const decoderPort = new FakeVideoDecoderPort(DECODER_LATENCY);
+    const pipeline = new DecodePipeline(twoLensTracks(), decoderPort, OPTIONS);
+
+    const run = pipeline.run(seconds(0), new FramePairQueue<FakeFrameHandle>(4));
+    pipeline.abort();
+    await run;
+
+    expect(decoderPort.decodersCreated).toHaveLength(2);
+    expect(decoderPort.openDecoders).toBe(0);
+    expect(decoderPort.openFrames).toBe(0);
+  });
+
   it('delivers the frames its decoders hold back until the end of the track, through their flush', async () => {
     const decoderPort = new FakeVideoDecoderPort({ ...DECODER_LATENCY, holdsFrames: 2 });
     const pipeline = new DecodePipeline(twoLensTracks(), decoderPort, OPTIONS);
@@ -305,7 +318,7 @@ describe('DecodePipeline', () => {
     expect(decoderPort.fast.openFrames + decoderPort.slow.openFrames).toBe(0);
   });
 
-  it('ends when the shorter track runs out and closes the longer track leftovers', async () => {
+  it('keeps feeding the longer track when the shorter runs out, dropping what can never pair', async () => {
     const [front] = twoLensTracks(FRAMES);
     const [back] = twoLensTracks(FRAMES - 5);
     const decoderPort = new FakeVideoDecoderPort(DECODER_LATENCY);
@@ -317,7 +330,29 @@ describe('DecodePipeline', () => {
     const report = await run;
 
     expect(pairs).toHaveLength(FRAMES - 5);
-    expect(report.hasReachedEnd).toBe(true);
+    expect(report).toMatchObject({
+      packetsDecoded: FRAMES * 2 - 5,
+      pairsDelivered: FRAMES - 5,
+      unpairedFrames: 5,
+      hasReachedEnd: true,
+    });
+    expect(decoderPort.openFrames).toBe(0);
+  });
+
+  it('aborts by media time when a track leads the ended one too far, without leaking frames', async () => {
+    const [longer] = twoLensTracks(FRAMES * 3);
+    const [shorter] = twoLensTracks(FRAMES);
+    const decoderPort = new FakeVideoDecoderPort(DECODER_LATENCY);
+    const pipeline = new DecodePipeline([longer!, shorter!], decoderPort, OPTIONS);
+    const queue = new FramePairQueue<FakeFrameHandle>(4);
+
+    const run = pipeline.run(seconds(0), queue);
+    const pairs = await drain(queue, swallow(run));
+    await expect(run).rejects.toMatchObject({ code: 'unsupported-layout', category: 'recording' });
+    queue.close();
+
+    expect(pairs).toHaveLength(FRAMES);
+    expect(decoderPort.openDecoders).toBe(0);
     expect(decoderPort.openFrames).toBe(0);
   });
 
@@ -455,16 +490,36 @@ describe('DecodePipeline', () => {
     expect(decoderPort.openDecoders).toBe(0);
   });
 
-  it('ends at once when aborted while draining its decoders', async () => {
+  it('ends at once when aborted while draining its decoders, releasing frames and reads', async () => {
+    const tracks = twoLensTracks(3);
     const decoderPort = new NeverDrainingPort();
-    const pipeline = new DecodePipeline(twoLensTracks(3), decoderPort, OPTIONS);
+    const pipeline = new DecodePipeline(tracks, decoderPort, OPTIONS);
     const queue = new FramePairQueue<FakeFrameHandle>(4);
     const run = pipeline.run(seconds(0), queue);
     await settle();
     pipeline.abort();
     await run;
-    expect(decoderPort.inner.openDecoders).toBe(0);
     queue.close();
+    expect(decoderPort.inner.openDecoders).toBe(0);
+    expect(decoderPort.inner.openFrames).toBe(0);
+    expect(tracks.map((track) => track.openReadings)).toEqual([0, 0]);
+  });
+
+  it('stops feeding as soon as the output queue closes mid-stream, closing what arrives after', async () => {
+    const decoderPort = new FakeVideoDecoderPort({ latencyTicks: 4 });
+    const pipeline = new DecodePipeline(twoLensTracks(), decoderPort, OPTIONS);
+    const queue = new FramePairQueue<FakeFrameHandle>(2);
+
+    const run = pipeline.run(seconds(0), queue);
+    await settle();
+    queue.close();
+    const report = await run;
+    await settle();
+
+    expect(report.hasReachedEnd).toBe(false);
+    expect(report.packetsDecoded).toBeLessThan(FRAMES * 2);
+    expect(decoderPort.openDecoders).toBe(0);
+    expect(decoderPort.openFrames).toBe(0);
   });
 
   it('keeps nothing of the packets it fed, however long the run', async () => {

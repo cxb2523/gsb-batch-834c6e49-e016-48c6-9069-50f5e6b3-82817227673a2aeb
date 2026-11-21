@@ -191,10 +191,10 @@ Use cases that orchestrate the domain through ports.
   calibration, which it requires. `inspectRecording` condenses a file into a `RecordingInspection`, plain data for a report or a
   page: its boxes and records, the info record, the calibration and summaries of the gyro and
   exposure records.
-- `playback/DecodePipeline` runs one lockstep decode of all frame sources from a time: one
-  decoder per source, packets fed under backpressure, frames paired by timestamp
-  (`FramePairer`), pairs before the start dropped by the `StartGate`, output into a
-  `FramePairQueue`.
+- `playback/DecodePipeline` runs one decode of all frame sources from a time: one
+  decoder per source, each track fed on a loop of its own under backpressure until every track
+  ends, frames paired by timestamp (`FramePairer`), pairs before the start dropped by the
+  `StartGate`, output into a `FramePairQueue`.
 - `playback/PlaybackSession` is the transport: it drives one `DecodeRun` at a time (a pipeline
   and its own queue, replaced whole on a seek) in step with a `PlaybackClock`, presents the pair due at each tick to a `FrameSink`, and owns the state
   machine. Sound follows the picture: playback waits in `buffering` until two pairs are queued,

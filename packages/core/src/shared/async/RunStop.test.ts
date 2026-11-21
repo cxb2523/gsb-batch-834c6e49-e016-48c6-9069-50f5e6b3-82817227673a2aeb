@@ -3,6 +3,12 @@ import { describe, expect, it } from 'vitest';
 import { RunStop, STOPPED } from './RunStop';
 import { isCollected } from '../../../test/support/garbage';
 
+function never(): Promise<string> {
+  return new Promise<string>(() => {
+    // Never settles: only the stop can end this wait.
+  });
+}
+
 describe('RunStop', () => {
   it('lets a wait finish with its own value while the run goes on', async () => {
     await expect(new RunStop().race(() => Promise.resolve('segment'))).resolves.toBe('segment');
@@ -44,19 +50,13 @@ describe('RunStop', () => {
     await expect(waiting).resolves.toBe(STOPPED);
   });
 
-  it('refuses a second wait while one is under way', async () => {
+  it('ends every wait in progress as soon as the run stops', async () => {
     const stop = new RunStop();
-    const first = stop.race(
-      () =>
-        new Promise<string>(() => {
-          // Never settles.
-        }),
-    );
-    await expect(stop.race(() => Promise.resolve('second'))).rejects.toMatchObject({
-      code: 'invariant-violation',
-    });
+    const first = stop.race(never);
+    const second = stop.race(never);
     stop.stop();
     await expect(first).resolves.toBe(STOPPED);
+    await expect(second).resolves.toBe(STOPPED);
   });
 
   it('starts no work once the run has stopped', async () => {

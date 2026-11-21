@@ -98,6 +98,56 @@ describe('FramePairer', () => {
     expect(waiting.handle.closed()).toBe(true);
   });
 
+  it('drops and closes what can never pair once the other source has ended', () => {
+    const pairer = new FramePairer<Probe>(2, seconds(0.001), () => {
+      // pairs are irrelevant here
+    });
+    const orphan = frame(3);
+    pairer.push(0, orphan);
+    expect(orphan.handle.closed()).toBe(false);
+    pairer.endSource(1);
+    expect(orphan.handle.closed()).toBe(true);
+    expect(pairer.unpaired).toBe(1);
+  });
+
+  it('still pairs what an ended source left behind, and drops only what follows', () => {
+    const pairs: FramePair<Probe>[] = [];
+    const pairer = new FramePairer<Probe>(2, seconds(0.001), (pair) => {
+      pairs.push(pair);
+    });
+    pairer.push(1, frame(0.5));
+    pairer.endSource(1);
+    pairer.push(0, frame(0.5));
+    expect(pairs.map((pair) => pair.timestamp)).toEqual([0.5]);
+    const orphan = frame(0.6);
+    pairer.push(0, orphan);
+    expect(orphan.handle.closed()).toBe(true);
+    expect(pairer.unpaired).toBe(1);
+  });
+
+  it('measures how far a dropped frame led the other source', () => {
+    const pairer = new FramePairer<Probe>(2, seconds(0.0001), () => {
+      // pairs are irrelevant here
+    });
+    pairer.push(1, frame(0));
+    pairer.endSource(1);
+    pairer.push(0, frame(3));
+    expect(pairer.unpairedLead).toBeCloseTo(3, 9);
+  });
+
+  it('measures no unpaired lead once a pair comes again', () => {
+    const pairer = new FramePairer<Probe>(2, seconds(0.0001), () => {
+      // pairs are irrelevant here
+    });
+    pairer.push(1, frame(0));
+    pairer.endSource(1);
+    pairer.push(0, frame(3));
+    expect(pairer.unpairedLead).toBeCloseTo(3, 9);
+    pairer.push(1, frame(3));
+    pairer.push(0, frame(3));
+    expect(pairer.unpairedLead).toBe(0);
+  });
+
   it('works with a single lens', () => {
     const pairs: FramePair<Probe>[] = [];
     const pairer = new FramePairer<Probe>(1, seconds(0), (pair) => {
