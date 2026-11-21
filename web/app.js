@@ -4,6 +4,8 @@ import {TransformControls} from 'three/addons/controls/TransformControls.js';
 import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
 import {GLTFExporter} from 'three/addons/exporters/GLTFExporter.js';
 import {clone as cloneSkeleton} from 'three/addons/utils/SkeletonUtils.js';
+import {EditHistory, StaleBaselineError} from './editor/history.js';
+import {SaveQueue} from './editor/save-queue.js';
 
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const clone=v=>structuredClone(v),uid=(p='n')=>p+'_'+crypto.randomUUID().slice(0,12),deg=THREE.MathUtils.radToDeg,rad=THREE.MathUtils.degToRad;
@@ -17,7 +19,8 @@ function download(data,name,type='application/json'){const url=URL.createObjectU
 function busyStatus(text,busy=false){const e=$('#generation-status');e.hidden=!text;e.classList.toggle('busy',busy);e.textContent=text}
 function safeName(name){return name.replace(/[<>:"/\\|?*]/g,'_').slice(0,80)||'XingGou'}
 
-let doc,revision=0,catalog=[],byId=new Map(),provider={},dirty=false,saving=false,saveTimer,editVersion=0,conflict=false,history=[],future=[],selection=new Set(),plan=null,aiMode='offline',generationBusy=false,libraryTab='native',category='精选',pageSize=40;
+let doc,revision=0,catalog=[],byId=new Map(),provider={},dirty=false,conflict=false,history=new EditHistory({limit:60}),selection=new Set(),plan=null,aiMode='offline',generationBusy=false,libraryTab='native',category='精选',pageSize=40;
+let saveQueue=null;
 const objects=new Map(),loads=new Map(),modelErrors=new Map(),assetCache=new Map(),loader=new GLTFLoader();
 let worldGeneration=0,pendingModels=0;
 const viewport=$('#viewport'),scene=new THREE.Scene();scene.background=new THREE.Color('#dfe8e1');scene.fog=new THREE.Fog('#dfe8e1',170,420);
@@ -110,15 +113,136 @@ function updateGizmo(){gizmo.detach();const nodes=movableSelection();if(!nodes.l
 function selectedNodes(){return doc?.nodes.filter(n=>selection.has(n.id))||[]}
 function movableSelection(){return selectedNodes().filter(n=>!n.locked&&n.visible!==false)}
 function select(ids,add=false){finishViewMove(false);if(!add)selection.clear();for(const id of ids){const n=doc.nodes.find(n=>n.id===id);if(n){if(add&&selection.has(id))selection.delete(id);else selection.add(id)}}updateGizmo();selectionBoxes();inspector();outliner();stats();const ns=selectedNodes();$('#selection-toolbar').hidden=!ns.length;$('#selection-label').textContent=ns.length===1?ns[0].name:`已选 ${ns.length} 个物件`;$('#ungroup').hidden=ns.length!==1||!doc.definitions[ns[0]?.assetId]}
-function remember(snapshot=doc){history.push(JSON.stringify(snapshot));if(history.length>60)history.shift();future=[];historyButtons()}
-function historyButtons(){$('#undo').disabled=!history.length;$('#redo').disabled=!future.length}
-function markDirty(){dirty=true;editVersion++;$('#save-dot').classList.add('dirty');$('#save-state').textContent='待保存';clearTimeout(saveTimer);saveTimer=setTimeout(save,700);stats()}
-function edit(fn,{rebuild=false,library=false}={}){finishViewMove(false);remember();fn();syncWorld(rebuild);outliner();inspector();updateGizmo();if(library)renderLibrary();markDirty();select([...selection])}
-async function save(){if(!dirty||saving||conflict)return;saving=true;const version=editVersion;try{const r=await api('/api/project',{project:clone(doc),revision,source:'web'});revision=r.revision;if(version===editVersion){dirty=false;$('#save-dot').classList.remove('dirty');$('#save-state').textContent='已保存本机'}else saveTimer=setTimeout(save,100)}catch(e){$('#save-state').textContent='保存失败';if(e.status===409){conflict=true;$('#external-update').hidden=false}else toast('自动保存：'+e.message,true)}finally{saving=false}}
-function loadProject(project,{keepCamera=true,undoable=false}={}){finishViewMove(false);if(undoable)remember();doc=clone(project);doc.definitions??={};doc.settings??={snap:1,rotateSnap:15};ground.constant=-(doc.settings.groundHeight||0);selection.clear();$('#project-name').value=doc.name;syncWorld(true);select([]);renderLibrary();setSnap();if(!keepCamera)overview();if(undoable)markDirty()}
-function undo(){if(!history.length)return;const ids=[...selection];future.push(JSON.stringify(doc));const v=JSON.parse(history.pop());loadProject(v);select(ids);historyButtons();markDirty()}
-function redo(){if(!future.length)return;const ids=[...selection];history.push(JSON.stringify(doc));loadProject(JSON.parse(future.pop()));select(ids);historyButtons();markDirty()}
-gizmo.addEventListener('dragging-changed',e=>{dragging=e.value;orbit.enabled=!e.value;if(e.value){dragSnapshot=clone(doc);multiStart=gizmo.object===pivot?{origin:pivot.position.clone(),nodes:selectedNodes().filter(n=>!n.locked).map(n=>({id:n.id,p:[...n.position]}))}:null}else{if(dragSnapshot&&JSON.stringify(dragSnapshot)!==JSON.stringify(doc)){remember(dragSnapshot);markDirty();outliner()}dragSnapshot=null;multiStart=null;inspector();selectionBoxes()}});
+// Record the state about to be left behind. The entry carries the document,
+// the selection at this moment and the server baseline revision, so undo can
+// restore content and selection together and can never replay a snapshot
+// whose baseline the server has replaced.
+function remember(snapshot=doc,selected=selection,base=revision){history.push(snapshot,selected,base);historyButtons()}
+function historyButtons(){$('#undo').disabled=!history.canUndo;$('#redo').disabled=!history.canRedo}
+function markDirty(){dirty=true;$('#save-dot').classList.add('dirty');$('#save-state').textContent='待保存';saveQueue?.requestFlush();stats()}
+function edit(fn,{rebuild=false,library=false}={}){
+  finishViewMove(false);
+  remember();
+  const ids=[...selection];
+  fn();
+  // A structural edit may delete the selected objects; keep only ids that
+  // still exist. The stored history entry retains the pre-edit selection.
+  selection=new Set(ids.filter(id=>doc.nodes.some(n=>n.id===id)));
+  syncWorld(rebuild);outliner();inspector();updateGizmo();
+  if(library)renderLibrary();
+  markDirty();
+  select([...selection]);
+}
+// Pure scene checkout: replace the live document and redraw. History policy
+// is decided by the callers — local replacements (open/AI) stay undoable,
+// external baseline adoptions explicitly reset the chain.
+function loadProject(project,{keepCamera=true}={}){
+  finishViewMove(false);
+  doc=clone(project);doc.definitions??={};doc.settings??={snap:1,rotateSnap:15};
+  ground.constant=-(doc.settings.groundHeight||0);
+  selection.clear();
+  $('#project-name').value=doc.name;
+  syncWorld(true);select([]);renderLibrary();setSnap();
+  if(!keepCamera)overview();
+}
+// Local full-scene replacement chosen inside the editor (open file, AI
+// generate). The previous document remains reachable through undo.
+function loadLocalProject(project,options={}){
+  remember();
+  loadProject(project,options);
+  markDirty();
+}
+// The server baseline moved (MCP or another client). Old snapshots cannot be
+// replayed over it: drop both history stacks and the pending save queue, then
+// check out the new project. The user can keep editing on the fresh chain.
+function adoptRemoteProject(project,nextRevision,{keepCamera=true,toastMessage}={}){
+  history.adoptBaseline();historyButtons();
+  saveQueue?.reset(nextRevision);
+  revision=nextRevision;
+  conflict=false;dirty=false;
+  $('#save-dot').classList.remove('dirty');
+  $('#external-update').hidden=true;
+  loadProject(project,{keepCamera});
+  $('#save-state').textContent='已载入另一端工程';
+  if(toastMessage)toast(toastMessage);
+}
+function restoreSelection(ids){
+  const valid=new Set(ids.filter(id=>doc.nodes.some(n=>n.id===id)));
+  select([...valid]);
+  return valid;
+}
+function undo(){
+  if(!history.canUndo)return;
+  try{
+    const state=history.undo(doc,selection,revision);
+    loadProject(state.document);
+    restoreSelection(state.selection);
+    historyButtons();markDirty();
+  }catch(e){
+    if(e instanceof StaleBaselineError){
+      conflict=true;$('#external-update').hidden=false;
+      toast('该撤销基于已被另一端改写的旧工程基线，已阻止覆盖；请载入远端版本后继续编辑',true);
+    }else throw e;
+  }
+}
+function redo(){
+  if(!history.canRedo)return;
+  try{
+    const state=history.redo(doc,selection,revision);
+    loadProject(state.document);
+    restoreSelection(state.selection);
+    historyButtons();markDirty();
+  }catch(e){
+    if(e instanceof StaleBaselineError){
+      conflict=true;$('#external-update').hidden=false;
+      toast('该重做基于已被另一端改写的旧工程基线，已阻止覆盖；请载入远端版本后继续编辑',true);
+    }else throw e;
+  }
+}
+// One serialized autosave pipeline. Every flush serializes the CURRENT
+// document, so rapid edits coalesce onto the newest state and writes can
+// never pass each other on the wire.
+function initSaveQueue(){
+  saveQueue=new SaveQueue({
+    delay:700,
+    post:(project,base)=>api('/api/project',{project,revision:base,source:'web'}),
+    getDocument:()=>doc,
+    getRevision:()=>revision,
+    onRevision:next=>{revision=next},
+    onSaved:()=>{
+      if(!saveQueue.hasPending){
+        dirty=false;$('#save-dot').classList.remove('dirty');$('#save-state').textContent='已保存本机';
+      }
+    },
+    onConflict:()=>{
+      conflict=true;$('#external-update').hidden=false;
+      $('#save-state').textContent='工程已被另一端更新';
+      toast('自动保存冲突：另一端已改写工程，本地旧快照不会覆盖它',true);
+    },
+    onError:error=>{
+      $('#save-state').textContent='保存失败，稍后重试';
+      toast('自动保存：'+error.message,true);
+    },
+  });
+  // Read-only diagnostic handle for automated checks; the page never mutates
+  // the queue through it (all state changes go through the methods above).
+  window.__xinggouSaveQueue=saveQueue;
+}
+gizmo.addEventListener('dragging-changed',e=>{
+  dragging=e.value;orbit.enabled=!e.value;
+  if(e.value){
+    // Capture the complete pre-drag state (document plus selection) as one
+    // history entry, so cancelling/undoing a drag restores both together.
+    dragSnapshot={doc:clone(doc),selection:[...selection]};
+    multiStart=gizmo.object===pivot?{origin:pivot.position.clone(),nodes:selectedNodes().filter(n=>!n.locked).map(n=>({id:n.id,p:[...n.position]}))}:null;
+  }else{
+    if(dragSnapshot&&JSON.stringify(dragSnapshot.doc)!==JSON.stringify(doc)){
+      history.push(dragSnapshot.doc,dragSnapshot.selection,revision);
+      historyButtons();markDirty();outliner();
+    }
+    dragSnapshot=null;multiStart=null;inspector();selectionBoxes();
+  }
+});
 gizmo.addEventListener('objectChange',()=>{if(!doc||!gizmo.object)return;if(multiStart){const delta=pivot.position.clone().sub(multiStart.origin);for(const original of multiStart.nodes){const n=doc.nodes.find(n=>n.id===original.id);if(n){n.position=original.p.map((x,i)=>x+delta.getComponent(i));applyTransform(objects.get(n.id),n)}}}else{const id=gizmo.object.userData.nodeId,n=doc.nodes.find(n=>n.id===id);if(n)Object.assign(n,readTransform(gizmo.object))}selectionBoxes();if(!dragging){inspector();markDirty()}});
 function setSnap(){const snap=Number(doc?.settings?.snap||0);gizmo.setTranslationSnap(snap||null);gizmo.setRotationSnap(snap?rad(doc.settings.rotateSnap||15):null);gizmo.setScaleSnap(snap ? .1 : null);$('#snap-toggle').classList.toggle('active',!!snap);$('#snap-toggle').innerHTML=icon('magnet')+(snap?`吸附 ${snap} m`:'自由变换')}
 function setPointer(event){const r=renderer.domElement.getBoundingClientRect();pointer.set((event.clientX-r.left)/r.width*2-1,-(event.clientY-r.top)/r.height*2+1);ray.setFromCamera(pointer,camera)}
@@ -322,7 +446,7 @@ $('#make-plan').onclick=()=>generate(async()=>{
   if(guided)request.brief=guided.brief;
   busyStatus(aiMode==='ai'?'正在按已确认需求生成设计草案…':'正在整理离线布局草案…',true);const {plan:p}=await api('/api/ai/plan',request);planFields(p);busyStatus('草案已生成。确认二维平面和动线后，再生成三维布局。');$('#plan-card').scrollIntoView({behavior:'smooth',block:'nearest'});
 });
-$('#make-scene').onclick=()=>generate(async()=>{if(aiMode==='ai'&&!guidedRequest()?.completed.includes('plan')){workflowQuestions({questions:[{question:'请先画出有尺寸、分区、入口、动线与视线的二维平面，并在教程的“二维平面规划”阶段确认，再重新采用需求。'}]},'先确认二维平面');return}const p=readPlan();busyStatus(aiMode==='ai'?'模型正在选择完整原生资产并生成坐标，通常需要数十秒…':'正在使用千星现成原生资产布置场景…',true);const {project:s}=await api('/api/ai/scene',{plan:p,mode:aiMode});if($('#generation-action').value==='append'){edit(()=>{for(const n of s.nodes){n.id=uid();doc.nodes.push(n)}Object.assign(doc.definitions,s.definitions);doc.design=s.design||p},{library:true})}else loadProject(s,{undoable:true});const notes=designNotes(s.design);busyStatus(`已放置 ${s.nodes.length} 个场景物件。可在画布继续编辑。`+(notes.length?'\n说明 / 待核对：'+notes.join('；'):''));toast(notes.length?`原生资产布局已生成，${notes.length} 条说明或待核对事项。可撤销恢复。`:'原生资产布局已生成，可以撤销恢复上一个版本');});
+$('#make-scene').onclick=()=>generate(async()=>{if(aiMode==='ai'&&!guidedRequest()?.completed.includes('plan')){workflowQuestions({questions:[{question:'请先画出有尺寸、分区、入口、动线与视线的二维平面，并在教程的“二维平面规划”阶段确认，再重新采用需求。'}]},'先确认二维平面');return}const p=readPlan();busyStatus(aiMode==='ai'?'模型正在选择完整原生资产并生成坐标，通常需要数十秒…':'正在使用千星现成原生资产布置场景…',true);const {project:s}=await api('/api/ai/scene',{plan:p,mode:aiMode});if($('#generation-action').value==='append'){edit(()=>{for(const n of s.nodes){n.id=uid();doc.nodes.push(n)}Object.assign(doc.definitions,s.definitions);doc.design=s.design||p},{library:true})}else loadLocalProject(s);const notes=designNotes(s.design);busyStatus(`已放置 ${s.nodes.length} 个场景物件。可在画布继续编辑。`+(notes.length?'\n说明 / 待核对：'+notes.join('；'):''));toast(notes.length?`原生资产布局已生成，${notes.length} 条说明或待核对事项。可撤销恢复。`:'原生资产布局已生成，可以撤销恢复上一个版本');});
 $('#make-asset').onclick=()=>generate(async()=>{const idea=$('#asset-idea').value.trim(),allowPrimitives=$('#allow-primitive-asset').checked;if(!idea)throw new Error('描述你要添加的物件');busyStatus(allowPrimitives?'先查找现成原生模型；没有匹配时才使用基元补充…':'正在查找匹配的千星现成原生模型…',true);const {asset}=await api('/api/ai/asset',{idea,mode:aiMode,allowPrimitives});if(asset.nativeModel||asset.origin==='native'){const id=String(asset.id),native=byId.get(id);if(!native?.exportable||native.primitive)throw new Error('接口返回的物件未匹配到已绑定的完整原生模型');await placeAsset(id);busyStatus(`已找到并放置原生资产：“${asset.name}”。保留游戏原有模型与材质。`);toast('已找到并放置原生资产');return}if(!allowPrimitives)throw new Error('接口返回了组合资产；当前未允许基元补充');edit(()=>doc.definitions[asset.id]=asset,{library:true});await placeAsset(asset.id);busyStatus(`未找到匹配原生资产。“${asset.name}”已作为基元组合加入我的组合，可重复放置。`);toast(`已添加基元补充：${asset.components.length} 个组件；组件数不是官方负载值`);});
 $$('[data-ai-mode]').forEach(e=>e.onclick=()=>{aiMode=e.dataset.aiMode;$$('[data-ai-mode]').forEach(b=>b.classList.toggle('active',b===e));$('#asset-mode-note').textContent=aiMode==='offline'?'默认只添加现成原生模型；基元组合需勾选上方选项。':'先匹配现成原生模型；勾选允许补充且无匹配时，才使用模型接口生成基元组合。';if(aiMode==='ai'&&!provider.model)openSettings()});
 $$('[data-idea]').forEach(e=>e.onclick=()=>{$('#idea').value=e.dataset.idea;$('#idea').focus()});
@@ -344,8 +468,8 @@ $$('[data-right]').forEach(e=>e.onclick=()=>rightTab(e.dataset.right));$$('[data
 let searchTimer;$('#asset-search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{pageSize=40;renderLibrary()},180)};$('#ready-only').onchange=()=>{pageSize=40;renderLibrary()};$('#load-more').onclick=()=>{pageSize+=40;renderLibrary()};$('#outliner-search').oninput=outliner;$('#select-all').onclick=()=>select(doc.nodes.filter(n=>!n.locked).map(n=>n.id));
 $('#project-name').onchange=e=>{edit(()=>doc.name=e.target.value.slice(0,120)||'未命名场景')};
 function saveProjectFile(){download(JSON.stringify(doc,null,2),safeName(doc.name)+'.starscene.json');toast('工程文件已保存')}
-$('#save-project').onclick=saveProjectFile;$('#new-project').onclick=()=>loadProject({schema:'starscene/1',name:'未命名场景',nodes:[],definitions:{},settings:{snap:1,rotateSnap:15},design:null},{undoable:true});$('#open-project').onclick=()=>$('#project-file').click();$('#project-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>12000000)throw new Error('工程文件应小于 12 MB');const project=JSON.parse(await file.text());const r=await api('/api/project',{project,revision,source:'web-open'});revision=r.revision;loadProject(r.project,{undoable:true});toast('工程已打开')}catch(e){toast(e.message,true)}finally{e.target.value=''}};
-$('#reload-remote').onclick=async()=>{try{const r=await api('/api/project');remember();loadProject(r.project);revision=r.revision;dirty=false;conflict=false;$('#external-update').hidden=true;$('#save-state').textContent='已载入另一端工程';$('#save-dot').classList.remove('dirty')}catch(e){toast(e.message,true)}};$('#download-conflict').onclick=saveProjectFile;
+$('#save-project').onclick=saveProjectFile;$('#new-project').onclick=()=>loadLocalProject({schema:'starscene/1',name:'未命名场景',nodes:[],definitions:{},settings:{snap:1,rotateSnap:15},design:null});$('#open-project').onclick=()=>$('#project-file').click();$('#project-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>12000000)throw new Error('工程文件应小于 12 MB');const project=JSON.parse(await file.text());const r=await api('/api/project',{project,revision,source:'web-open'});adoptRemoteProject(r.project,r.revision,{toastMessage:'工程已打开，旧编辑历史已按新基线重置'})}catch(e){toast(e.message,true)}finally{e.target.value=''}};
+$('#reload-remote').onclick=async()=>{try{const r=await api('/api/project');adoptRemoteProject(r.project,r.revision,{toastMessage:r.source==='mcp'?'已载入外部 AI 的工程，本地历史已按新基线重置':'已载入另一端工程，本地历史已按新基线重置'})}catch(e){toast(e.message,true)}};$('#download-conflict').onclick=saveProjectFile;
 window.addEventListener('keydown', e => {
   if (viewMove) {
     e.preventDefault();
@@ -371,16 +495,19 @@ window.addEventListener('keydown', e => {
 window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue=''}});
 async function boot(){
   try{
-    const data=await api('/api/boot');catalog=data.catalog;byId=new Map(catalog.flatMap(a=>[[a.id,a],...(a.aliases||[]).map(x=>[x.id,a])]));provider=data.provider;revision=data.revision;$('#library-count').textContent=`${data.catalogStatus.total.toLocaleString()} 个本机模型 · ${data.catalogStatus.ready.toLocaleString()} 已绑定`;$('#asset-root-info').textContent=data.catalogStatus.assetRoot;loadProject(data.project);if(data.project.design)planFields(data.project.design);historyButtons();$('#save-state').textContent='已保存本机';$('#loading-overlay').hidden=true;if(!data.catalogStatus.libraryAvailable)toast('未找到素材库。完整版请确认 library 目录已完整解压，也可在设置中查看路径。',true);
+    const data=await api('/api/boot');catalog=data.catalog;byId=new Map(catalog.flatMap(a=>[[a.id,a],...(a.aliases||[]).map(x=>[x.id,a])]));provider=data.provider;revision=data.revision;initSaveQueue();$('#library-count').textContent=`${data.catalogStatus.total.toLocaleString()} 个本机模型 · ${data.catalogStatus.ready.toLocaleString()} 已绑定`;$('#asset-root-info').textContent=data.catalogStatus.assetRoot;loadProject(data.project);if(data.project.design)planFields(data.project.design);historyButtons();$('#save-state').textContent='已保存本机';$('#loading-overlay').hidden=true;if(!data.catalogStatus.libraryAvailable)toast('未找到素材库。完整版请确认 library 目录已完整解压，也可在设置中查看路径。',true);
     setInterval(async () => {
-      if (dirty || saving || dragging || generationBusy || conflict) return;
+      if (dirty || saveQueue?.inFlight || dragging || generationBusy || conflict) return;
       const requestedRevision = revision;
       try {
         const r = await api('/api/project');
-        if (r.revision === revision || revision !== requestedRevision || dirty || saving || dragging || generationBusy || conflict) return;
-        revision = r.revision;
-        loadProject(r.project);
-        toast(r.source === 'mcp' ? '外部 AI 的工程修改已同步' : '工程已从另一端同步');
+        if (r.revision === revision || revision !== requestedRevision || dirty || saveQueue?.inFlight || dragging || generationBusy || conflict) return;
+        // Clean external change: no local edits are pending, so adopt the new
+        // baseline and reset the local chain instead of risking an undo that
+        // would overwrite the other client's work.
+        adoptRemoteProject(r.project,r.revision,{
+          toastMessage:r.source === 'mcp' ? '外部 AI 的工程修改已同步' : '工程已从另一端同步',
+        });
       } catch {}
     }, 3000);
   }catch(e){$('#loading-overlay b').textContent='本机服务连接失败';$('#loading-overlay span').textContent=e.message;toast(e.message,true)}

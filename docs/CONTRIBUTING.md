@@ -13,6 +13,14 @@ python -m unittest discover -s tests -v
 
 没有真实资产库时，依赖资源的集成用例会明确跳过。配齐真实资产库的全量集成、浏览器回归、Blender 和游戏实机是不同的验证范围。
 
+编辑历史链与自动保存队列的纯逻辑测试不依赖浏览器或网络，使用 Node 内置测试运行器：
+
+```sh
+node --test tests/*.test.mjs
+```
+
+`tests/editor-integration.cjs` 在无头 Chromium 内运行与线上相同的 `web/editor/history.js`、`web/editor/save-queue.js` 模块（仅在页面内模拟网络传输），覆盖撤销重做内容与选中一致性、外部 revision 变更后的旧快照拦截、快速连续编辑的串行落盘与冲突停机；`tests/editor-smoke.cjs` 通过路由拦截加载完整编辑器页面做端到端冒烟。两者需要可用的 Playwright Chromium，可用 `NODE_PATH` 指向其安装位置。
+
 浏览器测试还需要 Node.js、Playwright 和 Edge，使用独立源码副本及测试资产库运行：
 
 ```sh

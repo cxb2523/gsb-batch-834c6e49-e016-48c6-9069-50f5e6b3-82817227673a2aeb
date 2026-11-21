@@ -1,0 +1,46 @@
+{
+  "schema": "starscene/1",
+  "name": "历史链验证样例",
+  "nodes": [
+    {
+      "id": "sample_box_01",
+      "assetId": "10009001",
+      "name": "已绑定基元",
+      "position": [0, 0, 0],
+      "rotation": [0, 0, 0],
+      "scale": [2, 1, 1.5],
+      "visible": true,
+      "locked": false,
+      "layer": "场景"
+    },
+    {
+      "id": "sample_hidden_unbound_01",
+      "assetId": "terrain-local-unbound",
+      "name": "隐藏的未绑定地块",
+      "position": [4, 0, 0],
+      "rotation": [0, 0, 0],
+      "scale": [1, 1, 1],
+      "visible": false,
+      "locked": false,
+      "layer": "地块"
+    },
+    {
+      "id": "sample_visible_unbound_01",
+      "assetId": "terrain-local-unbound",
+      "name": "显示的未绑定地块",
+      "position": [-4, 0, 0],
+      "rotation": [0, 0, 0],
+      "scale": [1, 1, 1],
+      "visible": true,
+      "locked": false,
+      "layer": "地块"
+    }
+  ],
+  "definitions": {},
+  "settings": {
+    "snap": 1,
+    "rotateSnap": 15,
+    "groundHeight": 0
+  },
+  "design": null
+}
