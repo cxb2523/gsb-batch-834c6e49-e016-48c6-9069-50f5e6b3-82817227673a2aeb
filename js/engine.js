@@ -59,7 +59,74 @@ for (const l of LAYERS) {
     source: null, cur: null, tails: [], fxIn: null, insert: null, gain: null, analyser: null,
     loading: false, syncing: false, progress: 0, renderTag: 0,
     error: null, // why the layer couldn't follow the last tempo or key change, if it couldn't
+    reqId: 0, // the layer's current source request (see beginRequest): stale results are dropped
   };
+}
+
+// ---------- source-request lifecycle ----------
+// Every change of source (a pick, a clear, a tempo/key re-render) belongs to one cancellable
+// request with a globally increasing id. A late result whose id is no longer current is dropped
+// before it can touch any audio node, and its buffers are released right there (a worker that
+// finished after the request was cancelled still transferred them, so nobody else holds them).
+// The same id stamps the stretch job (see stretchInWorker), so a worker answer is checked twice:
+// once when the pool hears back, once when the layer's await resumes — an answer can overtake the
+// await that owns it.
+let sourceSeq = 0;
+const liveRequests = new Map(); // reqId -> { layerId, cancelled, buffers }
+export function beginRequest(layerId) {
+  const s = state.layers[layerId];
+  const req = { id: ++sourceSeq, layerId, cancelled: false, buffers: new Set() };
+  if (s.reqId) cancelRequest(s.reqId);
+  s.reqId = req.id;
+  liveRequests.set(req.id, req);
+  return req.id;
+}
+export function currentRequest(layerId) {
+  return state.layers[layerId].reqId;
+}
+export function isRequestCurrent(layerId, reqId) {
+  const s = state.layers[layerId];
+  return !!reqId && s.reqId === reqId && !liveRequests.get(reqId)?.cancelled;
+}
+// Ends a request: the stretch job it owns is stopped (see pumpJobs), any result that still lands
+// is dropped, and the buffers the request had assembled are released. A new pick on the layer, or
+// a clear, calls this; cancelled requests never write to an audio node (every await checks first).
+export function cancelRequest(reqId) {
+  const req = liveRequests.get(reqId);
+  if (!req || req.cancelled) return;
+  req.cancelled = true;
+  pumpJobs(); // a running job owned by this request retires its worker now
+  releaseRequest(reqId);
+  liveRequests.delete(reqId);
+  for (const s of LAYERS.map((l) => state.layers[l.id])) if (s.reqId === reqId) s.reqId = 0;
+}
+export function holdRequestBuffer(reqId, buf) {
+  const req = liveRequests.get(reqId);
+  if (req && buf) req.buffers.add(buf);
+  return buf;
+}
+function releaseRequest(reqId) {
+  const req = liveRequests.get(reqId);
+  if (!req) return;
+  for (const buf of req.buffers) { // detach the PCM so its memory can be collected at once
+    for (let c = 0; c < buf.numberOfChannels; c++) {
+      const d = buf.getChannelData(c);
+      if (d.length) d.fill(0);
+    }
+  }
+  req.buffers.clear();
+}
+// Called once a request has committed its buffers onto the layer: they now live on the layer, so
+// the request must not free them if a later change cancels it.
+export function commitRequest(reqId) {
+  if (reqId) liveRequests.delete(reqId);
+}
+// A stale worker answer (its request is gone, or a newer one took the layer): its transferred
+// channels are the only holders of that PCM, so let them go explicitly.
+function dropStaleAnswer(data) {
+  const chans = data && data.channels;
+  if (!chans) return;
+  for (const c of chans) { if (c && c.buffer) c.fill(0); } // dropping the typed array then frees the PCM
 }
 
 // The tempo the running sources were rendered at. state.bpm moves as soon as the user
@@ -151,7 +218,27 @@ function buildLimiter(c) {
     processorOptions: { lookahead, release: LIMIT.release, ceiling: LIMIT.ceiling },
   });
   input.connect(output);
+  liveLimiters.add(output); // so a source commit can reset its envelope (see armLimiterReset)
+  output.addEventListener?.('processorerror', () => liveLimiters.delete(output));
   return { input, output, latency: lookahead }; // its delay is exactly the lookahead
+}
+
+// Every limiter currently in a live graph (the initial one, and the one upgradeGlue crossfades to).
+// Offline export limiters aren't added here: a fresh worklet starts from unity anyway.
+const liveLimiters = new Set();
+// Reset the limiter's delay line and gain history for a new source, at audio-clock time `at`
+// (the swap's bar line). The worklet performs the reset itself at the first block not before `at`,
+// so it is sample-accurate even though this call happens on the main thread ahead of time. Posts to
+// every live limiter: the one the music actually passes through is among them, and an idle one
+// resetting harmlessly costs nothing. The fallback compressor has no message port and is skipped.
+const lastLimiterReset = { at: -1 };
+export function armLimiterReset(at) {
+  if (!ctx || !(at > 0)) return;
+  if (Math.abs(at - lastLimiterReset.at) < 0.5 / ctx.sampleRate) return; // one reset per commit point
+  lastLimiterReset.at = at;
+  for (const node of liveLimiters) {
+    try { node.port.postMessage({ type: 'reset', at }); } catch (_) { /* a torn-down node */ }
+  }
 }
 
 // Where AudioWorklet is missing (or its module won't load), and until it has loaded: gentle
@@ -365,6 +452,13 @@ const HQ_OK = !handheld && deviceGB > 4 && cores > 4;
 const pool = []; // { worker, job }
 const jobQueue = [];
 let jobSeq = 0;
+// Test seam: a factory taking the real worker URL and returning a worker-shaped object. Used by
+// the lifecycle tests to inject controllable render delays (tests/). The app always uses the
+// default, which builds a genuine Worker.
+let workerFactory = (url) => new Worker(url);
+export function setWorkerFactory(fn) {
+  workerFactory = typeof fn === 'function' ? fn : (url) => new Worker(url);
+}
 const abortError = () => new DOMException('No longer wanted', 'AbortError');
 const isAbort = (err) => !!err && err.name === 'AbortError';
 // Workers take 16-bit input once one has said what quality it rendered at, which only a
@@ -373,15 +467,26 @@ const isAbort = (err) => !!err && err.name === 'AbortError';
 let int16Input = false;
 
 function spawnWorker() {
-  const slot = { worker: new Worker(new URL('./stretch-worker.js', import.meta.url)), job: null, pre: false };
+  const slot = { worker: workerFactory(new URL('./stretch-worker.js', import.meta.url)), job: null, pre: false };
   slot.worker.onmessage = (e) => {
     const job = slot.job;
     slot.job = null;
     if (e.data.quality) int16Input = true;
-    if (job && job.id === e.data.id) {
-      if (e.data.error) job.reject(new Error(e.data.error));
-      else job.resolve(e.data); // { channels, quality, formant }
+    // First guard: the pool itself may have moved on (a newer request retired this worker, or the
+    // answer belongs to a job this slot no longer holds). Never resolve a job twice, and never
+    // hand a stale render's PCM up the stack — it is released here instead.
+    if (!job || job.id !== e.data.id) { dropStaleAnswer(e.data); pumpJobs(); preRenderSoon(); return; }
+    // Second guard: the request that asked for this job is cancelled or superseded. Its buffers
+    // are dropped and the job is rejected with an AbortError, exactly like a queue drop.
+    if (job.reqId && !isRequestCurrent(job.layerId, job.reqId)) {
+      dropStaleAnswer(e.data);
+      job.reject(abortError());
+      pumpJobs();
+      preRenderSoon();
+      return;
     }
+    if (e.data.error) job.reject(new Error(e.data.error));
+    else job.resolve(e.data); // { channels, quality, formant }
     pumpJobs();
     preRenderSoon(); // a worker is free: the hovered song may be rendered now
   };
@@ -428,7 +533,13 @@ const mixBusy = () => activeLayers().some((id) => {
 function pumpJobs() {
   for (let k = jobQueue.length - 1; k >= 0; k--) if (!jobQueue[k].wanted()) dropJob(jobQueue.splice(k, 1)[0]);
   for (const slot of [...pool]) {
-    if (slot.job && slot.pre && !slot.job.wanted()) { retire(slot); if (!pool.length) spawnWorker(); }
+    const j = slot.job;
+    if (!j) continue;
+    // A request's cancellation is immediate: even an urgent job mid-render is ended, so a cancelled
+    // pick can neither finish nor write into the graph. Pre-renders and upgrades whose pick moved
+    // on retire through their `wanted()` check as before.
+    const cancelled = j.reqId && !isRequestCurrent(j.layerId, j.reqId);
+    if ((slot.pre && !j.wanted()) || cancelled) { retire(slot); if (!pool.length) spawnWorker(); }
   }
   const rank = (j) => (j.urgent() ? 2 : j.low ? 0 : 1);
   while (jobQueue.length) {
@@ -463,11 +574,11 @@ function pumpJobs() {
 // worker converts it to `sampleRate`, the context's). `type` (the stem type) lets the worker
 // tune itself per layer; `quality` and `formant` ask for its slower paths (see upgrade). Resolves
 // with the worker's reply: { channels, quality, formant }.
-function stretchInWorker(channels, sampleRate, targetLen, pitchRatio, { wanted = () => true, urgent = wanted, dropped = () => {}, type, inLen, srcRate = sampleRate, low = false, quality, formant } = {}) {
+function stretchInWorker(channels, sampleRate, targetLen, pitchRatio, { wanted = () => true, urgent = wanted, dropped = () => {}, type, inLen, srcRate = sampleRate, low = false, quality, formant, reqId = 0, layerId = null } = {}) {
   return new Promise((resolve, reject) => {
     const id = ++jobSeq;
     const message = async (int16) => ({ id, channels: await channels(int16), inLen, sampleRate, srcRate, targetLen, pitchRatio, type, ...(quality && { quality, formant }) });
-    jobQueue.push({ id, message, wanted, urgent, dropped, low, resolve, reject });
+    jobQueue.push({ id, message, wanted, urgent, dropped, low, resolve, reject, reqId, layerId });
     pumpJobs();
   });
 }
@@ -932,11 +1043,16 @@ async function stretchStem(info, type, bpm, semis, { onProgress, ...job }) {
     return out;
   };
   const out = await stretchInWorker(chans, sr, len, ratio, { ...job, type, inLen, srcRate });
+  // The await may have resumed inside a request that has since been superseded: never build a node
+  // or a buffer for a stale pick. The worker's transferred channels go out of scope here and are
+  // collected, and the caller's own guard (see selectStem) drops the promise result.
+  if (job.reqId && !isRequestCurrent(job.layerId, job.reqId)) throw abortError();
   const buf = ctx.createBuffer(2, len, sr);
   for (let c = 0; c < 2; c++) await inSteps(len, copyInto, 0, out.channels[c], buf.getChannelData(c));
   buf.trim = stemTrim(info, type) * gain; // and back up by what toInt16 scaled a hot lossy decode down
   buf.quality = out.quality || 'fast'; // an older worker doesn't say: it only has the fast path
   buf.formant = !!out.formant;
+  if (job.reqId) holdRequestBuffer(job.reqId, buf); // released on cancel, released from the request on commit
   return buf;
 }
 
@@ -945,7 +1061,10 @@ async function stretchStem(info, type, bpm, semis, { onProgress, ...job }) {
 // one, replaced by its hq upgrade once that lands (see upgrade). The key needs no quality of its
 // own, as nothing asks for the fast render once there is a better one, and formant correction
 // follows from the key (the song, its type and the shift).
-function render(song, type, onProgress, at) {
+// `req` ({ layerId, reqId }) stamps a fresh stretch with the waiting layer's request, so a worker
+// answer for a cancelled or superseded pick is dropped rather than cached. Renders shared from the
+// cache or made in the background (no `req`) keep their tag-based lifecycle.
+function render(song, type, onProgress, at, req = null) {
   const info = MANIFEST[song];
   const { bpm, semis } = at || { bpm: state.bpm, semis: semisFor(info.key) };
   const key = renderKey(song, type, bpm, semis);
@@ -960,11 +1079,14 @@ function render(song, type, onProgress, at) {
       return s.song === song && s.type === type && renderKey(song, type) === key;
     });
     const wanted = () => urgent() || hoverRenders().some((h) => h.key === key);
+    // The request is captured now, at enqueue time, so a later pick on another layer can never
+    // re-stamp this shared entry's in-flight stretch with the wrong layer's id.
+    const stamp = req && req.reqId ? { reqId: req.reqId, layerId: req.layerId } : {};
     entry.promise = (async () => {
       const kept = await keptRender(info, type, key);
       if (kept) { if (onProgress) onProgress(1); entry.buf = kept; return kept; }
       // Dropped from the queue: forgotten at once, so a new request for it starts afresh.
-      entry.buf = await stretchStem(info, type, bpm, semis, { onProgress, wanted, urgent, dropped: forget });
+      entry.buf = await stretchStem(info, type, bpm, semis, { onProgress, wanted, urgent, dropped: forget, ...stamp });
       return entry.buf;
     })();
     entry.promise.then(() => setTimeout(trimCaches), forget); // once the layer waiting for it holds it
@@ -1574,15 +1696,25 @@ function retime(t) {
 }
 
 // Renders the given layers at the current tempo/key, in parallel; remembers which pick each
-// render was for, so a layer re-picked meanwhile can ignore it.
+// render was for (its render tag and its request id), so a layer re-picked or a tempo re-rendered
+// meanwhile can ignore it without writing a stale buffer anywhere.
 async function renderLayers(ids) {
   const jobs = ids.map((id) => {
     const s = state.layers[id];
-    return { id, song: s.song, tag: s.renderTag, job: render(s.song, s.type) };
+    return { id, song: s.song, tag: s.renderTag, reqId: s.reqId,
+      job: render(s.song, s.type, undefined, undefined, { layerId: id, reqId: s.reqId }) };
   });
   const done = await Promise.allSettled(jobs.map((j) => j.job.promise));
   return jobs.map((j, k) => ({ ...j, result: done[k] }));
 }
+
+// A result row is still the layer's current request when it comes back: same pick, same tag, and
+// a request id that has not been cancelled or superseded. A zero reqId is a background render
+// (pre-render, hq upgrade), which keeps its old tag-based rules.
+const rowIsCurrent = (r) => {
+  const s = state.layers[r.id];
+  return s.song === r.song && s.renderTag === r.tag && (!r.reqId || isRequestCurrent(r.id, r.reqId));
+};
 
 // A render that failed outright (a worker crash, a memory spike) is tried once more before the
 // layer is given up on; a dropped one (AbortError) just means the settings moved on.
@@ -1633,9 +1765,10 @@ export async function play() {
     for (const r of results) {
       const s = state.layers[r.id];
       s.syncing = false;
-      if (s.song !== r.song || s.renderTag !== r.tag) continue; // re-picked meanwhile
+      if (!rowIsCurrent(r)) continue; // re-picked, cleared, or a cancelled request's render
       if (r.result.status === 'fulfilled') {
         s.buffer = r.result.value; s.bufferKey = r.job.key; s.bufferBpm = r.job.bpm; s.error = null;
+        commitRequest(r.reqId);
       } else if (!isAbort(r.result.reason)) failed.set(r.id, r);
     }
     if (gen !== playGen || state.playing) { changed(); return; } // stopped or restarted meanwhile
@@ -1657,6 +1790,7 @@ export async function play() {
     if (ready.includes(l.id)) startSource(l.id, t, 0);
     else stopSource(l.id, t); // a cleared layer may still be fading out from before
   }
+  armLimiterReset(t); // the limiter starts this take from the new sources' own level
   state.playing = true;
   freshFrom = null; // the first picks' tempo has been heard: it holds now
   changed();
@@ -1717,11 +1851,15 @@ async function resyncOnce() {
   // played, and an hq upgrade could start on a render not heard yet.
   const fresh = [];
   const willBe = (id) => isCurrent(state.layers[id]) || fresh.some((r) => r.id === id);
+  // A row may take the new buffer only if its request is still current: same pick, tag and an
+  // uncancelled request id (see rowIsCurrent). Stale rows are skipped rather than committed.
+  const rowReady = (r) => rowIsCurrent(r) && !r.layerMoved && r.job.key === renderKey(state.layers[r.id].song, state.layers[r.id].type);
   const assign = () => {
     for (const r of fresh) {
       const s = state.layers[r.id];
-      if (s.song !== r.song || s.renderTag !== r.tag || s.loading || r.job.key !== renderKey(s.song, s.type)) continue; // moved on during the wait
+      if (!rowReady(r) || s.loading) continue; // moved on during the wait
       s.buffer = r.result.value; s.bufferKey = r.job.key; s.bufferBpm = r.job.bpm; s.error = null;
+      commitRequest(r.reqId); // the buffer now lives on the layer, not on the request
     }
   };
   if (stale.length) {
@@ -1732,7 +1870,8 @@ async function resyncOnce() {
     for (const r of results) {
       const s = state.layers[r.id];
       s.syncing = false;
-      if (s.song !== r.song || s.renderTag !== r.tag || s.loading) continue; // re-picked meanwhile
+      if (s.song !== r.song || s.renderTag !== r.tag || s.loading) { r.layerMoved = true; continue; } // re-picked meanwhile
+      if (r.reqId && !isRequestCurrent(r.id, r.reqId)) { r.layerMoved = true; resyncAgain = true; continue; } // cancelled: a newer request owns the layer
       if (r.result.status !== 'fulfilled') {
         if (isAbort(r.result.reason)) resyncAgain = true; // dropped: the tempo or key moved on
         else failed.push(r);
@@ -1743,9 +1882,23 @@ async function resyncOnce() {
     }
     if (resyncAgain) { resyncGroups.unshift(...groups); changed(); return; } // nudged again while rendering: wait for the next pass
     if (holdTempo()) { changed(); return; } // a pick at the new tempo started loading meanwhile: the restart waits for it
+    // Atomicity: a tempo change re-renders every layer, so the new mix may replace the old one only
+    // as a whole. If any layer that needed a new render can't provide one (a worker failure), hold
+    // every layer on its old buffer: no half-new, half-old mix, and no layer at the wrong tempo.
+    // The next tempo/key pass, or Stop then Play, retries (see syncFailed). A key-only change is
+    // different: a layer that couldn't re-key deliberately keeps playing in its old key.
+    const tempoChange = clockBpm !== state.bpm;
+    if (tempoChange && failed.length) {
+      for (const r of failed) {
+        r.skipped = true;
+        syncFailed(r, "couldn't follow the tempo change, so the whole mix stays at the old tempo for now");
+      }
+      fresh.length = 0; // nothing commits: every layer keeps the buffer the clock is playing
+    }
     // At a new tempo the clock moves on with the layers that made it (see below).
     const clockMoves = activeLayers().some(willBe);
     for (const r of failed) {
+      if (r.skipped) continue;
       const tempo = r.job.bpm !== state.layers[r.id].bufferBpm;
       syncFailed(r, !tempo ? "couldn't change key, so it plays on in the old key"
         : clockMoves && state.playing ? "couldn't follow the tempo change, so it's silent for now" : "couldn't follow the tempo change");
@@ -1781,6 +1934,7 @@ async function resyncOnce() {
       if (s.song && s.buffer && s.bufferBpm === clockBpm && !s.loading) startSource(l.id, t, t - state.transportStart);
       else stopSource(l.id, t); // still loading a new pick at the old tempo: it joins when ready; a cleared one leaves now
     }
+    armLimiterReset(t); // every source restarts here: the limiter re-initializes on the new mix
     if (fxOn && fxOn.repeats) restartRepeats(t); // a held Stutter repeats at the new tempo (an Auto length follows it)
   } else if (fresh.length) {
     assign();
@@ -1789,6 +1943,7 @@ async function resyncOnce() {
         const s = state.layers[r.id];
         if (s.bufferKey === r.job.key && !s.loading && isCurrent(s) && s.bufferBpm === clockBpm) startSource(r.id, t, t - state.transportStart);
       }
+      armLimiterReset(t); // re-keyed sources are a new source set: reset from their own level
     };
     // Re-keyed for a new anchor pick: drop in on the same bar as that pick (the latest one, if
     // the anchor changed twice).
@@ -1856,6 +2011,10 @@ export async function selectStem(layerId, song, opts = {}) {
   // At a tempo the clock isn't at yet, the pick lands with the restart that brings every layer to it
   // (see resyncOnce): in a group, so that restart waits for it and its old song plays on till then.
   if (state.playing && state.bpm !== clockBpm) group ??= swapGroup([layerId]);
+  // One lifecycle per pick: a globally increasing request id. The previous request on this layer
+  // (a re-pick that was still rendering, or a clear) is cancelled here — its worker is retired and
+  // any late answer will be dropped before it can reach a node (see spawnWorker).
+  const reqId = beginRequest(layerId);
   s.song = song;
   s.type = type;
   s.loading = true;
@@ -1884,32 +2043,39 @@ export async function selectStem(layerId, song, opts = {}) {
   s.joinGroup = (g) => { group = s.group = g; }; // switching auto tempo on while it loads (see setAutoTempo)
   const leave = () => { if (s.group !== group) settle(group, layerId); };
   const tag = ++s.renderTag;
+  // Every await below is followed by this guard: a newer pick, a clear or Stop has cancelled the
+  // request, so nothing it fetched may be written onto the layer or scheduled as a source.
+  const stale = () => !isRequestCurrent(layerId, reqId) || s.renderTag !== tag || s.song !== song;
   try {
     // Progress arrives per network chunk; re-render the UI in 2% steps, not hundreds of times.
     // It can go back (an Ogg this browser couldn't decode, then the FLAC).
     const progress = (p) => {
-      if (s.renderTag === tag && (p >= 1 || Math.abs(p - s.progress) >= 0.02)) { s.progress = p; changed(); }
+      if (!stale() && (p >= 1 || Math.abs(p - s.progress) >= 0.02)) { s.progress = p; changed(); }
     };
     let job, buf;
     for (;;) {
-      job = render(song, type, progress);
+      job = render(song, type, progress, undefined, { layerId, reqId });
       try { buf = await job.promise; break; } catch (err) {
+        if (stale()) { leave(); return; } // superseded while rendering: its result is dropped upstream
         // Dropped from the stretch queue because the tempo or key moved while it waited: render
-        // again for the new settings, however often that happens (nothing failed). A pick
-        // replaced meanwhile just ends, below.
-        if (!isAbort(err) || s.renderTag !== tag || s.song !== song) throw err;
+        // again for the new settings, however often that happens (nothing failed).
+        if (!isAbort(err)) throw err;
       }
     }
-    if (s.renderTag !== tag || s.song !== song) { leave(); return; }
+    if (stale()) { leave(); return; }
     s.buffer = buf; s.bufferKey = job.key; s.bufferBpm = job.bpm;
     s.loading = false;
     s.progress = 1;
+    commitRequest(reqId); // the buffers now belong to the layer; a later cancel must not free them
     let retimeLater = false;
     if (state.playing) {
       if (job.bpm === clockBpm) {
         // Rendered for an older key (it moved while this loaded): the resync below starts the re-render.
         const go = (t) => {
-          if (state.playing && s.renderTag === tag && s.buffer === buf && isCurrent(s) && s.bufferBpm === clockBpm) startSource(layerId, t, t - state.transportStart);
+          if (state.playing && !stale() && isCurrent(s) && s.bufferBpm === clockBpm) {
+            startSource(layerId, t, t - state.transportStart);
+            armLimiterReset(t); // the new stem is a new source: the limiter starts from its level
+          }
         };
         if (!settle(group, layerId, go)) go(nextBarTime());
       } else {
@@ -1931,7 +2097,7 @@ export async function selectStem(layerId, song, opts = {}) {
     changed();
     preRenderSoon();
   } catch (err) {
-    if (s.renderTag !== tag) { leave(); return; }
+    if (stale()) { leave(); return; }
     console.error(err);
     s.loading = false;
     stopSource(layerId);
@@ -1995,6 +2161,10 @@ export function clearLayer(layerId) {
   if (ctx && (!withTempo || repeating)) stopSource(layerId, state.playing && others && !repeating ? nextBarTime() : undefined);
   s.renderTag++;
   s.group = null; // a pick still loading settles its group as it ends (see selectStem)
+  // Cancel the layer's in-flight request: its running worker is retired, queued jobs are dropped and
+  // any result still on its way is discarded (see cancelRequest) rather than landing on the empty
+  // layer. The playing source above fades out on the bar and its nodes disconnect in gone().
+  if (s.reqId) { cancelRequest(s.reqId); s.reqId = 0; }
   const rootBefore = masterRoot();
   s.song = s.type = s.buffer = s.bufferKey = s.error = null;
   s.loading = s.syncing = false;

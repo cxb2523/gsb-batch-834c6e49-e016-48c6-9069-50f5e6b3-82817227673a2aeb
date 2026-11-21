@@ -20,7 +20,9 @@
     "dev:live": "node tools/serve-live.mjs",
     "stems": "node tools/build-stems.mjs",
     "covers": "node tools/build-covers.mjs",
-    "deploy": "node tools/deploy.mjs"
+    "deploy": "node tools/deploy.mjs",
+    "test:fixtures": "node tests/make-fixtures.mjs",
+    "test": "node tests/make-fixtures.mjs && node tests/run-all.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

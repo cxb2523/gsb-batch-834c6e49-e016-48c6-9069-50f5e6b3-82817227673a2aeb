@@ -60,6 +60,91 @@ class TruePeakLimiter extends AudioWorkletProcessor {
     this.qHead = 0; this.qLen = 0; this.n = 0;
     this.ring = new Float64Array(this.win).fill(1); this.rpos = 0; this.sum = this.win;
     this.rel = 1;
+    // A reset arms the limiter for a new source committed at this context time (see resetAt).
+    // The main thread cannot touch the audio thread's state, so it posts the bar-line time and the
+    // reset happens sample-accurately inside process(), at the first block not before it. An
+    // OfflineAudioContext can't post mid-render, so a test may also arm one in processorOptions.
+    this.resetAt = Number.isFinite(o.resetAt) ? o.resetAt : -1;
+    this.resets = 0; // how many resets have actually run (the tests read this through a message)
+    this.port.onmessage = (e) => {
+      const msg = e.data || {};
+      if (msg.type === 'reset' && Number.isFinite(msg.at)) this.resetAt = msg.at;
+      else if (msg.type === 'ping') this.port.postMessage({
+        type: 'pong', resets: this.resets, resetAt: this.resetAt, rel: this.rel, gain: this._lastGain ?? 1,
+      });
+    };
+  }
+
+  // Re-initializes the limiter for a fresh source, without a gap of silence and without carrying
+  // the previous source's gain reduction into the new one. The delay line is pre-filled with the
+  // new source's own first input sample (rather than zeroed, which would output a lookahead-long
+  // hole), and every gain-history structure restarts at a gain already computed from the new
+  // source's first quantum (see armReset): so even a peak in the very first lookahead window is
+  // under the ceiling from the very first output sample, with unity history elsewhere.
+  resetState(a, b) {
+    const { hist, delay, qVal, qIdx, ring } = this, span = 4 * HALF;
+    const s0 = a || 0, s1 = b || s0;
+    hist[0].fill(s0); hist[1].fill(s1);
+    this.hpos = 0;
+    delay[0].fill(s0); delay[1].fill(s1);
+    this.dpos = 0;
+    qVal.fill(1); qIdx.fill(0);
+    this.qHead = 0; this.qLen = 0; this.n = 0;
+    ring.fill(1); this.rpos = 0; this.sum = this.win;
+    this.rel = 1; this.qPrev = 0; this.loud = 0;
+  }
+
+  // True-peak estimate of the interval whose newest sample is (a,b), given the prior history.
+  // Mirrors the in-loop computation so the pre-read and the steady path use one definition.
+  peakFor(a, b, h0, h1) {
+    const span = 2 * HALF;
+    h0[this.hpos] = h0[this.hpos + span] = a;
+    h1[this.hpos] = h1[this.hpos + span] = b;
+    if (++this.hpos === span) this.hpos = 0;
+    const base = this.hpos;
+    let q = Math.max(Math.abs(h0[base + HALF]), Math.abs(h1[base + HALF]));
+    if (!(a > this.quiet || a < -this.quiet || b > this.quiet || b < -this.quiet)) return q;
+    let s0 = 0, t0 = 0, m0 = 0, s1 = 0, t1 = 0, m1 = 0;
+    for (let k = 0, j = base + span - 1; k < HALF; k++, j--) {
+      const u0 = h0[base + k] + h0[j], v0 = h0[base + k] - h0[j];
+      const u1 = h1[base + k] + h1[j], v1 = h1[base + k] - h1[j];
+      s0 += FOLD[k] * u0; t0 += TWIST[k] * v0; m0 += MID[k] * u0;
+      s1 += FOLD[k] * u1; t1 += TWIST[k] * v1; m1 += MID[k] * u1;
+    }
+    return Math.max(q, 0.5 * (Math.abs(s0) + Math.abs(t0)), 0.5 * (Math.abs(s1) + Math.abs(t1)), Math.abs(m0), Math.abs(m1));
+  }
+
+  // Pre-read the new source's first quantum before any of it is output, find the deepest gain its
+  // opening lookahead window requires, and seed the hold queue and smoothing ring with it. The
+  // first `win` output samples then already carry that gain, which is exactly what a peak at the
+  // start needs; the normal loop takes over from there and releases it over the usual window. The
+  // history and delay are restored to their just-reset positions afterwards, so processing replays
+  // the same quantum unchanged apart from the seeded gain.
+  armReset(x0, x1, n) {
+    const { hist, delay, qVal, qIdx, ring, ceiling, win } = this;
+    const h0 = hist[0].slice(), h1 = hist[1].slice();
+    const savedHpos = this.hpos;
+    let worst = 1, qPrev = 0;
+    for (let i = 0; i < n; i++) {
+      const q = this.peakFor(x0[i] || 0, x1[i] || 0, h0, h1);
+      const peak = q > qPrev ? q : qPrev;
+      qPrev = q;
+      if (peak > ceiling) worst = Math.min(worst, ceiling / peak);
+    }
+    this.hpos = savedHpos;
+    // Seed every hold-window slot and the whole smoothing ring with the opening gain. Filling the
+    // ring means the moving average equals `worst` for the first window, then recovers normally.
+    for (let k = 0; k < win; k++) ring[k] = worst;
+    this.sum = worst * win; this.rpos = 0; this.rel = worst;
+    // A full hold queue (cap entries) with timestamps already inside the current window [m-win, m).
+    // The steady loop's age eviction (`qIdx <= m - win`) therefore keeps the seeded head for the
+    // whole first window, and new `need` values only replace the tail: the opening gain holds.
+    const cap = win + 1;
+    for (let k = 0; k < cap; k++) { qVal[k] = worst; qIdx[k] = k - win + 1; }
+    this.qHead = 0; this.qLen = cap; this.n = 0;
+    // The delay stays pre-filled with the first sample (resetState did that); loud restarts so the
+    // first steady-path block runs its interpolator rather than trusting a quiet shortcut.
+    this.loud = 2 * HALF;
   }
 
   // The state lives in locals while a block runs (a phone's audio thread pays for every property
@@ -68,6 +153,15 @@ class TruePeakLimiter extends AudioWorkletProcessor {
     const inp = inputs[0], out = outputs[0];
     const n = out[0].length;
     const x0 = inp[0] || SILENT, x1 = inp[1] || x0, y0 = out[0], y1 = out[1] || out[0];
+    // A reset armed for this block's start: reinitialize from the new source's first sample before
+    // any of it is processed, then pre-read the quantum so the opening gain already covers a peak
+    // in the first lookahead window (see resetState / armReset).
+    if (this.resetAt >= 0 && currentTime >= this.resetAt) {
+      this.resetState(x0[0] || 0, x1[0] || 0);
+      this.armReset(x0, x1, n);
+      this.resetAt = -1;
+      this.resets++;
+    }
     const { hist, delay, ceiling, quiet, decay, win, latency, qVal, qIdx, ring } = this;
     const h0 = hist[0], h1 = hist[1], d0 = delay[0], d1 = delay[1], span = 2 * HALF, cap = win + 1;
     let { hpos, qPrev, dpos, qHead, qLen, n: m, rpos, sum, rel, loud } = this;
@@ -118,6 +212,7 @@ class TruePeakLimiter extends AudioWorkletProcessor {
         for (let k = 0; k < win; k++) sum += ring[k];
       }
       const g = sum < win ? sum / win : 1;
+      this._lastGain = g; // diagnostic only (see the ping handler); not on the audio path
       y0[i] = d0[dpos] * g;
       y1[i] = d1[dpos] * g;
       d0[dpos] = a; d1[dpos] = b;
