@@ -171,6 +171,10 @@ export interface WebGLAnalysisMetrics {
   passPixelCount: number     // Number of pixels passing threshold
   failPixelCount: number     // Number of pixels failing threshold
   totalPixelCount: number    // Total sampled pixels
+  // State consistency: identifies the comparison context (mode, flip, media URLs,
+  // threshold, ROI) these metrics were computed for. Metrics whose contextKey does
+  // not match the current context are stale and must not be displayed or exported.
+  contextKey?: string
 }
 
 export type BlendMode = 'difference' | 'overlay' | 'multiply' | 'screen'

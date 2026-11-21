@@ -31,6 +31,10 @@ export class WebGLComparisonRenderer {
 
   private textureA: WebGLTexture | null = null
   private textureB: WebGLTexture | null = null
+  // Identity (source URL) of the content currently held by each texture slot.
+  // Used to detect segment switches so stale frames are never rendered as if
+  // they belonged to the newly active clip.
+  private textureSourceKeys: { A: string | null; B: string | null } = { A: null, B: null }
   private positionBuffer: WebGLBuffer | null = null
   private texCoordBuffer: WebGLBuffer | null = null
 
@@ -258,9 +262,11 @@ export class WebGLComparisonRenderer {
   }
 
   /**
-   * Update texture from image/video source
+   * Update texture from image/video source.
+   * When sourceKey is provided it is recorded as the identity of the texture
+   * content, so later invalidation can tell stale content from current.
    */
-  updateTexture(which: 'A' | 'B', source: TexImageSource): void {
+  updateTexture(which: 'A' | 'B', source: TexImageSource, sourceKey?: string): void {
     const gl = this.gl
     if (!gl) return
 
@@ -269,6 +275,44 @@ export class WebGLComparisonRenderer {
 
     gl.bindTexture(gl.TEXTURE_2D, texture)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
+
+    if (sourceKey !== undefined) {
+      this.textureSourceKeys[which] = sourceKey
+    }
+  }
+
+  /**
+   * Get the source identity (URL) of the content currently held by a texture
+   * slot, or null if the slot holds only placeholder content.
+   */
+  getTextureSourceKey(which: 'A' | 'B'): string | null {
+    return this.textureSourceKeys[which]
+  }
+
+  /**
+   * Immediately invalidate a texture slot: releases the current (potentially
+   * stale) image data by replacing it with a 1x1 placeholder and clears the
+   * recorded source identity. Called when the active media segment changes so
+   * frames from the previous clip are never rendered as the new one.
+   */
+  invalidateTexture(which: 'A' | 'B'): void {
+    this.textureSourceKeys[which] = null
+
+    const gl = this.gl
+    const texture = which === 'A' ? this.textureA : this.textureB
+    if (!gl || !texture) return
+
+    const placeholder = new Uint8Array([128, 128, 128, 255])
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, placeholder)
+  }
+
+  /**
+   * Invalidate both texture slots (e.g. when all media is removed).
+   */
+  invalidateTextures(): void {
+    this.invalidateTexture('A')
+    this.invalidateTexture('B')
   }
 
   private renderCount = 0
@@ -494,6 +538,7 @@ export class WebGLComparisonRenderer {
     // Delete textures
     if (this.textureA) gl.deleteTexture(this.textureA)
     if (this.textureB) gl.deleteTexture(this.textureB)
+    this.textureSourceKeys = { A: null, B: null }
 
     // Delete buffers
     if (this.positionBuffer) gl.deleteBuffer(this.positionBuffer)
