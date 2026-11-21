@@ -10,10 +10,10 @@
   #speedTag{position:absolute;top:64px;right:16px;color:#000;font-size:14px;text-shadow:1px 1px 0 #fff;}
   #highScoreTag{position:absolute;top:44px;right:16px;color:#000;font-size:16px;font-weight:bold;text-shadow:1px 1px 0 #fff;}
   #copyrightTag{position:absolute;bottom:2px;left:0;width:100%;text-align:center;color:rgba(255,255,255,0.4);font-size:9px;font-family:sans-serif;pointer-events:none;z-index:5;}
-  #startScreen,#gameOverScreen{position:absolute;top:0;left:0;width:100%;height:100%;
+  #startScreen,#gameOverScreen,#pauseScreen{position:absolute;top:0;left:0;width:100%;height:100%;
     display:flex;flex-direction:column;align-items:center;justify-content:center;
     background:rgba(0,0,0,0.55);color:#fff;text-align:center;font-family:'Courier New',monospace;}
-  #gameOverScreen{display:none;}
+  #gameOverScreen,#pauseScreen{display:none;}
   h1{font-size:32px;margin:0 0 10px;text-shadow:2px 2px #000;}
   #brandTitle{font-size:56px;font-weight:900;letter-spacing:4px;color:#ffcc00;
     text-shadow:4px 4px 0 #8c2c2c, 6px 6px 0 rgba(0,0,0,0.6);margin:0 0 6px;
@@ -76,6 +76,12 @@
   <button id="restartBtn">RESTART</button>
 </div>
 
+<div id="pauseScreen">
+  <h1>PAUSED</h1>
+  <p id="pauseHint">Press Esc / P or click Resume to continue</p>
+  <button id="resumeBtn">RESUME</button>
+</div>
+
 
 
 <script>
@@ -105,6 +111,30 @@ const AC = window.AudioContext || window.webkitAudioContext;
 let audioCtx = null;
 let soundEnabled = true;
 let _audioUnlocked = false; // iOS dummy-unlock done flag — run at most once
+// True only when WE suspended the context because the game paused.
+// Keeps pause and the mute toggle independent: pause never touches
+// soundEnabled, and resume only un-suspends what pause itself suspended.
+let audioSuspendedByPause = false;
+
+// Pause silences any currently sounding oscillators/noise by suspending the
+// shared context (its currentTime freezes, so nothing keeps playing and
+// nothing is re-triggered on resume — short scheduled sfx simply expire).
+function suspendAudioForPause(){
+  if(audioCtx && audioCtx.state === 'running'){
+    audioCtx.suspend();
+    audioSuspendedByPause = true;
+  }
+}
+
+// Resume only if pause was the one that suspended, and only when sound is
+// enabled — a muted game stays silent until the user unmutes (getAudioCtx
+// resumes lazily on the next sfx in that case).
+function resumeAudioFromPause(){
+  if(audioSuspendedByPause){
+    audioSuspendedByPause = false;
+    if(soundEnabled && audioCtx && audioCtx.state !== 'running') audioCtx.resume();
+  }
+}
 
 function getAudioCtx(){
   if(!audioCtx) audioCtx = new AC();
@@ -135,15 +165,23 @@ function primeAudio(){
   if(audioCtx && audioCtx.state !== 'running') audioCtx.resume();
 }
 
-// Re-resume on tab return (iOS re-suspends context when tab goes to background)
+// Tab going to background pauses the game (world, score, barrel, audio all
+// freeze). Coming back does NOT auto-resume — the player resumes explicitly
+// with Esc / P / RESUME so the clock baseline is re-aligned under their control.
+// (iOS also re-suspends the AudioContext in background, hence the resume here
+// when the game is not paused.)
 document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState === 'visible' && audioCtx && audioCtx.state !== 'running'){
+  if(document.visibilityState === 'hidden'){
+    pauseGame();
+  } else if(document.visibilityState === 'visible' && gameState !== 'paused'
+            && audioCtx && audioCtx.state !== 'running'){
     audioCtx.resume();
   }
 });
 
 function playTone(opts){
   if(!soundEnabled) return;
+  if(gameState === 'paused') return; // world is frozen — no new sfx while paused
   try {
     const ac = getAudioCtx();
     const osc = ac.createOscillator();
@@ -165,6 +203,7 @@ function playTone(opts){
 
 function playNoise(duration, volume){
   if(!soundEnabled) return;
+  if(gameState === 'paused') return; // world is frozen — no new sfx while paused
   try {
     const ac = getAudioCtx();
     const bufferSize = Math.ceil(ac.sampleRate * duration);
@@ -200,6 +239,7 @@ function sfxLand(){
 function sfxSquash(){
   // Use AudioContext scheduling to avoid setTimeout breaking Safari gesture chain.
   if(!soundEnabled) return;
+  if(gameState === 'paused') return;
   try {
     const ac = getAudioCtx();
     [[440,180,0],[320,120,0.08]].forEach(([fs,fe,offset])=>{
@@ -272,8 +312,16 @@ function resize(){canvas.width=window.innerWidth;canvas.height=window.innerHeigh
 resize();
 window.addEventListener('resize', resize);
 
-let gameState = 'start';
-let startTime = 0, elapsed = 0;
+let gameState = 'start'; // 'start' | 'playing' | 'paused' | 'over'
+// Game clock: elapsed is ACCUMULATED from per-frame dt (never derived from
+// wall-clock deltas), so time in a backgrounded tab simply never counts.
+let elapsed = 0;
+// One update may never consume more than this many seconds — protects against
+// huge rAF gaps (e.g. the frame right after a background tab is re-shown).
+const MAX_DT = 0.25;
+// Frame timestamp of the previous loop iteration; null forces a re-aligned
+// (zero-dt) first frame after (re)starting or resuming.
+let lastFrameTime = null;
 let score = 0;
 let sessionHighScore = 0;
 let speedMult = 1;
@@ -318,7 +366,37 @@ function resetGame(){
   player.vy = 0; player.onGround = true; player.jumping=false;
   player.stuck = false; player.dead = false;
   jumpHoldTime = 0; jumpKeyDown = false;
-  startTime = performance.now();
+  clearPauseState();      // game over / restart always clears any paused state
+  lastFrameTime = null;   // re-align the clock baseline for the fresh run
+}
+
+// ── Pause / resume ───────────────────────────────────────────────────────────
+// Pause is a real game state: the loop keeps rendering but update() never
+// runs, so world, score, speed multiplier, obstacles and the barrel chase all
+// freeze exactly where they were. Audio is suspended alongside (see
+// suspendAudioForPause) and inputs are gated by gameState checks.
+function pauseGame(){
+  if(gameState !== 'playing') return;
+  gameState = 'paused';
+  jumpKeyDown = false; // don't let a held jump key stay "held" across the pause
+  document.getElementById('pauseScreen').style.display = 'flex';
+  suspendAudioForPause();
+}
+
+function resumeGame(){
+  if(gameState !== 'paused') return;
+  document.getElementById('pauseScreen').style.display = 'none';
+  gameState = 'playing';
+  lastFrameTime = null; // re-align clock baseline: next frame gets dt = 0,
+                        // so no background wall-clock time is ever back-filled
+  resumeAudioFromPause();
+}
+
+// Clears pause UI/audio without changing gameState — used by resetGame() and
+// endGame() so a new run (or the game-over screen) never inherits pause state.
+function clearPauseState(){
+  document.getElementById('pauseScreen').style.display = 'none';
+  resumeAudioFromPause();
 }
 
 let groundScroll = 0;
@@ -339,7 +417,9 @@ function spawnObstacle(){
 }
 
 function update(dt){
-  elapsed = (performance.now() - startTime)/1000;
+  // Advance the game clock by the frame's dt only — backgrounded time never
+  // arrives here because update() doesn't run while paused and dt is clamped.
+  elapsed += dt;
 
   const t = elapsed;
   if(t <= 300){
@@ -473,6 +553,7 @@ function update(dt){
 }
 
 function endGame(){
+  clearPauseState(); // never carry pause UI/audio state into the game-over screen
   gameState = 'over';
   sfxGameOver();
   document.getElementById('finalScore').textContent = 'Score: ' + String(Math.floor(score)).padStart(5,'0') + '  |  High Score: ' + String(Math.floor(sessionHighScore)).padStart(5,'0');
@@ -676,10 +757,18 @@ function drawHUD(){
   document.getElementById('highScoreTag').textContent = 'HIGH SCORE: ' + String(Math.floor(sessionHighScore)).padStart(5,'0');
 }
 
-function loop(){
+function loop(now){
   if(gameState==='playing'){
-    update(1/60);
+    // Real per-frame dt, clamped so a single update can never swallow a huge
+    // wall-clock gap (background tab, breakpoint, etc.). A null baseline
+    // (fresh start / just resumed) yields dt = 0 for the first frame.
+    let dt = 0;
+    if(lastFrameTime !== null){
+      dt = Math.min(MAX_DT, Math.max(0, (now - lastFrameTime)/1000));
+    }
+    update(dt);
   }
+  lastFrameTime = now;
   ctx.clearRect(0,0,canvas.width,canvas.height);
   ctx.save();
   ctx.scale(ZOOM, ZOOM);
@@ -690,7 +779,9 @@ function loop(){
   drawBarrel();
   drawPlayer();
   ctx.restore();
-  if(gameState==='playing') drawHUD();
+  // HUD stays visible (frozen) while paused so the player can read the
+  // exact score/speed they paused at — values only change inside update().
+  if(gameState==='playing' || gameState==='paused') drawHUD();
   requestAnimationFrame(loop);
 }
 
@@ -708,8 +799,10 @@ function startJump(){
   }
 }
 function endJump(){
-  if(gameState!=='playing') return;
-  if(jumpKeyDown){
+  // Only adjust velocity mid-flight; the key release itself must ALWAYS be
+  // recorded, even while paused — otherwise jumpKeyDown would stay stuck
+  // true if the player lets go of Space during a pause.
+  if(gameState==='playing' && jumpKeyDown){
     const holdRatio = Math.min(1, jumpHoldTime/MAX_HOLD_MS);
     const extra = (MAX_JUMP_V - MIN_JUMP_V)*holdRatio;
     if(player.vy < 0){
@@ -721,6 +814,10 @@ function endJump(){
 
 window.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault(); startJump(); }
+  if(e.code==='Escape' || e.code==='KeyP'){
+    if(gameState==='playing') pauseGame();
+    else if(gameState==='paused') resumeGame();
+  }
 });
 window.addEventListener('keyup', e=>{
   if(e.code==='Space'){ e.preventDefault(); endJump(); }
@@ -741,6 +838,31 @@ document.getElementById('restartBtn').addEventListener('click', ()=>{
   resetGame();
   gameState='playing';
 });
+document.getElementById('resumeBtn').addEventListener('click', ()=>{
+  primeAudio();
+  resumeGame();
+});
+
+// Test/debug hook — used by tests/pause_test.py to drive and inspect pause
+// scenarios from a real browser. Read-only snapshot plus the same
+// pause/resume/endGame entry points the UI uses.
+window.__spikeSprint = {
+  getState(){
+    return {
+      gameState, score, elapsed, speedMult, barrelCatchUp,
+      playerY: player.y, playerVy: player.vy, playerStuck: player.stuck,
+      highScore: sessionHighScore, soundEnabled,
+      audioState: audioCtx ? audioCtx.state : 'none',
+      audioSuspendedByPause
+    };
+  },
+  pause: pauseGame,
+  resume: resumeGame,
+  endGame,
+  debug: {
+    setStuck(v){ player.stuck = v; if(v) playerStuckTimer = 0; }
+  }
+};
 
 groundY = logicalH()*GROUND_Y_RATIO;
 player.y = groundY - player.h;

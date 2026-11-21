@@ -14,6 +14,13 @@
 
 ---
 
+### [2026-11-21] — Pausable game clock + pause-aware audio + browser tests
+- **What Changed**: `index.html` — added `paused` game state with overlay UI (Esc/P/visibilitychange trigger, explicit resume), replaced wall-clock `elapsed` with accumulated clamped `dt`, suspend/resume of the shared AudioContext on pause/resume (independent of the mute toggle), pause guards on all sfx entry points, `endJump` always releases `jumpKeyDown`, HUD stays visible-but-frozen while paused, `resetGame`/`endGame` clear pause state, added `window.__spikeSprint` test hook. Added `tests/pause_test.py` — Playwright test covering 4 chains: pause freeze (world/score/barrel/HUD/audio + blocked input), resume without frame jump, game-over/restart reset with high-score retention, and background-tab visibility pause without auto-resume.
+- **Why**: Switching tabs and returning caused a one-frame jump of score/speed/obstacles/barrel because elapsed time came from `performance.now()` deltas; audio had no unified pause behavior.
+- **Affected Areas**: `index.html`, `tests/pause_test.py` (new), `docs/ai/decision-log.md`, `docs/ai/testing-strategy.md`
+- **Related Commit**: This working tree (run-A branch)
+- **Risks / Follow-ups**: `tests/pause_test.py` simulates backgrounding by overriding `document.visibilityState` (headless tabs never truly hide); consider wiring it into CI alongside the existing smoke test.
+
 ### [2026-07-08 02:50 IST] — Full repo audit: fixed CI and documentation drift
 - **What Changed**: Replaced stub `.github/workflows/ci.yml` with a working Playwright smoke test; filled in TODO/TIMESTAMP placeholders in `.github/copilot-instructions.md` and `docs/ai/engineering-rules.md`; backfilled `docs/ai/decision-log.md` with 4 real decisions already referenced by `architecture.md`; backfilled `docs/ai/mistakes.md` with the CI failure and doc-drift findings; rewrote `docs/ai/testing-strategy.md` to describe the actual Playwright approach instead of a generic TODO stub.
 - **Why**: User requested a full audit for discrepancies/misrepresentations across the repo (title, docs, everything) and asked for all CI errors to be fixed. Found and corrected 5 distinct sync/drift issues.

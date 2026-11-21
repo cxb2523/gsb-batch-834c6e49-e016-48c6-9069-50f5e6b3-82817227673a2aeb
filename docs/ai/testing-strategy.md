@@ -11,6 +11,7 @@
 | Type            | Tool                | Location                  | When to run |
 |------------------|---------------------|----------------------------|-------------|
 | Smoke test       | Playwright (Python)  | `.github/workflows/ci.yml` (inline script) | Every push/PR (CI) |
+| Pause-system test | Playwright (Python) | `tests/pause_test.py`      | After any change to the game clock, pause state, audio, or input handling |
 | Manual gameplay  | Local browser        | N/A — open `index.html`    | Before every feature change, for visual/feel verification |
 
 ## Commands
@@ -23,7 +24,17 @@ import asyncio
 from playwright.async_api import async_playwright
 # see .github/workflows/ci.yml for the full smoke test script
 "
+
+# Pause-system chains (freeze / resume-no-jump / restart-reset / visibility):
+python tests/pause_test.py
 ```
+
+## What the Pause-System Test Verifies (`tests/pause_test.py`)
+- Pause (Esc/P) freezes score, game clock, speed multiplier, barrel chase, player physics and HUD; jump input and new sfx are blocked while paused; the AudioContext is suspended.
+- Resume does not back-fill wall-clock time spent paused (no frame jump); clock/score/audio resume at normal pace; the mute toggle stays independent of pause.
+- Game over and restart clear pause state and reset clock/score/speed/barrel to baseline while the high score survives.
+- A `visibilitychange` to hidden pauses the game; returning to the tab does NOT auto-resume (simulated by overriding `document.visibilityState`, since a headless tab never truly hides).
+- The game exposes `window.__spikeSprint` (state snapshot + pause/resume/endGame) as the test hook for these scenarios.
 
 ## What CI Verifies
 - The start screen renders without errors.

@@ -15,6 +15,14 @@
 
 ---
 
+### [2026-11-21] — Pausable accumulated game clock instead of wall-clock elapsed
+- **Context**: Game time was derived from `performance.now() - startTime`, so returning from a backgrounded tab made `elapsed` jump by the whole backgrounded duration — score, speed multiplier, obstacle positions and the barrel chase all desynced in one frame. Audio also had no unified pause entry point.
+- **Decision**: Introduce a real `paused` game state (Esc / P / visibilitychange-hidden trigger it; resume is explicit via Esc / P / RESUME button, never automatic). `elapsed` is now accumulated from per-frame `dt` inside `update()`, with `dt` taken from the rAF timestamp and clamped to `MAX_DT = 0.25s`; resume re-aligns the frame baseline (`lastFrameTime = null`) so no background time is back-filled. Pause suspends the shared `AudioContext` (tracked via `audioSuspendedByPause`) and resume only un-suspends when sound is enabled, keeping the mute toggle independent. `resetGame()`/`endGame()` clear pause state; high score survives restarts. A `window.__spikeSprint` test hook exposes state snapshots for browser tests.
+- **Rationale**: An accumulated clock can never observe background time, which removes the whole class of tab-switch desync bugs; suspending the AudioContext freezes live oscillators/noise without replaying missed sfx on resume.
+- **Alternatives Rejected**: Keeping wall-clock elapsed and clamping dt only (rejected — elapsed would still jump); auto-resume on tab visible (rejected — player isn't ready; explicit resume re-aligns the clock under user control); stopping individual audio nodes (rejected — suspending the single shared context is simpler and covers all sources).
+- **Consequences**: All time-based gameplay (score rate, speed multiplier, spawn cadence, barrel catch-up) is driven by the same accumulated clock; `endJump` must always clear `jumpKeyDown` even when not playing (keyup can arrive during pause). Verified by `tests/pause_test.py` (4 chains: freeze, resume-no-jump, restart-reset, visibility).
+- **Reversible**: Yes.
+
 ### [2026-07-08 20:32 IST] — Rename project from Pixel Runner to Spike Sprint
 - **Context**: User requested a more distinctive name and tagline for the game; "Spike Sprint" was selected from suggested name lists.
 - **Decision**: Renamed the game everywhere — GitHub repo (`pixel-runner-game` → `spike-sprint`), page `<title>`, README, CITATION.cff, docs/ai/*, and all cross-tool AI instruction files (CLAUDE.md, GEMINI.md, copilot-instructions.md). Added tagline "A poorly coded pixel runner" and redesigned the start screen with dedicated branded title/tagline styling, removing verbose gameplay instructions (kept only the jump control hint).
