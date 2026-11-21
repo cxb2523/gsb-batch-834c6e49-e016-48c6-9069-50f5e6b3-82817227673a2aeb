@@ -1,9 +1,11 @@
-import {mkdir,readFile,writeFile,rename,copyFile} from 'node:fs/promises';
+import {mkdir,readFile,writeFile,rename,copyFile,readdir,rmdir,unlink} from 'node:fs/promises';
 import {constants} from 'node:fs';import path from 'node:path';import {randomUUID} from 'node:crypto';
 import type {Series,CacheOverview,Progress,CacheLimits,CachePriority} from '../shared/types';import {MediaCache} from './media';import {validId} from './library';import {AppError} from './errors';
 
 interface Task {series:Series;paused:boolean;createdAt:number;priority:CachePriority}
 interface Settings {version:1;directory:string;closeToTray:boolean;tasks:Task[];concurrency:number;knownSeries:Series[];limits:CacheLimits}
+// 迁移日志：迁移开始前写入，设置提交成功后清除。应用中途退出时据此判断半迁移状态的归属。
+interface MigrationJournal {source:string;target:string;startedAt:number}
 const defaultLimits=():CacheLimits=>({maxGiB:20,bandwidthMiB:0});
 function cleanLimits(value:CacheLimits):CacheLimits{
  if(!value||!Number.isFinite(value.maxGiB)||value.maxGiB<0||value.maxGiB>10000||!Number.isFinite(value.bandwidthMiB)||value.bandwidthMiB<0||value.bandwidthMiB>1000)throw new AppError('INVALID_INPUT','缓存总额度须为 0–10000 GiB，总下载限速须为 0–1000 MiB/s；0 表示不限制');
@@ -39,8 +41,33 @@ export class CacheManager {
     catch{throw new AppError('CACHE_SETTINGS','缓存设置无法读取或备份，请检查应用数据目录权限')}
    }
   }
+  await this.recoverMigration();
   this.sync();
  }
+ private journalFile(){return path.join(this.profile,'cache-migration.json')}
+ // 恢复上次退出时未完成的迁移：设置未提交则原目录仍是权威目录，清理目标位置的临时文件；
+ // 设置已提交则迁移实际已成功，仅清除残留日志。两种结果都不会把半迁移状态当成成功。
+ private async recoverMigration(){
+  let raw:string;
+  try{raw=await readFile(this.journalFile(),'utf8')}catch{return}
+  let journal:MigrationJournal|undefined;
+  try{const parsed=JSON.parse(raw);if(parsed&&typeof parsed.source==='string'&&path.isAbsolute(parsed.source)&&typeof parsed.target==='string'&&path.isAbsolute(parsed.target))journal={source:path.resolve(parsed.source),target:path.resolve(parsed.target),startedAt:Number.isFinite(parsed.startedAt)?parsed.startedAt:0}}catch{}
+  if(journal&&path.basename(journal.target)==='HongguoManjuCache'&&journal.source===this.value.directory&&journal.target!==this.value.directory){
+   await this.cleanAbandonedTarget(journal.target);
+   this.message='上次缓存迁移未完成，已恢复为原缓存目录并清理目标位置的临时文件。';
+  }
+  await unlink(this.journalFile()).catch(()=>{});
+ }
+ private async cleanAbandonedTarget(target:string){
+  let names:string[]=[];
+  try{names=await readdir(target)}catch{return}
+  for(const name of names)if(/^[a-f0-9]{32}(?:\.partial)?\.(?:mp4|json)$/.test(name)||/^[a-f0-9]{32}\.(?:input|working)\.mp4$/.test(name))await unlink(path.join(target,name)).catch(()=>{});
+  await rmdir(target).catch(()=>{});
+ }
+ private async writeJournal(journal:MigrationJournal){
+  try{await writeFile(this.journalFile(),JSON.stringify(journal),'utf8')}catch{throw new AppError('CACHE_SETTINGS','无法记录迁移状态，已取消迁移；请检查应用数据目录权限')}
+ }
+ private async clearJournal(){await unlink(this.journalFile()).catch(()=>{})}
  get closeToTray(){return this.value.closeToTray}
  private sync(){this.media.setLimits({maxBytes:toBytes(this.value.limits.maxGiB,1024**3),bytesPerSecond:toBytes(this.value.limits.bandwidthMiB,1024**2)});this.media.setBackgroundGroups(this.value.tasks.map(task=>({id:task.series.id,ids:task.series.episodes.map(e=>e.id),paused:task.paused,priority:task.priority})));this.media.setConcurrency(this.value.concurrency)}
  private async save(value:Settings){const file=path.join(this.profile,'cache-settings.json');try{await writeFile(file+'.tmp',JSON.stringify(value),'utf8');await rename(file+'.tmp',file)}catch{throw new AppError('CACHE_SETTINGS','缓存任务保存失败，请检查磁盘空间及目录权限')}}
@@ -56,14 +83,17 @@ export class CacheManager {
  private watched(task:{series:Series},history:Map<string,Progress>){const last=task.series.episodes.at(-1),progress=history.get(task.series.id);return !!(last&&progress&&progress.episodeId===last.id&&progress.order===last.order&&progress.duration>0&&progress.time/progress.duration>=.95)}
  async action(id:string,action:'pause'|'resume'|'retry'|'remove'|'delete'){
   if(!validId(id)||!['pause','resume','retry','remove','delete'].includes(action))throw new AppError('INVALID_INPUT','缓存操作无效');
-  if(action==='delete')return this.deleteTask(id);
+  if(action==='delete'){
+   // 调用时检查：先到达的删除在迁移前完成，迁移开始后的删除得到明确拒绝而不是排队等待。
+   if(this.migrating)throw new AppError('CACHE_BUSY','缓存正在迁移，请等待完成再删除');
+   return this.deleteTask(id);
+  }
   const result=await this.mutate(draft=>{let task=draft.tasks.find(task=>task.series.id===id);if(!task&&action!=='remove'){const series=draft.knownSeries.find(item=>item.id===id);if(series){if(draft.tasks.length>=100)throw new AppError('CACHE_LIMIT','最多添加 100 部后台缓存作品，请先移除不需要的任务');task={series,paused:true,createdAt:Date.now(),priority:'normal'};draft.tasks.push(task)}}if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');if(action==='remove'){draft.knownSeries=[...draft.knownSeries.filter(series=>series.id!==id),task.series].slice(-100);draft.tasks=draft.tasks.filter(item=>item.series.id!==id)}else task.paused=action==='pause'});
   if(action==='retry'||action==='resume'){const task=this.value.tasks.find(task=>task.series.id===id);this.media.retryBuffer(task?.series.episodes.map(e=>e.id));return this.snapshot()}
   return result;
  }
  private deleteTask(id:string){
   const operation=this.pending.then(async()=>{
-   if(this.migrating)throw new AppError('CACHE_BUSY','缓存正在迁移，请等待完成再删除');
    const draft=structuredClone(this.value);let task=draft.tasks.find(item=>item.series.id===id);if(!task){const series=draft.knownSeries.find(item=>item.id===id);if(series)task={series,paused:true,createdAt:Date.now(),priority:'normal'}}if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');
    task.paused=true;await this.save(draft);this.value=draft;this.sync();
    // Persist the pause first. A failed unlink must never restart the download on relaunch.
@@ -83,11 +113,18 @@ export class CacheManager {
  async setPriority(id:string,priority:CachePriority){if(!validId(id)||!validPriority(priority))throw new AppError('INVALID_INPUT','缓存任务优先级无效');return this.mutate(draft=>{const task=draft.tasks.find(item=>item.series.id===id);if(!task)throw new AppError('CACHE_TASK','缓存任务不存在');task.priority=priority})}
  setCloseToTray(enabled:boolean){if(typeof enabled!=='boolean')throw new AppError('INVALID_INPUT','关闭窗口设置无效');return this.mutate(draft=>{draft.closeToTray=enabled})}
  migrate(destination:string){
-  if(this.migrating)return Promise.reject(new AppError('CACHE_BUSY','缓存正在迁移，请等待完成'));this.migrating=true;
+  if(this.migrating)return Promise.reject(new AppError('CACHE_BUSY','缓存正在迁移，请等待完成'));
+  const directory=path.resolve(destination);
+  if(path.basename(directory)!=='HongguoManjuCache')return Promise.reject(new AppError('CACHE_PATH','请选择应用专用缓存文件夹'));
+  this.migrating=true;
   const operation=this.pending.then(async()=>{
-   const draft={...this.value,directory:path.resolve(destination)};
-   if(path.basename(draft.directory)!=='HongguoManjuCache')throw new AppError('CACHE_PATH','请选择应用专用缓存文件夹');
-   await this.media.relocate(draft.directory,()=>this.save(draft));this.value=draft;this.message='缓存目录已切换。原目录文件已保留，可确认新目录播放正常后自行清理。';return this.snapshot();
+   const draft={...this.value,directory};
+   // 先写迁移日志再动文件：退出或失败后重启能据此区分"未提交"与"已提交"。
+   await this.writeJournal({source:this.media.location,target:directory,startedAt:Date.now()});
+   try{await this.media.relocate(directory,async()=>{await this.save(draft)})}
+   catch(error){await this.clearJournal();throw error}
+   this.value=draft;await this.clearJournal();
+   this.message='缓存目录已切换。原目录文件已保留，可确认新目录播放正常后自行清理。';return this.snapshot();
   }).finally(()=>{this.migrating=false});this.pending=operation.catch(()=>{});return operation;
  }
  async flush(){await this.pending}

@@ -53,7 +53,9 @@ export class MediaCache {
  private activeJobs=new Set<MediaJob>();
  private groups:BackgroundGroup[]=[];
  private groupCursor=0;
- private suspended=false;
+ private hold:'delete'|'migrate'|null=null;
+ private phase:'draining'|'copying'|'committing'|'rollback'|null=null;
+ private relocation:Promise<void>|undefined;
  private window:string[]=[];
  private protectedIds=new Set<string>();
  private pausedMessage='';
@@ -113,7 +115,8 @@ export class MediaCache {
  prepare(id:string,force=false):Promise<Playback>{
   if(!validId(id))return Promise.reject(new AppError('INVALID_INPUT','剧集编号无效'));
   if(this.closing)return Promise.reject(cancelled());
-  if(this.suspended)return Promise.reject(new AppError('CACHE_MOVING','正在迁移缓存，请稍后再播放'));
+  if(this.hold==='migrate')return Promise.reject(new AppError('CACHE_MOVING','正在迁移缓存，请稍后再播放'));
+  if(this.hold)return Promise.reject(new AppError('CACHE_BUSY','正在删除缓存，请稍后再播放'));
   const cached=this.cached(id);if(cached&&!force){cached.touched=Date.now();return Promise.resolve(this.result(cached))}
   const existing=this.jobs.get(id);
   if(existing&&!existing.controller.signal.aborted){if(force&&existing.everReady)this.cancel(existing);else{existing.foreground=true;if(existing.progressivePlayback)existing.resolve(existing.progressivePlayback);if(existing.progress?.stage==='waiting')this.prioritizeProcessing(existing.controller.signal);return existing.promise}}
@@ -178,9 +181,9 @@ export class MediaCache {
  }
  async deleteEpisodes(ids:string[]):Promise<{freedBytes:number}>{
   if(!Array.isArray(ids)||ids.length>5000||ids.some(id=>!validId(id))||new Set(ids).size!==ids.length)throw new AppError('INVALID_INPUT','删除缓存的分集列表无效');
-  if(this.suspended||this.closing)throw new AppError('CACHE_BUSY','缓存正在迁移或退出，请稍后再删除');
+  if(this.hold||this.closing)throw new AppError('CACHE_BUSY',this.hold==='migrate'?'缓存正在迁移，请等待完成再删除':'缓存正在退出，请稍后再删除');
   if(ids.some(id=>this.window.includes(id)))throw new AppError('CACHE_IN_USE','作品仍在播放页打开，请先返回缓存中心再删除');
-  this.suspended=true;let freedBytes=0,failed=false;
+  this.hold='delete';let freedBytes=0,failed=false;
   try{
    const selected=new Set(ids),pending=[...new Set([...this.jobs.values(),...this.activeJobs])].filter(job=>selected.has(job.id));
    for(const job of pending)this.cancel(job);await Promise.allSettled(pending.map(job=>job.completion??job.promise));
@@ -193,9 +196,10 @@ export class MediaCache {
    }
    if(failed)throw new AppError('CACHE_DELETE','部分缓存文件无法删除，任务已暂停；请关闭占用文件的程序或检查目录权限后重试删除');
    return {freedBytes};
-  }finally{this.suspended=false;this.pump()}
+  }finally{this.hold=null;this.pump()}
  }
  get location(){return this.directory}
+ get migrationPhase(){return this.phase}
  get usedBytes(){return [...this.entries.values()].reduce((sum,entry)=>sum+(entry.bytes||0),0)+[...this.partialBytes.values()].reduce((sum,bytes)=>sum+bytes,0)}
  private retainedBytes(id:string){let bytes=this.entries.get(id)?.bytes||0;if(this.partialBytes.size)for(const quality of ['auto','1080p','720p','540p','480p','360p'] as const)bytes+=this.partialBytes.get(this.partialName(id,quality)+'.mp4')||0;return bytes}
  // The quota covers projected retained files. Active source/working files are
@@ -204,33 +208,49 @@ export class MediaCache {
  private checkBudget(job:MediaJob){if(this.maxBytes&&this.projectedBytes()>this.maxBytes){job.capacityBytes=undefined;throw new AppError('CACHE_BUDGET','缓存额度不足，已暂停新任务；请清理缓存或提高缓存额度后重试')}}
  async freeBytes(){const info=await statfs(this.directory);return info.bavail*info.bsize}
  async relocate(destination:string,commit:()=>Promise<void>){
-  if(this.suspended||this.closing)throw new AppError('CACHE_BUSY','缓存正在迁移或退出，请稍后重试');
+  if(this.hold||this.closing)throw new AppError('CACHE_BUSY','缓存正在迁移或退出，请稍后重试');
   const source=path.resolve(this.directory),target=path.resolve(destination);
   if(source.toLowerCase()===target.toLowerCase())return;
   const nested=(a:string,b:string)=>{const relative=path.relative(a,b);return relative===''||(!relative.startsWith('..')&&!path.isAbsolute(relative))};
   if(nested(source,target)||nested(target,source))throw new AppError('CACHE_PATH','新旧缓存目录不能相互包含');
-  this.suspended=true;const copied:string[]=[];
+  this.hold='migrate';
+  const task=this.performRelocation(source,target,commit);
+  this.relocation=task;
+  try{await task}
+  finally{this.relocation=undefined;this.hold=null;this.phase=null;this.pump()}
+ }
+ // 迁移状态机：draining（取消并等待任务）→ copying（校验复制）→ committing（提交设置后切换目录）。
+ // 任何一步失败都进入 rollback：清理目标目录里已复制的临时文件，原目录保持可用。
+ private async performRelocation(source:string,target:string,commit:()=>Promise<void>){
+  const interrupted=()=>new AppError('CACHE_MOVE','缓存迁移已中止，原缓存及目录设置未更改，可重新发起迁移');
+  const copied:string[]=[];
+  this.phase='draining';
   try{
    const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);await Promise.allSettled(pending.map(job=>job.completion??job.promise));
+   if(this.closing)throw interrupted();
    await mkdir(target,{recursive:true});if((await readdir(target)).length)throw new AppError('CACHE_PATH','目标专用缓存文件夹不是空文件夹，请选择其他位置');
    const info=await statfs(target);if(info.bavail*info.bsize<this.usedBytes+SPACE_RESERVE+2*FILE_LIMIT*this.concurrency)throw new AppError('DISK_SPACE','目标磁盘空间不足，原缓存及目录设置未更改');
+   this.phase='copying';
    const hash=async(file:string)=>{const digest=createHash('sha256');for await(const chunk of createReadStream(file))digest.update(chunk);return digest.digest('hex')};
    for(const entry of this.entries.values())for(const suffix of ['.mp4','.json']){
-    if(this.closing)throw cancelled();const from=path.join(source,entry.key+suffix),to=path.join(target,entry.key+suffix);
+    if(this.closing)throw interrupted();const from=path.join(source,entry.key+suffix),to=path.join(target,entry.key+suffix);
     await copyFile(from,to,constants.COPYFILE_EXCL);copied.push(to);
     if(await hash(from)!==await hash(to))throw new AppError('CACHE_VERIFY','迁移文件校验失败，已保留原缓存');
    }
    for(const name of this.partialBytes.keys())for(const file of [name,name.replace('.mp4','.json')]){
-    if(this.closing)throw cancelled();const from=path.join(source,file),to=path.join(target,file);const exists=await stat(from).catch(()=>null);if(!exists)continue;
+    if(this.closing)throw interrupted();const from=path.join(source,file),to=path.join(target,file);const exists=await stat(from).catch(()=>null);if(!exists)continue;
     await copyFile(from,to,constants.COPYFILE_EXCL);copied.push(to);if(await hash(from)!==await hash(to))throw new AppError('CACHE_VERIFY','断点文件校验失败，继续使用原目录');
    }
-   if(this.closing)throw cancelled();await commit();this.directory=target;
+   this.phase='committing';
+   if(this.closing)throw interrupted();await commit();this.directory=target;
    for(const entry of this.entries.values())entry.file=path.join(target,entry.key+'.mp4');
-  }catch(error){for(const file of copied)await unlink(file).catch(()=>{});if(error instanceof AppError)throw error;throw new AppError('CACHE_MOVE','缓存迁移失败，原缓存及目录设置未更改，请检查目标目录权限和空间')}
-  finally{this.suspended=false;this.pump()}
+  }catch(error){
+   this.phase='rollback';for(const file of copied)await unlink(file).catch(()=>{});
+   if(error instanceof AppError)throw error;throw new AppError('CACHE_MOVE','缓存迁移失败，原缓存及目录设置未更改，请检查目标目录权限和空间');
+  }
  }
  private pump(){
-  if(this.closing||this.suspended)return;
+  if(this.closing||this.hold)return;
   while(this.activeJobs.size<this.concurrency){
   let job=[...this.jobs.values()].find(job=>job.foreground&&!job.controller.signal.aborted&&!this.activeJobs.has(job)&&![...this.activeJobs].some(other=>other.id===job.id));
   if(!job&&!this.pausedMessage){
@@ -359,5 +379,5 @@ export class MediaCache {
    }
   }
  }
- async close(){this.closing=true;this.window=[];const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);this.limiter.close();await Promise.allSettled(pending.map(job=>job.completion??job.promise))}
+ async close(){this.closing=true;this.window=[];const pending=[...new Set([...this.jobs.values(),...this.activeJobs])];for(const job of pending)this.cancel(job);this.limiter.close();await Promise.allSettled(pending.map(job=>job.completion??job.promise));await this.relocation?.catch(()=>{})}
 }
