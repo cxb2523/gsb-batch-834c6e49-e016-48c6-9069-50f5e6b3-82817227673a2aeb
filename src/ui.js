@@ -86,6 +86,45 @@ export class UI {
     el.classList.add('show');
   }
 
+  /** 立即清空连击弹幕（回合切换用，避免上一回合的连击数残留） */
+  clearCombo() {
+    for (const pid of ['p1', 'p2']) {
+      const el = $(`combo-${pid}`);
+      if (!el) continue;
+      el.textContent = '';
+      el.classList.remove('show');
+    }
+  }
+
+  /**
+   * 回合切换：HUD 数值直接对齐新一回合（不做上一回合残血的缓动/幽灵条衰减），
+   * 并清空连击弹幕。主机本地重置与客机收到新回合快照时都调用。
+   */
+  resetRound(f1, f2) {
+    this.clearCombo();
+    const snap = (p, f) => {
+      const ratio = Math.max(0, Math.min(1, f.hp / f.maxHp));
+      this.hpView[p].cur = ratio;
+      this.hpView[p].ghost = ratio;
+      this.meterView[p] = f.meter / 100;
+      this._last[`${p}fill`] = ratio;
+      this._last[`${p}ghost`] = ratio;
+      this._last[`${p}meter`] = this.meterView[p];
+      this.el[`${p}fill`].style.transform = `scaleX(${ratio})`;
+      this.el[`${p}ghost`].style.transform = `scaleX(${ratio})`;
+      this.el[`${p}meter`].style.transform = `scaleX(${this.meterView[p]})`;
+      const glowKey = p === 'p1' ? 'glow1' : 'glow2';
+      const glowOn = f.meter >= 100;
+      this._last[glowKey] = glowOn;
+      this.el[`${p}glow`].classList.toggle('hidden', !glowOn);
+      const pipKey = p === 'p1' ? 'pips1' : 'pips2';
+      this._last[pipKey] = f.roundsWon;
+      const children = this.el[`${p}pips`].children;
+      for (let i = 0; i < children.length; i++) children[i].classList.toggle('won', i < f.roundsWon);
+    };
+    snap('p1', f1); snap('p2', f2);
+  }
+
   // ---------- 中央公告 ----------
   announce(text, { dur = 1.1, size = null } = {}) {
     const el = $('announce-text');

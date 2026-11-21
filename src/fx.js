@@ -35,7 +35,8 @@ export class FX {
   flash(a = 0.5, color = '#fff') {
     this.flashEl.style.background = color;
     this.flashEl.style.opacity = a;
-    setTimeout(() => { this.flashEl.style.opacity = 0; }, 60);
+    clearTimeout(this._flashTimer);
+    this._flashTimer = setTimeout(() => { this.flashEl.style.opacity = 0; }, 60);
   }
 
   /** 打击火花 */
@@ -190,5 +191,29 @@ export class FX {
     for (const r of this.rings) { this.scene.remove(r.m); }
     for (const p of this.phantoms || []) { this.scene.remove(p.g); }
     this.particles = []; this.rings = []; this.phantoms = [];
+  }
+
+  /**
+   * 回合切换清理：立即移除仍在存活的粒子/冲击环/幻狼，不等自然衰减。
+   * 只清理与战斗表现相关的瞬时特效（尘土/火花/必杀环/幻狼），
+   * 舞台常驻对象不在此处，不受影响。
+   */
+  clearRoundFx() {
+    for (const p of this.particles) {
+      this.scene.remove(p.m);
+      if (p.spin !== undefined) p.m.geometry?.dispose?.();   // 羽毛为专属几何
+      p.m.material?.dispose?.();                              // 圆粒子共享几何，仅销毁材质
+    }
+    for (const r of this.rings) {
+      this.scene.remove(r.m);
+      if (r.m.material) r.m.material.dispose();
+    }
+    for (const p of this.phantoms || []) {
+      this.scene.remove(p.g);
+      p.g.traverse((o) => { o.geometry?.dispose?.(); o.material?.dispose?.(); });
+    }
+    this.particles = []; this.rings = []; this.phantoms = [];
+    this.flashEl.style.opacity = 0;
+    clearTimeout(this._flashTimer);
   }
 }

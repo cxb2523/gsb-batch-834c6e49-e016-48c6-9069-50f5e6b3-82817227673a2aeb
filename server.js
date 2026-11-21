@@ -12,6 +12,8 @@ import { WebSocketServer } from 'ws';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
+// 仅当显式开启（NET_TEST=1）时才接受 net-fault 模拟丢包指令，正常对局不会暴露该能力
+const NET_TEST = process.env.NET_TEST === '1';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -99,8 +101,17 @@ wss.on('connection', (ws) => {
       case 'input':  // 客户端 → 主机：输入状态
         if (room && ws === room.guest) send(room.host, { type: 'input', keys: msg.keys });
         break;
-      case 'state':  // 主机 → 客户端：权威状态快照
-        if (room && ws === room.host) send(room.guest, { type: 'state', ...msg.data });
+      case 'net-fault':  // 仅测试（NET_TEST=1）：主机可切换「丢弃主机→客机」的模拟丢包窗口
+        if (NET_TEST && room && ws === room.host) room.dropHostToGuest = !!msg.drop;
+        break;
+      case 'state':  // 主机 → 客户端：权威状态快照（字段扁平，原样转发）
+        if (room && ws === room.host && !room.dropHostToGuest) {
+          const { type: _t, ...rest } = msg;
+          send(room.guest, { type: 'state', ...rest });
+        }
+        break;
+      case 'ack':    // 客机 → 主机：快照确认（客机已应用该回合序号 rid）
+        if (room && ws === room.guest) send(room.host, { type: 'ack', rid: msg.rid, seq: msg.seq });
         break;
       case 'cmd':    // 双向命令（开始/重赛等）—— 透传全部字段
         if (room) {

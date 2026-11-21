@@ -145,6 +145,10 @@ src/audio.js     WebAudio 全合成音效（打击/格挡/KO锣声/必杀呼啸�
 | `&freeze=秒` | 推进到指定时刻定格 |
 | `&cycle=N` | 每 9 秒完整重建一局（资源释放压测） |
 | `&select=1&mode=ai&autopick=我,AI` | 自动化选人流程测试 |
+| `&lan=1&pick=N` | 联机自动匹配（首窗主机、次窗客机），并自动确认角色 |
+| `&auto=1` | 联机客机自动驾驶（配合 `&lan=1` 自动化联机对局） |
+
+**联机回合切换（启用 `NET_TEST=1` 时的服务端调试钩子）**：`node server.js` 前设置 `NET_TEST=1` 可让主机发送 `{type:'net-fault', drop:true/false}` 切换「主机→客机」模拟丢包窗口，用于验证客机在回合切换丢包后重连不会有回合号/血量回退。默认不开启，正常对局不暴露。
 
 </details>
 

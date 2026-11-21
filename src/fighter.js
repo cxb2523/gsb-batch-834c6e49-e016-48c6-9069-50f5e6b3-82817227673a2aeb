@@ -521,6 +521,49 @@ export class Fighter {
     this.onEvent('win', { who: this });
   }
 
+  /**
+   * 回合重置：清空上一回合的招式/受击/倒地残留，回到出生姿态。
+   * 主机本地重置与客机收到新回合快照时共用，保证两端状态迁移一致。
+   */
+  resetForRound({ x, facing, keepMeter = true } = {}) {
+    if (x !== undefined) this.x = x;
+    if (facing !== undefined) this.facing = facing;
+    this.y = 0; this.vx = 0; this.vy = 0;
+    this.hp = this.maxHp;
+    if (!keepMeter) this.meter = 0;
+    else this.meter = Math.min(this.meter, 100);   // 能量跨回合保留
+    this.state = 'idle'; this.stateT = 0;
+    this.comboCount = 0; this.comboDmg = 0; this.comboTick = 0;
+    this.move = null; this.moveClip = null; this.special = null;
+    this.hasHit = false; this.lastHitTick = -9;
+    this.armor = false; this.iframes = 0; this.dodgeCooldown = 0;
+    this.buffered = null;
+    this.flyRoll = 0;
+    this.renderX = null; this.renderY = null;   // 下一帧直接落到新位置，不做跨场插值
+    this._syncFacing();
+    this.model.resetPose();                      // 清空片段 + 姿态立即回中性（无混合残留）
+    if (this.model.body) this.model.body.rotation.set(0, 0, 0);
+    this._poseState = 'idle';
+    this.model.root.position.set(this.x, 0, 0);
+  }
+
+  /**
+   * 客机：检测到回合号变化时，硬清除上一回合的战斗表现残留
+   * （招式片段、必杀状态、受击/倒地姿态、身体旋转、连击计数）。
+   * 只清表现层与临时战斗态，数值由随后的 applySnapshot 覆盖。
+   */
+  clearRoundResiduals() {
+    this.move = null; this.moveClip = null; this.special = null;
+    this.hasHit = false; this.lastHitTick = -9; this.armor = false;
+    this.buffered = null; this.iframes = 0; this.dodgeCooldown = 0;
+    this.comboCount = 0; this.comboDmg = 0; this.comboTick = 0;
+    this.flyRoll = 0;
+    this.model.stopClip();
+    this.model.resetPose();
+    if (this.model.body) this.model.body.rotation.set(0, 0, 0);
+    this._poseState = null;      // 让随后的 _syncModel 依据快照状态重新落姿态
+  }
+
   /** 客机木偶：快照驱动，位置插值平滑 */
   puppetStep(dt) {
     if (this.renderX == null) { this.renderX = this.x; this.renderY = this.y; }
@@ -546,13 +589,20 @@ export class Fighter {
     };
   }
 
-  applySnapshot(s) {
-    if (this.renderX == null) { this.renderX = this.x; this.renderY = this.y; }
-    else { this.renderX = this.x; this.renderY = this.y; }   // 以当前值作为插值起点
+  applySnapshot(s, { roundChanged = false } = {}) {
+    if (roundChanged) {
+      // 回合切换：用快照位置直接落位（不做上一回合 KO 位置的插值滑行）
+      this.clearRoundResiduals();
+      this.renderX = s.x; this.renderY = s.y;
+    } else if (this.renderX == null) {
+      this.renderX = this.x; this.renderY = this.y;
+    } else {
+      this.renderX = this.x; this.renderY = this.y;   // 以当前值作为插值起点
+    }
     this.x = s.x; this.y = s.y; this.vx = s.vx; this.vy = s.vy;
     if (s.facing !== this.facing) { this.facing = s.facing; this._syncFacing(); }
     this.hp = s.hp; this.meter = s.meter;
-    const stateChanged = s.state !== this.state;
+    const stateChanged = roundChanged || s.state !== this.state;
     this.state = s.state; this.stateT = s.stateT; this.comboCount = s.combo;
     this.roundsWon = s.roundsWon;
     if (stateChanged) {

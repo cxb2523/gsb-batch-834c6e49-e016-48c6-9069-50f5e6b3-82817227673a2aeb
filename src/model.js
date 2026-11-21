@@ -574,6 +574,17 @@ export class FighterModel {
   /** 直接设置目标姿态（防御/胜利等保持型姿态） */
   setPose(pose) { this.clip = null; this.poseTarget = { ...this._neutralPose(), ...pose }; }
 
+  /** 立即回到中性姿态（回合切换时清除上一回合的动作/受击残留，不做插值过渡） */
+  resetPose() {
+    this.clip = null; this.clipTime = 0; this.clipRate = 1;
+    this.poseTarget = this._neutralPose();
+    this.poseCurrent = this._neutralPose();
+    for (const j in this.poseCurrent) {
+      const joint = this['j_' + j];
+      if (joint) { const v = this.poseCurrent[j]; joint.rotation.set(v[0], v[1], v[2]); }
+    }
+  }
+
   update(dt, ctx) {
     // ctx: { state, vx, vy, grounded, walkSpeed, specialKind, moveT }
     this.breathT += dt;

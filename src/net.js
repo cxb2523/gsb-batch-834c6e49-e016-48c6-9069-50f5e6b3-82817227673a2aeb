@@ -1,15 +1,22 @@
 /**
  * 局域网联机客户端 —— 主机权威架构
- * 主机：运行完整模拟，30Hz 广播状态快照；接收客机输入
- * 客机：本地输入 30Hz 上行；接收快照驱动木偶（插值平滑渲染）
+ * 主机：运行完整模拟，30Hz 广播状态快照；接收客机输入并回送确认
+ * 客机：本地输入 30Hz 上行；接收快照驱动木偶（插值平滑渲染），确认新回合
+ *
+ * 回合切换可靠性：
+ * - 主机每帧快照带单调递增的 seq，客机每收到一帧回 ack（带 seq / round）
+ * - 主机只有在「客机已确认该回合」后才允许越过回合边界推进模拟，
+ *   未确认前反复重发同一回合的最终快照；客机按 seq/round 单调性丢弃旧帧，
+ *   因此丢包或重传都不会让客机回退到上一回合。
  */
 export class NetSession {
   constructor(handlers) {
     this.ws = null;
     this.role = null;         // 'host' | 'guest'
-    this.handlers = handlers; // { onRole, onMatched, onPick, onReady, onStart, onCmd, onState, onInput, onClose }
+    this.handlers = handlers; // { onRole, onMatched, onPick, onReady, onStart, onCmd, onState, onInput, onAck, onClose }
     this._inputTimer = null;
     this._stateTimer = null;
+    this.stateTx = 0;         // 已发送的状态快照计数
   }
 
   connect() {
@@ -41,7 +48,9 @@ export class NetSession {
       case 'pick': h.onPick?.(msg.from, msg.char); break;
       case 'ready': h.onReady?.(msg.from, msg.char); break;
       case 'cmd': h.onStart?.(msg); break;
+      // 快照是扁平字段（host: {...snapshot, type:'state'}），服务器原样转发
       case 'state': if (this.role === 'guest') h.onState?.(msg); break;
+      case 'ack': if (this.role === 'host') h.onAck?.(msg); break;
       case 'input': if (this.role === 'host') h.onInput?.(msg.keys); break;
       case 'peer-left': h.onClose?.(true); break;
     }
@@ -74,6 +83,12 @@ export class NetSession {
       const data = this._getState();
       if (data) this.send({ type: 'state', ...data });
     }, 33);
+  }
+
+  /** 主机：立即下发一帧快照（绕过 33ms 定时器，用于回合重置的关键帧） */
+  sendStateNow(data) {
+    if (this.role !== 'host' || !data) return;
+    this.send({ type: 'state', ...data });
   }
 
   _stopTimer(key) { if (this[key]) { clearInterval(this[key]); this[key] = null; } }

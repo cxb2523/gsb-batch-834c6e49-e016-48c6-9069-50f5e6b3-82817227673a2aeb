@@ -18,6 +18,9 @@ import { FighterModel } from './model.js';
 
 const $ = (id) => document.getElementById(id);
 const BOOT_ID = Date.now().toString(36);   // 页面实例标识（截图命名用）
+// 主机等待客机确认新回合的最长时间（秒）：期间冻结回合推进并周期重发关键帧，
+// 超时后放行以避免对端失联导致对局锁死。
+const NET_ROUND_ACK_TIMEOUT = 2.5;
 
 class Game {
   constructor() {
@@ -75,6 +78,14 @@ class Game {
     this._netLatest = null;        // 客机最新快照
     this._pendingNetEvts = [];     // 主机待下发的事件
     this._isNet = false;
+    this._netSeq = 0;              // 主机快照单调序号（客机据此丢弃乱序/旧帧）
+    this._roundSerial = 0;         // 回合切换序号（重赛时 round 会归 1，但该值持续递增）
+    this._guestAck = { rid: -1, seq: -1 };   // 主机：客机已确认的最新回合/序号
+    this._roundAckPending = false; // 主机：新回合尚未被客机确认
+    this._roundAckT = 0;
+    this._netRid = -1;             // 客机：已应用的最新回合序号
+    this._netAppliedSeq = -1;      // 客机：已应用的最新快照序号
+    this._guestLiveAnnounced = false;   // 客机：本回合是否已播过「开打」公告
     this._justSnap = { p1: emptyInput(), p2: emptyInput() };   // 待消费按键事件（跨帧保留直到消费）
 
     this._bindMenus();
@@ -154,10 +165,15 @@ class Game {
     };
     $('btn-rematch').onclick = () => {
       this._click();
-      if (this._isNet) { this.net?.send({ type: 'cmd', cmd: 'rematch' }); return; }   // 双方都会收到回声并各自重开
-      this.ui.hide('screen-result');
-      this.score = [0, 0]; this.round = 1;
-      this.startMatch(this.picks[0], this.picks[1]);
+      if (this._isNet) {
+        // 联机：由主机发起重赛并广播，双方各自重开（服务器只转发给对端，本机需自己执行）
+        if (this.mode === 'net-host') {
+          this.net?.send({ type: 'cmd', cmd: 'rematch' });
+          this._restartMatch();
+        }
+        return;
+      }
+      this._restartMatch();
     };
     $('btn-to-menu').onclick = () => {
       this._click();
@@ -167,6 +183,13 @@ class Game {
   }
 
   _click() { SFX.select(); document.activeElement?.blur?.(); }
+
+  /** 重开一局（重赛）：本地/人机与联机主机、客机共用，保证 reset 顺序一致 */
+  _restartMatch() {
+    this.ui.hide('screen-result');
+    this.score = [0, 0]; this.round = 1;
+    this.startMatch(this.picks[0], this.picks[1]);
+  }
 
   /** 局域网联机面板 */
   openNetPanel() {
@@ -197,6 +220,11 @@ class Game {
           : '已找到房间，正在握手…';
       },
       onMatched: () => {
+        // 新会话开始：重置客机快照单调游标，避免沿用上一次配对/页面旧值
+        this._netRid = -1; this._netAppliedSeq = -1;
+        this._roundSerial = 0;
+        this._guestAck = { rid: -1, seq: -1 };
+        this._roundAckPending = false;
         $('net-panel').classList.add('hidden');
         this.mode = this.netRole === 'host' ? 'net-host' : 'net-guest';
         SFX.confirm();
@@ -238,14 +266,23 @@ class Game {
           this.picks = [msg.c1, msg.c2];
           this.startMatch(msg.c1, msg.c2);
         } else if (msg.cmd === 'rematch') {
-          this.ui.hide('screen-result');
-          this.score = [0, 0]; this.round = 1;
-          this.startMatch(this.picks[0], this.picks[1]);
+          this._restartMatch();
         } else if (msg.cmd === 'menu') {
           this.exitToTitle();
         }
       },
       onState: (snap) => this._applyNetState(snap),
+      onAck: (msg) => {
+        if (typeof msg.rid === 'number' && msg.rid > this._guestAck.rid) {
+          this._guestAck = { rid: msg.rid, seq: msg.seq ?? -1 };
+        } else if (msg.rid === this._guestAck.rid && (msg.seq ?? -1) > this._guestAck.seq) {
+          this._guestAck.seq = msg.seq;
+        }
+        // 新回合已确认：解除回合推进等待
+        if (this._roundAckPending && this._guestAck.rid >= this._roundSerial) {
+          this._roundAckPending = false;
+        }
+      },
       onInput: (keys) => { this.remoteInput = keys || {}; },
       onClose: (peerLeft) => {
         const wasInGame = this.phase !== 'title';
@@ -482,6 +519,14 @@ class Game {
     this.aiP1 = null;
     this.showcase = null;
     this.remoteInput = {}; this._prevRemote = {};
+    // _roundSerial 跨对局单调递增（不清零、不复用），重赛回 round 1 时客机才不会
+    // 把新对局首帧误判成旧回合。客机的 _netRid/_netAppliedSeq 也刻意不在这里清零：
+    // 同一会话内重赛时它们继续单调，能挡掉重赛后才迟到的上一局快照；
+    // 新会话（重新配对）在 onMatched 里才重置。
+    this._netSeq = 0;
+    this._guestAck = { rid: -1, seq: -1 };
+    this._roundAckPending = false; this._roundAckT = 0;
+    this._guestLiveAnnounced = false;
 
     // 联机数据通道
     if (this.net) {
@@ -513,27 +558,61 @@ class Game {
     });
   }
 
+  /**
+   * 回合重置。顺序严格为：
+   *   1) 本机斗士数值/姿态/特效全部重置（主机权威结果先落地）
+   *   2) 本地 HUD 立即对齐新回合（不等缓动）
+   *   3) 递增回合序号，并挂起「等待客机确认」
+   *   4) 立即下发该回合的关键帧快照（不等 33ms 定时器，避免客机先看到旧帧）
+   * 第 4 步之后客机才会收到新回合号；主机在收到确认前不会越过本回合边界，
+   * 期间定时器重发的也只是同一回合的快照，客机因此不可能回退到旧回合。
+   */
   _beginRound() {
     const [f1, f2] = this.fighters;
-    for (const f of this.fighters) {
-      f.hp = f.maxHp;
-      f.x = f.isP1 ? -3.2 : 3.2;
-      f.y = 0; f.vx = 0; f.vy = 0;
-      f.facing = f.isP1 ? 1 : -1;
-      f._syncFacing();
-      f.state = 'idle'; f.stateT = 0;
-      f.comboCount = 0;
-      f.meter = Math.min(f.meter, 100);   // 能量跨回合保留
-      f.renderX = null;
+    if (this._isNet) {
+      // 联机：主机/客机都用同一套完整重置（姿态与特效硬清，避免跨回合残留）
+      for (const f of this.fighters) {
+        f.resetForRound({ x: f.isP1 ? -3.2 : 3.2, facing: f.isP1 ? 1 : -1, keepMeter: true });
+      }
+      this.fx.clearRoundFx();
+      this.ui.resetRound(f1, f2);
+    } else {
+      // 本地双人 / 人机：保持原有行为（数值重置 + 姿态由状态机自然过渡）
+      for (const f of this.fighters) {
+        f.hp = f.maxHp;
+        f.x = f.isP1 ? -3.2 : 3.2;
+        f.y = 0; f.vx = 0; f.vy = 0;
+        f.facing = f.isP1 ? 1 : -1;
+        f._syncFacing();
+        f.state = 'idle'; f.stateT = 0;
+        f.comboCount = 0;
+        f.meter = Math.min(f.meter, 100);   // 能量跨回合保留
+        f.renderX = null;
+      }
     }
     this.timer = GAME.roundTime;
     this.subPhase = 'intro'; this.subT = 0;
     this.world.timeScale = 1;
     this.world.hitstop = 0;
+    this._fightAnnounced = false;
     this.ui.setTimer(this.timer);
-    this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
-    SFX.roundBell();
-    if (this._isNet) this.netEvt({ k: 'round', n: this.round });   // 转发给客机
+    // 客机的回合公告/计时以主机快照为准（首次快照的 roundChanged 会本地公告），避免重复
+    if (!(this._isNet && this.mode === 'net-guest')) {
+      this.ui.announce(`ROUND ${this.round}`, { dur: 1.0 });
+      SFX.roundBell();
+    }
+
+    if (this._isNet && this.mode === 'net-host') {
+      // 清除上一回合尚未下发的事件（KO/胜负已经属于上一回合）。
+      // 回合公告不走事件流：客机在快照里检测到 rid 变化时本地触发，保证丢包也不会漏。
+      this._pendingNetEvts = [];
+      this._roundSerial++;
+      this._roundAckPending = true;   // 客机确认前不进入本回合的实战阶段
+      this._roundAckT = 0;
+      this._roundAckResendT = 0;
+      // 关键帧：立即带新回合号下发（快照含 rid / seq / 重置后的完整状态）
+      this.net?.sendStateNow(this._netSnap());
+    }
   }
 
   _onFighterEvent(type, data) {
@@ -611,6 +690,24 @@ class Game {
     if (!f1) return;
     if (this.mode === 'net-guest') { this._tickFightGuest(dt); return; }
 
+    // 联机回合切换闸门：客机确认新回合前，主机不推进模拟（subT/world/计时全冻结），
+    // 只按固定间隔重发同一回合的关键帧（客机端按 rid/seq 幂等应用，不会回退）。
+    if (this._isNet && this._roundAckPending) {
+      this._roundAckT += dt;
+      this._roundAckResendT = (this._roundAckResendT || 0) + dt;
+      if (this._roundAckResendT >= 0.12) {
+        this._roundAckResendT = 0;
+        this.net?.sendStateNow(this._netSnap());
+      }
+      if (this._roundAckT >= NET_ROUND_ACK_TIMEOUT) {
+        this._roundAckPending = false;   // 客机迟迟未确认（可能掉线）：放行，避免锁死对局
+      } else {
+        this.fcam.update(dt, f1, f2, {});
+        this.ui.updateHud(f1, f2, dt);
+        return;
+      }
+    }
+
     this.subT += dt;
 
     // ---- 输入收集 ----
@@ -681,7 +778,7 @@ class Game {
         this._fightAnnounced = true;
         this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
         SFX.roundBell();
-        if (this._isNet) this.netEvt({ k: 'fight' });
+        // 客机从快照的 intro→live 迁移本地触发开打公告，无需事件流
       }
       if (this.subT >= 1.7) { this.subPhase = 'live'; this.subT = 0; this._fightAnnounced = false; }
     } else if (this.subPhase === 'live') {
@@ -795,7 +892,9 @@ class Game {
   _netSnap() {
     if (!this.fighters.length) return null;
     const [a, b] = this.fighters;
+    this._netSeq++;
     return {
+      seq: this._netSeq, rid: this._roundSerial,
       phase: this.phase, sub: this.subPhase,
       t: +this.timer.toFixed(2), round: this.round,
       score: [...this.score],
@@ -806,12 +905,51 @@ class Game {
 
   netEvt(o) { if (this._isNet) this._pendingNetEvts.push(o); }
 
-  /** 客机：应用主机快照 */
+  /**
+   * 客机：应用主机快照。
+   * 单调性保护：
+   * - rid（回合序号）小于已应用值的快照一律丢弃 —— 丢包重传的旧回合帧不会让客机回退；
+   * - 同一回合内 seq 小于已应用值的乱序帧丢弃（重连后老快照同样被挡）。
+   * 回合号变化时先硬清上一回合的招式动画 / 姿态 / 特效 / 连击显示，再应用新数值。
+   */
   _applyNetState(snap) {
     if (!this.fighters.length || !snap || !snap.f) return;
+    const rid = typeof snap.rid === 'number' ? snap.rid : 0;
+    const seq = typeof snap.seq === 'number' ? snap.seq : 0;
+    if (rid < this._netRid) return;                       // 旧回合：丢弃
+    if (rid === this._netRid && seq <= this._netAppliedSeq) return;   // 同回合旧帧：丢弃
+    const roundChanged = rid > this._netRid;
+    this._netRid = rid;
+    this._netAppliedSeq = seq;
     this._netLatest = snap;
-    for (let i = 0; i < 2; i++) this.fighters[i].applySnapshot(snap.f[i]);
+
+    if (roundChanged) {
+      // 清上一回合的瞬时特效与连击弹幕；角色招式/姿态由 applySnapshot(roundChanged) 清除
+      this.fx.clearRoundFx();
+      this.ui.clearCombo();
+    }
+    // 2) 应用权威数值/状态（回合切换时 applySnapshot 会按快照位置直接落位）
+    for (let i = 0; i < 2; i++) this.fighters[i].applySnapshot(snap.f[i], { roundChanged });
     this.timer = snap.t; this.round = snap.round; this.score = snap.score;
+    const prevSub = this.subPhase;
+    if (roundChanged) {
+      this.subPhase = snap.sub || 'intro';
+      this.ui.resetRound(this.fighters[0], this.fighters[1]);
+      this.ui.setTimer(this.timer);
+      // 回合公告由本地在检测到回合号变化时触发，不依赖可能丢包的事件流
+      this.ui.announce(`ROUND ${snap.round}`, { dur: 1.0 });
+      SFX.roundBell();
+    } else if (snap.sub === 'live' && prevSub !== 'live' && !this._guestLiveAnnounced) {
+      // 开打公告同样以状态迁移为准（intro→live），事件流丢包也不受影响
+      this._guestLiveAnnounced = true;
+      this.subPhase = 'live';
+      this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
+    } else if (snap.sub && snap.sub !== this.subPhase) {
+      this.subPhase = snap.sub;
+    }
+    if (roundChanged) this._guestLiveAnnounced = false;
+    // 3) 回确认：主机据此放行下一回合推进，避免在未确认时重发旧回合状态
+    this.net?.send({ type: 'ack', rid, seq });
     if (snap.evts?.length) this._playNetEvts(snap.evts);
     if (snap.phase === 'result' && this.phase === 'fight') {
       this.phase = 'result';
@@ -847,11 +985,10 @@ class Game {
           this.ui.announce('K.O.', { dur: 1.6, size: 'clamp(90px,17vw,240px)' });
           break;
         case 'round':
-          this.ui.announce(`ROUND ${ev.n}`, { dur: 1.0 });
-          SFX.roundBell();
+          // 回合公告已由 _applyNetState 在检测到回合号变化时本地触发，这里不重复播
           break;
         case 'fight':
-          this.ui.announce('开打！', { dur: 0.8, size: 'clamp(64px,11vw,150px)' });
+          // 开打公告已由 _applyNetState 的 intro→live 状态迁移本地触发，避免重复
           break;
         case 'winner':
           this.ui.announce(`${ev.label} ${ev.name} 胜`, { dur: 1.4, size: 'clamp(36px,6vw,72px)' });
