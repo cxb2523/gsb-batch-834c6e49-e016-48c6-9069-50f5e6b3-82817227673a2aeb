@@ -53,11 +53,22 @@ nothing to `?online`/the server path):
 - `&stocks=<n>` — with `&mode=stocks`, overrides the starting life count
   (production default: 2, see `docs/MATCH_MODES.md` for why). Ignored
   without `&mode=stocks`.
+- `&seat=<n>` — with `?crowd20=1`, controls exactly one fighter slot `n`
+  instead of slots 0 and 1, so that slot can be eliminated while the rest
+  of the field plays on. This is the local repro path for the
+  elimination → spectate handover; see
+  `docs/SPECTATE_LIFECYCLE.md` for what to check.
 
 Example for a reproducible crowd match on a specific stage:
 
 ```
 http://localhost:5173/?crowd20=1&seed=42&arena=the-atoll
+```
+
+Example for a reproducible elimination/spectate check (slot 7 is yours):
+
+```
+http://localhost:5173/?crowd20=1&seed=1234&arena=the-atoll&seat=7
 ```
 
 ## What was actually broken

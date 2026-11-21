@@ -22,12 +22,15 @@ test('hello includes a profile built from buildClientProfile', () => {
 test('tick() records input activity from the same local frame used by the sim, not a second poll', () => {
   const tickIdx = src.indexOf('private tick(');
   assert.ok(tickIdx >= 0);
-  const tickBody = src.slice(tickIdx, tickIdx + 2000);
-  assert.match(tickBody, /const local = this\.input\.poll\(\)/);
+  const tickBody = src.slice(tickIdx, tickIdx + 2400);
+  // The frame is sampled once per tick through pollSlots (pollSlots(0)
+  // when the spectate lifecycle says this seat may not act -- see
+  // spectator/session.ts), and the telemetry reads THAT frame.
+  assert.match(tickBody, /const polled = this\.input\.pollSlots\(/);
   assert.match(tickBody, /this\.inputActivity\.recordTick\(/);
-  // Only one poll() call in this stretch -- telemetry must read the
-  // already-computed local frame, never poll a second time.
-  assert.equal((tickBody.match(/this\.input\.poll\(/g) ?? []).length, 1);
+  // Only one pollSlots()/poll() call in this stretch -- telemetry must
+  // read the already-computed local frame, never poll a second time.
+  assert.equal((tickBody.match(/this\.input\.poll(Slots)?\(/g) ?? []).length, 1);
 });
 
 test('render() feeds the FrameTimeTracker and never gates on it', () => {

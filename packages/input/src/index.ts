@@ -139,9 +139,33 @@ export class InputManager {
    * frame; the app layer samples the latest returned pair on each fixed
    * 60Hz sim tick (poll-and-hold, not per-tick re-polling of the DOM). */
   poll(): InputFrame[] {
-    const frames = this.slots.map((_, i) => this.pollSlot(i));
+    return this.pollSlots(this.slots.length);
+  }
+
+  /** Sample at most `slotCount` slots (starting at 0) and mark the poll as
+   * consumed, so tap-shorter-than-a-tick presses stay visible to exactly
+   * this sample. For a match where the local seat is frozen (eliminated,
+   * spectating) the caller passes 0: input collection stops at the source
+   * rather than being sampled and then thrown away, which is what the
+   * spectate lifecycle requires (see spectator/session.ts). Either way the
+   * keyboard's per-poll edge set is cleared, so a key tapped while frozen
+   * can never leak into the first tick after a later transition. */
+  pollSlots(slotCount: number): InputFrame[] {
+    const count = Math.max(0, Math.min(this.slots.length, slotCount));
+    const frames: InputFrame[] = [];
+    for (let i = 0; i < count; i++) frames.push(this.pollSlot(i));
     this.keyboard.endPoll();
     return frames;
+  }
+
+  /** Forget every currently-held key and queued tap. Used when a seat is
+   * frozen or a match generation ends: without this, a direction held down
+   * at the moment of elimination would still read as held on any later
+   * poll (e.g. after reconnecting into a new seat) with no new keystroke
+   * to explain it. */
+  releaseAll(): void {
+    this.keyboard.reset();
+    for (const source of this.touch.values()) source.reset();
   }
 
   /** Register (or clear, passing null) the touch source that should be

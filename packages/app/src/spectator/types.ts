@@ -26,8 +26,17 @@ export interface MatchAdapter {
   update(): void;
   status(index: number): FighterMatchStatus;
   survivorIndices(): number[];
+  /** Survivors as of `tick`, for replayed/recorded matches. Live adapters
+   * omit this (their survival set only ever moves forward); a replay
+   * adapter must implement it so the spectator can cycle to whoever was
+   * alive at the tick being shown instead of the recording's final
+   * roster — see docs/SPECTATE_LIFECYCLE.md. */
+  survivorIndicesAt?(tick: number): number[];
   /** Null when the arena isn't shrinking (not implemented by the current
    * sim yet) — callers fall back to the renderer's static stage bounds. */
   liveArenaBounds(): LiveArenaBounds | null;
+  /** Live blast bounds as of `tick` (replay adapters only, same rationale
+   * as survivorIndicesAt). */
+  liveArenaBoundsAt?(tick: number): LiveArenaBounds | null;
   isMatchOver(): boolean;
 }

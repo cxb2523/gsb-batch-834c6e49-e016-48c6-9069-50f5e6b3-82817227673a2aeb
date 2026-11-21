@@ -4,6 +4,7 @@
 // answer rather than a hidden dev page.
 import { REPLAY_FIXTURES } from '../replay/fixtures.ts';
 import { ReplayViewer } from '../replay/replay-viewer.ts';
+import { shouldIgnoreKeydown } from '@bash-fighter/input';
 
 export class ReplayScreen {
   readonly root: HTMLDivElement;
@@ -15,6 +16,7 @@ export class ReplayScreen {
   private readonly playBtn: HTMLButtonElement;
   private viewer: ReplayViewer | null = null;
   private rafHandle = 0;
+  private readonly keyHandler: (e: KeyboardEvent) => void;
 
   constructor(
     parent: HTMLElement,
@@ -57,6 +59,25 @@ export class ReplayScreen {
 
     this.playBtn.addEventListener('click', () => this.viewer?.togglePlay());
     this.scrubEl.addEventListener('input', () => this.viewer?.seekTo(Number(this.scrubEl.value)));
+    // Spectator controls, the same keys as a live spectate (Tab cycle / O
+    // overview). Registered exactly once, here, and inert whenever no
+    // replay is loaded -- the screen itself lives for the app's lifetime,
+    // so there is no attach/detach cycle to get wrong. The viewer's own
+    // SpectatorController owns its target/buffer state and is fully
+    // released by ReplayViewer.destroy(), so loading a second replay can
+    // never leave a stale camera or a stacked listener behind.
+    this.keyHandler = (e: KeyboardEvent): void => {
+      if (!this.viewer) return;
+      if (shouldIgnoreKeydown(e.target, e.code)) return;
+      if (e.code === 'Tab') {
+        e.preventDefault();
+        this.viewer.cycleFollow();
+      } else if (e.code === 'KeyO') {
+        e.preventDefault();
+        this.viewer.toggleOverview();
+      }
+    };
+    window.addEventListener('keydown', this.keyHandler);
     (this.root.querySelector('#replay-back-btn') as HTMLButtonElement).addEventListener('click', () => {
       this.stopViewer();
       this.hide();
@@ -108,12 +129,14 @@ export class ReplayScreen {
     this.pickerEl.classList.remove('hidden');
   }
 
+
   show(): void {
     this.root.classList.remove('hidden');
   }
 
   hide(): void {
     this.stopViewer();
+    window.removeEventListener('keydown', this.keyHandler);
     this.root.classList.add('hidden');
   }
 }

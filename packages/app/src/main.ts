@@ -9,6 +9,7 @@ import { type MatchSettings } from '@bash-fighter/sim';
 import { Hud } from './ui/hud.ts';
 import { SpectatorBanner } from './ui/spectator-banner.ts';
 import { SimMatchAdapter } from './spectator/sim-adapter.ts';
+import { SnapshotMatchAdapter } from './spectator/net-adapter.ts';
 import { SpectatorController } from './spectator/controller.ts';
 import { NetMatch, clearStoredResumeToken, type ConnectionState } from './net-match.ts';
 import { getMatchesPlayed } from './matches-played.ts';
@@ -48,6 +49,7 @@ import {
   setDevMinFighterPx,
   PALETTE,
   type ArenaBounds,
+  type RenderFrame,
   setLocalReadoutBottomInset,
 } from '@bash-fighter/render';
 import { AudioManager } from '@bash-fighter/audio';
@@ -86,6 +88,22 @@ let adapter: SimMatchAdapter | null = null;
 let spectator: SpectatorController | null = null;
 let matchGeneration = 0;
 let lastFrameTimeMs: number | null = null;
+// True for the rest of an online match once this client's own seat has
+// been eliminated (set by onEliminated below). Drives the spectator
+// camera's activation in the frame transform -- activation itself stays
+// idempotent per generation in SpectatorController.
+let onlineSpectating = false;
+
+/** Hand the spectator camera back: remove its keyboard registration and
+ * drop its target/buffer state. Called from every match teardown path, so
+ * leaving spectating (or reconnecting, or rematching) can never leave a
+ * second registration behind to fight the next match's camera. Idempotent.
+ */
+function releaseSpectator(): void {
+  spectator?.release();
+  spectator = null;
+  adapter = null;
+}
 // Tracks which mode the most recently finished match was so the shared
 // win screen's "Rematch" button starts another match of the *same* kind
 // instead of always dropping back into the local two-player harness --
@@ -726,6 +744,7 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
   requestedSpectate = spectate;
   currentJoinCode = null;
   eliminatedThisOnlineMatch = false;
+  onlineSpectating = false;
   lastEliminationContent = null;
   clearSpectateStallTimer();
   spectateChip.hide();
@@ -744,6 +763,8 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
       inMatchFeedbackButton.classList.add('hidden');
   touchControls.hide();
   const generation = ++matchGeneration;
+  lastFrameTimeMs = null;
+  releaseSpectator();
 
   if (match) {
     match.stop();
@@ -764,7 +785,7 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
   // slot label for an empty name rather than forcing a placeholder.
   const name = startScreen.playerName;
   const characterId = startScreen.selectedCharacterId;
-  const net = new NetMatch(serverUrl(), {
+  const net: NetMatch = new NetMatch(serverUrl(), {
     onStateChange: (state, detail) => {
       setNetStatus(state, state === 'spectating' ? spectateFallbackNotice ?? detail : detail);
       if (state !== 'waiting') netModeLine.classList.add('hidden');
@@ -941,6 +962,7 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
     onEliminated: (placement, totalFighters) => {
       matchIntro.hide();
       eliminatedThisOnlineMatch = true;
+      onlineSpectating = true;
       touchControls.hide();
       lastEliminationContent = {
         title: `You finished ${placement} of ${totalFighters}`,
@@ -992,8 +1014,78 @@ async function beginOnlineMatch(requeued = false, joinCode?: string, spectate = 
     onContextLost: onRendererContextLost,
     onContextRestored: onRendererContextRestored,
     onRenderStalled: onRendererRenderStalled,
+    // Spectate-on-death for online play. NetMatch has already frozen the
+    // eliminated seat and dropped its unacked input at the 'eliminated'
+    // control message (see net-match.ts), so by the time a frame gets
+    // here the only input question left is camera policy. A reconnect
+    // produces a new NetMatch generation (startMatch() calls
+    // session.startGeneration), and this reacts to that by rebuilding the
+    // controller's target/camera state rather than following the old
+    // match's target into the new one.
+    transformFrame: (frame): RenderFrame => {
+      const currentSpectator = spectator;
+      if (!currentSpectator) return frame;
+      const generation = net.sessionGeneration();
+      // A reconnect rebuilds the online session as a new generation (see
+      // net-match.ts's startMatch). Rebuild the camera's target state too,
+      // rather than carrying a follow target from the match/seat that was
+      // replaced; the camera snaps instead of gliding in from it.
+      if (currentSpectator.currentGeneration !== generation) {
+        currentSpectator.beginGeneration(generation);
+      }
+      // The seat is only known once 'welcome'/'matchStart' arrive, and it
+      // changes to -1 when this client stops holding one (eliminated, or
+      // arrived via ?watch=CODE as a pure spectator). Both cases get the
+      // spectator camera -- there is no local fighter to frame either way.
+      const mySlot = net.localSlot();
+      currentSpectator.setLocalSlot(mySlot);
+      const watching = onlineSpectating || (mySlot < 0 && net.hasStarted());
+      if (watching && !currentSpectator.isActive) currentSpectator.activate(generation);
+      if (!currentSpectator.isActive) return frame;
+
+      const now = performance.now();
+      const dtSeconds = lastFrameTimeMs === null ? 1 / 60 : Math.min(0.1, (now - lastFrameTimeMs) / 1000);
+      lastFrameTimeMs = now;
+
+      const { width, height } = net.renderer.viewSize;
+      const arena = net.spectatorArenaBounds() ?? STATIC_ARENA;
+      const cameraOverride = currentSpectator.update({
+        positions: frame.fighters.map((f) => ({ x: f.x, y: f.y })),
+        viewWidth: width,
+        viewHeight: height,
+        arena,
+        dtSeconds,
+      });
+      // No localPlayerIndex while spectating: a seat that is no longer
+      // played must not keep the "this is you" pointer or the hit-shake
+      // attention weight attached to a dead fighter.
+      return { ...frame, liveArenaBounds: arena, cameraOverride, localPlayerIndex: undefined };
+    },
   }, audio, isQaSession(), requestedArenaId(), requeued, requestedJoinCode, requestedSpectate, autoContinued);
   netMatch = net;
+  // Online spectating uses the snapshot-backed adapter (authoritative
+  // elimination state, no predicted-local override), so the camera's
+  // follow list can never include a seat this client merely predicts is
+  // alive. Built after `net` so both closures bind to this instance.
+  spectator = new SpectatorController(
+    new SnapshotMatchAdapter({
+      roster: () => net.spectatorRoster(),
+      isOver: () => net.isOver(),
+      liveArenaBounds: () => net.spectatorArenaBounds(),
+    }),
+    net.localSlot(),
+    {
+      centerX: (STATIC_ARENA.minX + STATIC_ARENA.maxX) / 2,
+      centerY: (STATIC_ARENA.minY + STATIC_ARENA.maxY) / 2,
+      scale: 3,
+    },
+  );
+  spectator.beginGeneration(net.sessionGeneration(), {
+    centerX: (STATIC_ARENA.minX + STATIC_ARENA.maxX) / 2,
+    centerY: (STATIC_ARENA.minY + STATIC_ARENA.maxY) / 2,
+    scale: 3,
+  });
+  spectator.attachKeys(window, { shouldIgnore: (event) => isTypingKeystroke(event as unknown as KeyboardEvent) });
   net.input.setBinding(0, currentBindings.p1);
   net.input.setBinding(1, currentBindings.p2);
   if (!(await initWithTimeout(net.init(canvasRoot), 'online match'))) return;
@@ -1120,6 +1212,10 @@ async function beginMatch(): Promise<void> {
   controlsHint.maybeShow(touchCapable);
   const generation = ++matchGeneration;
   lastFrameTimeMs = null;
+  // A rematch is a new match generation, not a continuation of the last
+  // one: release the previous spectator (dropping its key listener and
+  // buffered state) before anything else can attach a new one.
+  releaseSpectator();
 
   if (match) {
     match.stop();
@@ -1154,7 +1250,24 @@ async function beginMatch(): Promise<void> {
     : Date.now() & 0xffffffff;
   const __DEBUG_ARENA_PARAM = __DEBUG_PARAMS.get('arena');
   const localArenaOverride = isKnownArenaId(__DEBUG_ARENA_PARAM) ? __DEBUG_ARENA_PARAM : null;
+  // ?crowd20=1&seat=<n> narrows the local harness to ONE controlled seat
+  // (default: both, unchanged) so the player's own fighter can be
+  // eliminated while a full field plays on -- the local stand-in for a
+  // real online elimination, and the repro path documented in
+  // docs/SPECTATE_LIFECYCLE.md. Controls stay on InputManager slot 0
+  // (keyboard P1 / touch); Match maps that polled frame onto the fighter
+  // slot named here.
+  const __DEBUG_SEAT_PARAM = __DEBUG_PARAMS.get('seat');
+  const debugSingleSeat =
+    __DEBUG_CROWD && __DEBUG_SEAT_PARAM !== null && Number.isFinite(Number(__DEBUG_SEAT_PARAM))
+      ? Math.max(0, Math.min(19, Math.round(Number(__DEBUG_SEAT_PARAM))))
+      : null;
   const localHumanSlotCount = __DEBUG_CROWD ? 2 : 2;
+  const localSeats: readonly number[] =
+    debugSingleSeat !== null ? [debugSingleSeat] : [0, 1];
+  // The fighter slot this harness plays (the one whose elimination triggers
+  // the spectator handover and which the HUD marks as "you").
+  const localSlot = debugSingleSeat ?? LOCAL_SLOT;
   // Dev/QA helper: ?mode=timedKO drives the local (offline) harness --
   // including ?crowd20=1 -- through Timed Brawl instead of Battle
   // Royale, the only way to see the Timed Brawl HUD/end screen with a
@@ -1212,14 +1325,23 @@ async function beginMatch(): Promise<void> {
 
       const fighters = frame.fighters.map((f, i) => ({ ...f, eliminated: currentAdapter.status(i).eliminated }));
 
-      if (currentAdapter.status(LOCAL_SLOT).eliminated && !currentSpectator.isActive) {
-        currentSpectator.activate();
-        const status = currentAdapter.status(LOCAL_SLOT);
+      // Elimination handover. Match.tick() has already frozen the seat at
+      // tick-exactness (see Match.freezeEliminatedLocalSeats), so this is
+      // purely the presentation side: turn the camera over once, and say
+      // where the player finished. Keyed on the match's own generation so
+      // a repeated frame cannot re-run activate() and reset the camera.
+      const matchGeneration = localMatch.session.generation;
+      if (localMatch.currentLocalSlot() === null && !currentSpectator.isActive) {
+        if (currentSpectator.currentGeneration !== matchGeneration) {
+          currentSpectator.beginGeneration(matchGeneration);
+        }
+        currentSpectator.activate(matchGeneration);
+        const status = currentAdapter.status(localSlot);
         spectatorBanner.show(status.placement ?? currentAdapter.fighterCount, currentAdapter.fighterCount);
       }
 
       if (!currentSpectator.isActive) {
-        return { ...frame, fighters, localPlayerIndex: LOCAL_SLOT };
+        return { ...frame, fighters, localPlayerIndex: localMatch.currentLocalSlot() ?? undefined };
       }
 
       const now = performance.now();
@@ -1236,21 +1358,35 @@ async function beginMatch(): Promise<void> {
         dtSeconds,
       });
 
-      return { ...frame, fighters, liveArenaBounds: arena, cameraOverride, localPlayerIndex: LOCAL_SLOT };
+      // No localPlayerIndex while spectating: the "this is you" pointer
+      // and hit-shake attenuation must stop pointing at a seat that is no
+      // longer being played.
+      return { ...frame, fighters, liveArenaBounds: arena, cameraOverride, localPlayerIndex: undefined };
     },
     onContextLost: onRendererContextLost,
     onContextRestored: onRendererContextRestored,
     onRenderStalled: onRendererRenderStalled,
-  }, undefined, audio, localHumanSlotCount, localArenaOverride, localSettingsOverride);
+  }, undefined, audio, localHumanSlotCount, localArenaOverride, localSettingsOverride, localSeats);
   match = localMatch;
   localMatch.input.setBinding(0, currentBindings.p1);
   localMatch.input.setBinding(1, currentBindings.p2);
   adapter = new SimMatchAdapter(localMatch);
-  spectator = new SpectatorController(adapter, LOCAL_SLOT, {
+  spectator = new SpectatorController(adapter, localSlot, {
     centerX: (STATIC_ARENA.minX + STATIC_ARENA.maxX) / 2,
     centerY: (STATIC_ARENA.minY + STATIC_ARENA.maxY) / 2,
     scale: 3,
   });
+  // Attach the Tab/O shortcuts through the controller itself rather than
+  // the global keydown handler below: the controller owns exactly one
+  // registration, replaces it if re-attached, and removes it in release()
+  // on exit/reconnect -- so two listeners can never both advance the
+  // follow target (the camera "drift" symptom).
+  spectator.beginGeneration(localMatch.session.generation, {
+    centerX: (STATIC_ARENA.minX + STATIC_ARENA.maxX) / 2,
+    centerY: (STATIC_ARENA.minY + STATIC_ARENA.maxY) / 2,
+    scale: 3,
+  });
+  spectator.attachKeys(window, { shouldIgnore: (event) => isTypingKeystroke(event as unknown as KeyboardEvent) });
 
   if (!(await initWithTimeout(localMatch.init(canvasRoot), 'local match'))) return;
   localMatch.start();
@@ -1271,7 +1407,7 @@ async function beginMatch(): Promise<void> {
       hud.update(
         match.currentSnapshots(),
         extras,
-        0,
+        localMatch.currentLocalSlot() ?? -1,
         localMatch.displayNames(),
         isTimedBrawl(localSettings) && localSettings
           ? { clockText: formatClock(ticksRemaining(localMatch.currentTick, localSettings)) }
@@ -1291,18 +1427,17 @@ async function beginMatch(): Promise<void> {
   requestAnimationFrame(hudTick);
 }
 
+// Global shortcuts that do NOT belong to a spectator camera. Tab/O are
+// deliberately absent: they are registered by the SpectatorController
+// itself (attachKeys), which owns exactly one registration and removes it
+// on release() -- see the comment at that call site for why two listeners
+// here would make the follow target advance twice per keypress.
 window.addEventListener('keydown', (e) => {
   if (isTypingKeystroke(e)) return;
   if (e.code === 'F3') {
     e.preventDefault();
     match?.toggleDebug();
     netMatch?.toggleDebug();
-  } else if (e.code === 'Tab' && spectator?.isActive) {
-    e.preventDefault();
-    spectator.cycleNext();
-  } else if (e.code === 'KeyO' && spectator?.isActive) {
-    e.preventDefault();
-    spectator.toggleOverview();
   }
 });
 

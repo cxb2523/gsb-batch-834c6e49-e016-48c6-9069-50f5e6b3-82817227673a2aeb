@@ -32,6 +32,7 @@ import {
   type StageBounds,
 } from '@bash-fighter/render';
 import { FixedTimestepLoop } from './loop.ts';
+import { SpectateSession } from './spectator/session.ts';
 import { AudioManager } from '@bash-fighter/audio';
 import { detectFighterEvents, detectItemEvents } from './effects-events.ts';
 import { EffectsAudioBridge } from './effects-audio.ts';
@@ -118,6 +119,14 @@ export class Match {
   readonly audio: AudioManager;
   private readonly effectsBridge: EffectsAudioBridge;
   private readonly bots: Map<number, BotController>;
+  // Which slots this local harness's InputManager drives (see the
+  // localSeats constructor parameter). Everything else is bot-filled.
+  private readonly localSeats: number[];
+  // Generation-scoped lifecycle state shared with main.ts's spectator
+  // wiring: which seats are frozen for good, whether we are spectating,
+  // and the unacked input window that a reconnect must discard rather than
+  // replay. See spectator/session.ts.
+  readonly session: SpectateSession;
   // Local-play equivalent of NetMatch's server-broadcast names[] (see
   // packages/app/src/net-match.ts and the Player Names 2026-09-11 wiki
   // page): a local/?crowd20=1 match has no server to hand out names, so
@@ -161,13 +170,26 @@ export class Match {
     // battleRoyale. Ignored (stays battleRoyale) when omitted, so this
     // changes nothing about ordinary local play.
     settingsOverride?: Partial<MatchSettings>,
+    // Which local slots this harness controls. Defaults to the leading
+    // `humanSlotCount` seats (2 for ordinary local play, none for the
+    // all-bot attract-mode demo), preserving the old wiring exactly.
+    // ?crowd20=1&seat=<n> narrows it to one seat, so the player's own
+    // fighter can be eliminated while a full 20-fighter field plays on --
+    // the local stand-in for a real online elimination.
+    localSeats: readonly number[] = Array.from({ length: humanSlotCount }, (_, i) => i),
   ) {
     this.characters = characters;
     this.audio = audio;
+    // An explicitly empty localSeats (attract mode: every slot is a bot)
+    // must stay empty -- inventing a seat here would take a slot away from
+    // the bot fill below. An omitted list means "the leading humanSlotCount
+    // seats", which is what the default parameter already produced.
+    this.localSeats = [...localSeats];
+    this.session = new SpectateSession();
+    this.session.startGeneration((this.localSeats[0] ?? -1) as number);
     this.effectsBridge = new EffectsAudioBridge(audio);
-    // Local play: the human is always fighter slot 0 by convention (the
-    // rest are bots) -- see InputManager wiring below.
-    this.effectsBridge.setContext(characters, 0);
+    // Local play: the human is slot 0 by convention (the rest are bots).
+    this.effectsBridge.setContext(characters, this.localSeats[0] ?? 0);
     // Local play must build its Sim through the same sanctioned path the
     // server and online clients use (createMatchSim) so it exercises the
     // real item set, hazard config, and arena resolution instead of the
@@ -184,6 +206,11 @@ export class Match {
     // deriveBotSeed(seed, slot) for determinism), just decided locally by
     // slot index instead of a per-seat isBot flag.
     this.bots = buildLocalBots(seed, this.numFighters, humanSlotCount);
+    // A slot this harness controls must not also have a bot decision
+    // driving it -- exactly one owner per slot. Slots in localSeats at or
+    // after humanSlotCount (the ?seat= narrowing of the crowd harness) are
+    // therefore removed from the bot map.
+    for (const slot of this.localSeats) this.bots.delete(slot);
     this.names = Array.from({ length: this.numFighters }, (_, slot) => (this.bots.has(slot) ? botName(slot) : ''));
     this.renderer = new Renderer(arenaDataToStageBounds(this.sim.getArena()));
     this.prevSnapshots = this.snapshotAll();
@@ -238,6 +265,10 @@ export class Match {
   stop(): void {
     this.loop.stop();
     this.input.detach(window);
+    // Leaving the match ends its generation: buffered state from it must
+    // never be reachable by whatever starts next (a rematch, a reconnect,
+    // the replay viewer). Idempotent by construction (see SpectateSession).
+    this.session.invalidate();
     if (this.renderWatchdogTimer !== null) {
       clearTimeout(this.renderWatchdogTimer);
       this.renderWatchdogTimer = null;
@@ -272,8 +303,24 @@ export class Match {
 
   private tick(): void {
     if (this.over) return;
-    const polled: InputFrame[] = this.input.poll();
-    const inputs: InputFrame[] = buildTickInputs(this.sim, polled, this.bots, this.numFighters);
+    // Collect input only while this harness still has a live seat. Once
+    // every local seat is frozen the session reports spectating and
+    // pollSlots(0) stops sampling at the source (while still clearing the
+    // keyboard's per-poll tap set), so nothing this harness reads can be
+    // submitted or predicted afterwards. Per-seat freezing is enforced one
+    // step later by buildTickInputs, so an ordinary 2-keyboard match keeps
+    // player 2's controls alive after player 1 is out. See
+    // spectator/session.ts rule 1.
+    const polled = this.currentLocalSlot() !== null
+      ? this.input.pollSlots(this.seatWriteLimit())
+      : this.input.pollSlots(0);
+    const inputs: InputFrame[] = buildTickInputs(
+      this.sim,
+      this.polledByFighterSlot(polled),
+      this.bots,
+      this.numFighters,
+      this.session.frozenSeats(),
+    );
     this.sim.advance(inputs);
 
     this.prevSnapshots = this.currSnapshots;
@@ -295,9 +342,60 @@ export class Match {
       this.lastStocks[i] = stocks;
     }
 
+    // Elimination handover, tick-exact: the sim state that first reports a
+    // local seat eliminated is the last state that seat may have affected.
+    // Freeze it here (not only in the render path) so even a burst of
+    // catch-up ticks inside one animation frame can never submit another
+    // input for it, and so the authority never sees it either.
+    this.freezeEliminatedLocalSeats();
+
     if (this.sim.isMatchOver() && !this.over) {
       this.over = true;
       this.events.onMatchOver?.(this.sim.getWinner(), this.sim.getLeaderboard(), this.sim.getMatchSettings());
+    }
+  }
+
+  /** Highest InputManager slot index this harness may still sample: the
+   * greatest local seat that is not frozen, +1 (0 when none remain). */
+  private seatWriteLimit(): number {
+    let limit = 0;
+    for (const slot of this.localSeats) {
+      if (!this.session.isSeatFrozen(slot)) limit = Math.max(limit, slot + 1);
+    }
+    return limit;
+  }
+
+  /** InputManager polls its own slots 0..n-1 (keyboard/gamepad seats), but
+   * a fighter slot is not necessarily an InputManager slot: ?seat=<n> puts
+   * the one controlled fighter into the middle of the crowd while its
+   * controls stay on InputManager slot 0. Map one onto the other here so
+   * `polled[fighterSlot]` always means "the frame for that fighter". */
+  private polledByFighterSlot(polled: readonly InputFrame[]): InputFrame[] {
+    if (this.localSeats.length === 0) return [];
+    if (this.localSeats.length === 1) {
+      const single = this.localSeats[0] as number;
+      const out: InputFrame[] = [];
+      const frame = polled[0];
+      if (frame) out[single] = frame;
+      return out;
+    }
+    return [...polled];
+  }
+
+  private freezeEliminatedLocalSeats(): void {
+    for (const slot of this.localSeats) {
+      if (this.session.isSeatFrozen(slot)) continue;
+      if (!(this.currSnapshots[slot] as FighterSnapshot).eliminated) continue;
+      this.session.freezeSeat(slot);
+    }
+    const anyLiveSeat = this.localSeats.some((slot) => !this.session.isSeatFrozen(slot));
+    if (!anyLiveSeat) {
+      this.session.beginSpectating(this.session.generation);
+      // Only once NO seat is left do we forget every held key. Doing it per
+      // seat would wipe the other local player's controls the moment
+      // player 1 is out of an ordinary two-keyboard match; per-seat
+      // neutralisation is already guaranteed by buildTickInputs above.
+      this.input.releaseAll();
     }
   }
 
@@ -320,8 +418,7 @@ export class Match {
         eliminated: curr.eliminated,
         inRingDanger: curr.inRingDanger,
       });
-    }
-    const items: RenderItemState[] = [];
+    }    const items: RenderItemState[] = [];
     for (let i = 0; i < MAX_ITEMS; i++) {
       const prev = this.prevItemSnapshots[i] as ItemSnapshot;
       const curr = this.currItemSnapshots[i] as ItemSnapshot;
@@ -376,11 +473,13 @@ export class Match {
     const { hitEffects, eliminationEffects } = this.effectsBridge.consume(this.pendingEvents, this.currSnapshots);
     this.pendingEvents = [];
 
-    // Hazard/boundary danger cue for the local player only (index 0 in
-    // local play -- see the EffectsAudioBridge.setContext call above).
+    // Hazard/boundary danger cue for the local player only (the seat this
+    // harness is still playing -- see currentLocalSlot; null once it is
+    // eliminated/spectating, which is exactly when the cue must stop).
     // Debounced on the threshold crossing so it announces "you're now in
     // danger", not a continuous alarm.
-    const localSnap = this.currSnapshots[0];
+    const localSlot = this.currentLocalSlot();
+    const localSnap = localSlot === null ? undefined : this.currSnapshots[localSlot];
     if (localSnap && !localSnap.eliminated) {
       const liveBounds = currentArenaBounds(this.sim.getCurrentBlastRect());
       const danger = computeEdgeDangerFrac(fx.toFloat(localSnap.posX), fx.toFloat(localSnap.posY), {
@@ -434,8 +533,25 @@ export class Match {
         this.sim.getMatchSettings(),
       ),
       names: this.names,
+      // The local player's own fighter, or absent once their seat is
+      // frozen — same contract as NetMatch's render(): the renderer uses
+      // this for the "this is you" pointer and hit-shake attenuation, and
+      // both must stop pointing at a seat that is no longer being played
+      // (that pointer sticking to an eliminated fighter is one of the
+      // visual symptoms the spectate lifecycle fixes).
+      localPlayerIndex: this.currentLocalSlot() ?? undefined,
     };
     this.renderer.render(this.events.transformFrame ? this.events.transformFrame(frame) : frame);
+  }
+
+  /** The seat this harness is still playing, or null once frozen/
+   * spectating. Read by the render frame and available to the app layer. */
+  currentLocalSlot(): number | null {
+    if (this.session.isSpectating) return null;
+    for (const slot of this.localSeats) {
+      if (!this.session.isSeatFrozen(slot)) return slot;
+    }
+    return null;
   }
 
   currentSnapshots(): readonly FighterSnapshot[] {

@@ -35,6 +35,8 @@ import {
 import { currentArenaBounds, previewArenaBounds } from './arena-preview.ts';
 import { resyncLocalTickAfterSnapshot } from './reconnect-resync.ts';
 import { reconcilePrediction } from './prediction-replay.ts';
+import { SpectateSession } from './spectator/session.ts';
+import type { LiveArenaBounds } from './spectator/types.ts';
 import { getMatchesPlayed, recordMatchPlayed } from './matches-played.ts';
 
 // See packages/app/src/match.ts for why these mirror the sim's private
@@ -150,6 +152,11 @@ export interface NetMatchEvents {
   onContextLost?(): void;
   /** Fired once if/when the browser restores the context. */
   onContextRestored?(): void;
+  /** Runs right before a frame is handed to the renderer, exactly like
+   * Match's identical hook -- the app layer's spectator camera and
+   * eliminated-seat handover live here, so NetMatch itself never needs to
+   * know spectate policy. */
+  transformFrame?(frame: RenderFrame): RenderFrame;
   /** Fired once if, a few seconds after this match starts running, the
    * renderer has not genuinely presented a single frame -- same
    * contract as Match's identical event in match.ts. Never fires if
@@ -261,7 +268,20 @@ export class NetMatch {
   private over = false;
 
   private localTick = 0;
+  /** Generation-scoped lifecycle state. Every write that could outlive the
+   * match it belongs to (unacked input for replay, the frozen-seat set,
+   * the spectating flag) goes through here, so a reconnect's rebuilt
+   * generation can never replay or re-submit anything from the previous
+   * one. See spectator/session.ts and docs/SPECTATE_LIFECYCLE.md. */
+  private readonly session = new SpectateSession();
   private readonly inputHistory = new Map<number, InputFrame>();
+  /** Generation token the caller may hand back to markInputFrozen and
+   * friends. Mirrors session.generation but stays stable for the lifetime
+   * of one matchStart, which is exactly the scope every caller's message
+   * belongs to. */
+  sessionGeneration(): number {
+    return this.session.generation;
+  }
 
   private prevSnapState: Int32Array | null = null;
   private currSnapState: Int32Array | null = null;
@@ -714,6 +734,14 @@ export class NetMatch {
       clearTimeout(this.renderWatchdogTimer);
       this.renderWatchdogTimer = null;
     }
+    // Leaving the match ends its generation for good: no buffered input,
+    // frozen-seat record or spectating flag from it may survive into
+    // whatever runs next in this tab. Idempotent, so every teardown path
+    // (leave, error, match end, a fresh NetMatch superseding this one) can
+    // call it without coordinating.
+    this.session.invalidate();
+    this.inputHistory.clear();
+    this.input.releaseAll();
   }
 
   toggleDebug(): void {
@@ -749,6 +777,18 @@ export class NetMatch {
       case 'eliminated':
         if (msg.slot === this.mySlot && !this.spectating) {
           this.spectating = true;
+          // Hand the seat over at the authority's word, not on the next
+          // snapshot's rendering: freeze it for this generation (so no
+          // further input is sampled, predicted or sent -- tick() and the
+          // reconciliation both gate on the session), drop the unacked
+          // window that seat would otherwise still replay, and release any
+          // keys held at the moment of the KO. A late duplicate of this
+          // message on a superseded generation is a no-op by token.
+          const generation = this.session.generation;
+          this.session.freezeSeat(this.mySlot);
+          this.session.beginSpectating(generation);
+          this.input.releaseAll();
+          this.inputHistory.clear();
           // Once we're eliminated there is nothing left for *this* seat to
           // resume into -- the match plays on for everyone else, but our
           // token now only reclaims a spectator view of a match we're about
@@ -861,6 +901,15 @@ export class NetMatch {
     this.renderer.setStageBounds(arenaDataToStageBounds(this.localSim.getArena()));
     this.localTick = 0;
     this.inputHistory.clear();
+    // A matchStart -- fresh join OR a resumed reconnect -- is a brand-new
+    // generation. Both Sim rebuilds above start empty, so anything the
+    // previous generation still held is dropped here in the same place,
+    // before a single snapshot of the new one can be applied. Starting
+    // fresh on the new seat is what makes "rebuild by generation" true for
+    // online play: a resumed reconnect cannot replay or resubmit an input
+    // buffered against a seat/connection that no longer exists.
+    this.session.startGeneration(this.spectating ? -1 : slot);
+    this.input.releaseAll();
     this.events.onStateChange?.(this.spectating ? 'spectating' : 'in-match');
 
     // Engagement telemetry only (see docs/MEASUREMENT.md) -- fresh
@@ -922,10 +971,28 @@ export class NetMatch {
     if (this.over || !this.localSim) return;
     this.localTick++;
     const inputs: InputFrame[] = new Array(this.numFighters).fill(null).map(() => makeInputFrame());
-    if (!this.spectating && this.mySlot >= 0) {
-      const local = this.input.poll()[0] ?? makeInputFrame();
+    // One question decides everything about this tick's local seat: does
+    // the CURRENT generation still let us act? A stale generation (a
+    // reconnect rebuilt it), the spectating phase, or a frozen seat all
+    // answer no, and the seat then contributes a neutral frame -- never a
+    // polled one. This is the single gate that makes "no input is
+    // collected, predicted or submitted for an eliminated seat" true.
+    const generation = this.session.generation;
+    const holdingLiveSeat =
+      this.session.acceptsLocalInput(generation) && !this.spectating && this.mySlot >= 0;
+    // Exactly one poll either way: with no live seat it samples zero slots
+    // but still clears the keyboard's per-poll tap set, so a key tapped
+    // while spectating cannot linger into a later tick.
+    const polled = this.input.pollSlots(holdingLiveSeat ? this.mySlot + 1 : 0);
+    if (holdingLiveSeat) {
+      const local = polled[this.mySlot] ?? makeInputFrame();
       inputs[this.mySlot] = local;
-      this.inputHistory.set(this.localTick, local);
+      // Buffer for replay against a future ack, through the generation-
+      // checked path: rejected rather than applied if the generation
+      // turns over between sampling and this call.
+      if (this.session.recordInput(generation, this.localTick, local)) {
+        this.inputHistory.set(this.localTick, local);
+      }
       // Engagement telemetry only (see docs/MEASUREMENT.md) -- reads the
       // same local input frame already computed above for the sim, never
       // adds a poll or touches the sim's inputs array.
@@ -939,7 +1006,7 @@ export class NetMatch {
       // Same tick's real source (see InputManager.lastSourceForSlot) --
       // observed usage, not capability. this.mySlot indexes the same
       // InputManager slot local was just polled from above.
-      this.inputUsage.recordTick(hadInput, this.input.lastSourceForSlot(0));
+      this.inputUsage.recordTick(hadInput, this.input.lastSourceForSlot(this.mySlot));
       const ws = this.ws;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
@@ -1083,7 +1150,13 @@ export class NetMatch {
     // large mid-match server tick. Jumping forward keeps the countdown and
     // match clock (both read localTick) in step with the server.
     this.localTick = resyncLocalTickAfterSnapshot(this.localTick, snap.tick);
-    const slot = !this.spectating && this.mySlot >= 0 ? this.mySlot : -1;
+    // Reach agreement first: the new generation's seat is whoever we are
+    // now playing (or -1 while spectating), so a snapshot arriving on a
+    // connection that superseded the predicted one cannot replay inputs
+    // buffered under the previous generation.
+    if (this.spectating) this.session.beginSpectating(this.session.generation);
+    const slot = this.session.acceptsLocalInput(this.session.generation) && this.mySlot >= 0 ? this.mySlot : -1;
+    if (slot < 0) this.inputHistory.clear();
     reconcilePrediction(this.localSim, snap.state, this.inputHistory, snap.ackedInputTick, slot, this.numFighters);
   }
 
@@ -1183,6 +1256,31 @@ export class NetMatch {
     for (let i = 0; i < this.numFighters; i++) out[i] = source.getFighter(i);
     if (!this.spectating && this.mySlot >= 0) out[this.mySlot] = this.localSim.getFighter(this.mySlot);
     return out;
+  }
+
+  /** Spectator-facing roster: authoritative (last confirmed snapshot)
+   * elimination state, with NO predicted-local override. The spectator
+   * must follow what the server says is alive, not what this client's
+   * prediction believes about its own fighter -- otherwise a local
+   * prediction that outlives an elimination keeps a dead seat in the
+   * follow/cycle list. Satisfies SnapshotMatchAdapter's LiveRosterSource
+   * (see spectator/net-adapter.ts). */
+  spectatorRoster(): readonly FighterSnapshot[] {
+    if (!this.localSim) return [];
+    const source = this.currSnapState && this.renderSim ? this.renderSim : this.localSim;
+    if (this.currSnapState && this.renderSim) this.renderSim.loadState(this.currSnapState);
+    const out: FighterSnapshot[] = new Array(this.numFighters);
+    for (let i = 0; i < this.numFighters; i++) out[i] = source.getFighter(i);
+    return out;
+  }
+
+  /** Live blast rect for the spectator camera, or null before the first
+   * snapshot. */
+  spectatorArenaBounds(): LiveArenaBounds | null {
+    const sim = this.currSnapState && this.renderSim ? this.renderSim : this.localSim;
+    if (!sim) return null;
+    if (this.currSnapState && this.renderSim) this.renderSim.loadState(this.currSnapState);
+    return currentArenaBounds(sim.getCurrentBlastRect());
   }
 
   private static readonly STALL_THRESHOLD_MS = SNAPSHOT_INTERVAL_MS * 8;
@@ -1307,7 +1405,7 @@ export class NetMatch {
       hash: this.currSnapHash,
       hitEffects: this.pendingHitEffects,
       eliminationEffects: this.pendingEliminationEffects,
-      localPlayerIndex: !this.spectating && this.mySlot >= 0 ? this.mySlot : undefined,
+      localPlayerIndex: this.session.acceptsLocalInput(this.session.generation) && this.mySlot >= 0 ? this.mySlot : undefined,
       names: this.names,
       crownSlot: this.renderSim.getCrownHolder(),
       liveArenaBounds: currentArenaBounds(this.renderSim.getCurrentBlastRect()),
@@ -1321,7 +1419,7 @@ export class NetMatch {
     };
     this.pendingHitEffects = [];
     this.pendingEliminationEffects = [];
-    this.renderer.render(frame);
+    this.renderer.render(this.events.transformFrame ? this.events.transformFrame(frame) : frame);
     // Slow-frame attribution (2026-09-15, see docs/MEASUREMENT.md
     // "Slow-frame attribution"): a single comparison on the hot path --
     // the more expensive counter reads below only ever run on frames

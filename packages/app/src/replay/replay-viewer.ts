@@ -30,6 +30,8 @@ import {
   type RenderHazardState,
   type RenderFrame,
 } from '@bash-fighter/render';
+import { SpectatorController } from '../spectator/controller.ts';
+import { ReplayMatchAdapter, type ReplayRosterFrame } from '../spectator/replay-adapter.ts';
 
 // Item HELD/ARMED state ids mirror packages/sim/src/sim.ts's private
 // ItemState enum -- same duplication match.ts already carries (see the
@@ -146,6 +148,8 @@ export class ReplayViewer {
   private readonly renderer: Renderer;
   private readonly frames: ReplayTickFrame[];
   private readonly characters: CharacterData[];
+  private readonly adapter: ReplayMatchAdapter;
+  private readonly spectator: SpectatorController;
   private index = 0;
   private playing = false;
   private rafHandle = 0;
@@ -162,6 +166,41 @@ export class ReplayViewer {
     this.frames = precomputed.frames;
     this.characters = precomputed.characters;
     this.renderer = new Renderer(arenaDataToStageBounds(sim.getArena()));
+    // Spectator camera over the recorded ticks. The adapter answers "who
+    // was alive at the frame being shown", which is what makes cycling and
+    // auto-retargeting correct while scrubbing -- a fighter eliminated
+    // late in the recording is still a valid target on an early frame, and
+    // one alive at the current frame is never dropped because a later
+    // frame kills it. See docs/SPECTATE_LIFECYCLE.md.
+    this.adapter = new ReplayMatchAdapter(this.rosterFrames());
+    this.adapter.setFrameIndex(0);
+    this.spectator = new SpectatorController(this.adapter, -1, this.defaultView());
+    // A replay has no local seat; beginGeneration gives the controller its
+    // own generation and makes the first camera frame snap, not glide.
+    this.spectator.beginGeneration(1, this.defaultView());
+    this.spectator.activate(1);
+  }
+
+  /** True while the spectator camera (rather than the renderer's own
+   * framing) is driving this replay. Always true once activated; exposed
+   * for the screen's UI and for tests. */
+  get isSpectating(): boolean {
+    return this.spectator.isActive;
+  }
+
+  get followedIndex(): number | null {
+    return this.spectator.followedIndex;
+  }
+
+  /** Restrict/adjust what the replay camera follows. No local seat in a
+   * replay, so this is only useful for tests and a future "follow slot N"
+   * control; kept minimal. */
+  cycleFollow(): void {
+    this.spectator.cycleNext(this.adapter.frameIndex);
+  }
+
+  toggleOverview(): void {
+    this.spectator.toggleOverview();
   }
 
   static create(fixture: ReplayFixture): ReplayViewer {
@@ -218,6 +257,12 @@ export class ReplayViewer {
 
   destroy(): void {
     this.pause();
+    // Release the spectator camera's buffers and any keyboard registration
+    // it owns. Without this, closing the replay and opening another one
+    // would leave the previous controller alive (holding its own follow
+    // target and, if keys were ever attached, a listener) while the new
+    // one draws -- the "camera drift / stacking" symptom.
+    this.spectator.release();
   }
 
   private readonly frame = (nowMs: number): void => {
@@ -243,6 +288,22 @@ export class ReplayViewer {
 
   private renderCurrent(): void {
     const f = this.frames[this.index] as ReplayTickFrame;
+    // Point every spectator lookup at the frame actually being shown
+    // BEFORE asking it anything, so cycle/auto-retarget see this tick's
+    // survivors and this tick's blast rect.
+    this.adapter.setFrameIndex(this.index);
+    const dtSeconds = this.playing ? this.stepMs / 1000 : 0;
+    const { width, height } = this.renderer.viewSize;
+    const cameraOverride =
+      width > 0 && height > 0
+        ? this.spectator.update({
+            positions: f.fighters.map((fighter) => ({ x: fighter.x, y: fighter.y })),
+            viewWidth: width,
+            viewHeight: height,
+            arena: f.liveArenaBounds,
+            dtSeconds,
+          })
+        : undefined;
     const renderFrame: RenderFrame = {
       fighters: f.fighters,
       characters: this.characters,
@@ -251,7 +312,31 @@ export class ReplayViewer {
       tick: f.tick,
       hash: '',
       liveArenaBounds: f.liveArenaBounds,
+      cameraOverride,
     };
     this.renderer.render(renderFrame);
+  }
+
+  /** The roster captured with each frame, in the shape the replay adapter
+   * consumes. Built once at construction; frames are never mutated. */
+  private rosterFrames(): ReplayRosterFrame[] {
+    return this.frames.map((f) => ({
+      fighters: f.fighters.map((fighter) => ({ eliminated: fighter.eliminated === true })),
+      tick: f.tick,
+      liveArenaBounds: f.liveArenaBounds,
+    }));
+  }
+
+  /** Camera view to start from: the arena's own centre at a scale that
+   * frames a typical stage, matching the live spectator controller's
+   * initial view in main.ts. */
+  private defaultView(): { centerX: number; centerY: number; scale: number } {
+    const bounds = this.frames[0]?.liveArenaBounds;
+    if (!bounds) return { centerX: 0, centerY: 0, scale: 3 };
+    return {
+      centerX: (bounds.minX + bounds.maxX) / 2,
+      centerY: (bounds.minY + bounds.maxY) / 2,
+      scale: 3,
+    };
   }
 }
