@@ -241,6 +241,115 @@ async function main() {
         console.log('PASS unique exact-fit layout is preserved across all container orientations');
         await extreme.close();
 
+        // 容器尺寸变更失效链：在途任务、派生状态、撤销、自动与手动布局重校验。
+        const resized = await browser.newPage();
+        await resized.setViewport({ width: 1440, height: 900 });
+        await resized.goto(url, { waitUntil: 'load' });
+        await resized.click('#run-pack-btn');
+        await resized.waitForFunction(() => !document.getElementById('run-pack-btn').disabled, { timeout: 60000 });
+        assert.equal(await resized.evaluate(() => autoPackedItems.length), 45);
+        assert.equal(await resized.evaluate(() => bestAutoResult !== null), true);
+        assert.equal(await resized.evaluate(() => currentLayoutSignature !== null), true);
+
+        // 旧容器下移出一件并保留撤销条目；尺寸变化后该条目必须失效。
+        await resized.click('#tab-manual');
+        await resized.$eval('.place-one-btn', el => el.click());
+        const removed = await resized.evaluate(() => {
+            selectPlacedItemById(placedItems[0].id);
+            const id = placedItems[0].id;
+            document.getElementById('btn-delete-placed').click();
+            return { id, undoVisible: !document.getElementById('placement-undo').hidden };
+        });
+        assert.equal(removed.undoVisible, true);
+
+        await resized.click('#tab-auto');
+        // 收窄容器：自动布局应保留但被标红，尺寸派生状态全部清空。
+        const narrowed = await resized.evaluate(() => {
+            const before = Packer.layoutSignature(autoPackedItems);
+            const input = document.getElementById('bin-w');
+            input.value = '24';
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            return {
+                kept: Packer.layoutSignature(autoPackedItems) === before,
+                best: bestAutoResult,
+                sig: currentLayoutSignature,
+                seed: packingSeed,
+                unpacked: autoUnpackedItems.length,
+                invalid: invalidItemIds.size,
+                alert: getComputedStyle(document.getElementById('collision-alert')).display,
+                status: document.getElementById('workspace-status').textContent,
+                alternativeDisabled: document.getElementById('alternative-pack-btn').disabled,
+                restoreHidden: document.getElementById('restore-best-btn').hidden,
+                undoHidden: document.getElementById('placement-undo').hidden,
+                deleted: deletedPlacement
+            };
+        });
+        assert.equal(narrowed.kept, true, 'existing auto layout stays visible for review');
+        assert.equal(narrowed.best, null, 'best solution is cleared');
+        assert.equal(narrowed.sig, null, 'current layout signature is cleared');
+        assert.equal(narrowed.seed, 20260617, 'seed history is reset');
+        assert.equal(narrowed.unpacked, 0, 'stale unpacked stats are cleared');
+        assert.ok(narrowed.invalid > 0, 'out-of-bounds items are flagged');
+        assert.equal(narrowed.alert, 'flex', 'invalid layout is surfaced');
+        assert.match(narrowed.status, /标红/);
+        assert.equal(narrowed.alternativeDisabled, true, 'changing plans requires a fresh calculation');
+        assert.equal(narrowed.restoreHidden, true);
+        assert.equal(narrowed.undoHidden, true, 'undo entry bound to old geometry is dropped');
+        assert.equal(narrowed.deleted, null);
+        assert.equal(await resized.evaluate(() => Packer.validatePackingResult(autoPackedItems, 24, 50, 60).valid), false);
+        console.log('PASS resizing flags the retained auto layout and clears size-derived state');
+
+        // 迟到结果不得写回：被中止任务的代数与当前代数不同。
+        const late = await resized.evaluate(async () => {
+            const atom = {};
+            window.__lateGate = new Promise(resolve => { atom.release = resolve; });
+            const original = performParallelPacking;
+            performParallelPacking = async (items, binW, binH, binL) => {
+                await window.__lateGate;
+                const packed = new Packer(binW, binH, binL).pack(items, { checkStability: false }); // 旧容器结果
+                return { items: packed.items, unpacked: packed.unpacked };
+            };
+            const epochBefore = layoutEpoch;
+            const pending = calculatePacking();
+            const input = document.getElementById('bin-w');
+            input.value = '40';
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            const epochAfter = layoutEpoch;
+            const sigBefore = Packer.layoutSignature(autoPackedItems);
+            atom.release();
+            await pending;
+            performParallelPacking = original;
+            return { epochGrew: epochAfter > epochBefore, sigKept: Packer.layoutSignature(autoPackedItems) === sigBefore,
+                status: document.getElementById('workspace-status').textContent,
+                abandoned: bestAutoResult === null };
+        });
+        assert.equal(late.epochGrew, true, 'resizing advances the layout epoch');
+        assert.equal(late.sigKept, true, 'stale worker result never overwrites the workspace');
+        assert.equal(late.abandoned, true, 'stale result cannot seed a best solution');
+        assert.match(late.status, /容器尺寸已更新/);
+        console.log('PASS in-flight jobs are invalidated and their late results never land');
+
+        // 手动模式下按新容器重新落底：缩短高度后物品落到新底面并可再次校验。
+        await resized.click('#tab-manual');
+        const settled = await resized.evaluate(() => {
+            // 移出撤销条目已随尺寸变更失效，先按当前容器重新放入两件。
+            for (let i = 0; i < 2; i++) document.querySelector('.place-one-btn').click();
+            const before = placedItems.map(item => item.y);
+            const input = document.getElementById('bin-h');
+            input.value = '30';
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            return {
+                before,
+                after: placedItems.map(item => item.y),
+                valid: Packer.validatePackingResult(placedItems, 40, 30, 60, true, 0.5).valid,
+                invalid: invalidItemIds.size
+            };
+        });
+        assert.equal(settled.valid, true, 'manual layout is re-seated against the new container');
+        assert.equal(settled.invalid, 0);
+        console.log('PASS manual placement recomputes landing and collisions for the new container');
+        await resized.close();
+
         const noWorkers = await browser.newPage();
         await noWorkers.setViewport({ width: 1440, height: 900 });
         await noWorkers.evaluateOnNewDocument(() => { window.Worker = undefined; });

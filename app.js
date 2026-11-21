@@ -16,6 +16,14 @@ let packingController = null;
 let bestAutoResult = null;
 let solutionAttempt = 0;
 let packingSeed = 20260617;
+// 当前自动布局签名（“换方案”要排除的基线）。它和最佳方案、换方案历史一样
+// 依赖容器尺寸，尺寸变更后必须清空，否则新方案仍会围绕旧几何搜索。
+let currentLayoutSignature = null;
+// 布局失效代数：每次失效或容器尺寸变化递增。后台任务在写回前比对代数，
+// 保证即使取消信号未能及时抵达，迟到结果也不会覆盖工作区。
+let layoutEpoch = 0;
+// 当前激活布局（自动或手动）中校验失败的物品 id，用于重绘红色标记。
+let invalidItemIds = new Set();
 
 const MAX_INVENTORY_QTY = 1000;
 const MAX_ITEM_NAME_LENGTH = 80;
@@ -27,21 +35,143 @@ function cancelPacking() {
     packingController?.abort();
 }
 
+// 递增布局代数。任何在途后台任务在写回前都必须再次确认代数未变，
+// 因此即使取消信号未能及时抵达，迟到结果也会被丢弃。
+function bumpLayoutEpoch() {
+    layoutEpoch++;
+    return layoutEpoch;
+}
+
+function clearAutoDerivedState() {
+    bestAutoResult = null;
+    solutionAttempt = 0;
+    packingSeed = 20260617;
+    currentLayoutSignature = null;
+    document.getElementById('alternative-pack-btn').disabled = true;
+    document.getElementById('restore-best-btn').hidden = true;
+}
+
 function invalidateAutoLayout() {
     cancelPacking();
+    bumpLayoutEpoch();
     stopAnimation();
     autoPackedItems = [];
     autoUnpackedItems = [];
     animationStep = 0;
-    bestAutoResult = null;
-    solutionAttempt = 0;
-    packingSeed = 20260617;
-    document.getElementById('alternative-pack-btn').disabled = true;
-    document.getElementById('restore-best-btn').hidden = true;
+    invalidItemIds = new Set();
+    clearAutoDerivedState();
     document.getElementById('packing-comparison').textContent = '配置已更新，请重新计算';
     document.getElementById('anim-section').style.display = 'none';
     if (activeMode === 'auto') clearRenderedBoxes();
+    refreshLayoutValidity();
     setWorkspaceStatus('配置已更新，请重新计算');
+}
+
+// 容器尺寸变化是完整的失效链：作废在途任务与尺寸派生状态，然后立即按新容器
+// 重新校验屏幕上仍然保留的布局（自动或手动），把越界/支撑不足的物品显式标出。
+function handleContainerDimensionsChanged() {
+    cancelPacking();
+    bumpLayoutEpoch();
+    stopAnimation();
+
+    // 与旧容器几何绑定的撤销条目必须失效，避免撤销把越界布局恢复回来。
+    if (deletedPlacement) {
+        deletedPlacement = null;
+        clearTimeout(placementUndoTimer);
+        document.getElementById('placement-undo').hidden = true;
+    }
+
+    // 最佳方案、换方案历史、当前布局签名都依赖容器几何，全部清空。
+    // 旧容器下的“未能装入”统计同样失效，等待按新尺寸重新计算。
+    clearAutoDerivedState();
+    autoUnpackedItems = [];
+    document.getElementById('packing-comparison').textContent = '容器尺寸已变更，请重新计算';
+
+    let invalidCount;
+    if (activeMode === 'auto') {
+        // 保留现有自动布局供用户判断，但按新容器重校验并标红不合法的物品。
+        // 逻辑坐标以容器左下后角为原点，容器改变后需重新映射世界坐标。
+        autoPackedItems.slice(0, animationStep).forEach(item => {
+            const mesh = renderedItemMeshes.get(item.id);
+            if (mesh) updateMeshPosition(mesh, item);
+        });
+        invalidCount = refreshLayoutValidity();
+    } else {
+        settleManualLayout();
+        invalidCount = refreshLayoutValidity();
+        renderPlacedItemsListUI();
+        updateCoordUI();
+    }
+
+    if (!hasActiveLayout()) {
+        document.getElementById('anim-section').style.display = 'none';
+    }
+    updateStats();
+
+    const base = activeMode === 'auto'
+        ? '容器尺寸已更新，最佳方案与换方案历史已清空'
+        : '容器尺寸已更新，落底与碰撞已重新计算';
+    setWorkspaceStatus(invalidCount > 0
+        ? `${base}；${invalidCount} 件物品越界或支撑不足，已标红`
+        : `${base}，现有布局已按新容器重新校验`);
+}
+
+// 复用 packer.js 的布局校验：返回当前容器下不合法物品的 id 集合与错误明细。
+function validateLayoutItems(items) {
+    const { l: binL, w: binW, h: binH } = lastBinDimensions;
+    const stability = document.getElementById('cfg-stability').checked;
+    const result = Packer.validatePackingResult(items, binW, binH, binL, stability, 0.5);
+    const ids = new Set();
+    for (const error of result.errors) {
+        if (error.item) ids.add(error.item.id);
+        if (error.itemA) ids.add(error.itemA.id);
+        if (error.itemB) ids.add(error.itemB.id);
+    }
+    return { ids, errors: result.errors };
+}
+
+function updateLayoutAlert(count) {
+    const banner = document.getElementById('collision-alert');
+    document.querySelector('#collision-alert .alert-banner-text').textContent = activeMode === 'auto'
+        ? `自动布局中有 ${count} 件物品越界或支撑不足，请重新计算`
+        : `布局无效：${count} 件存在重叠、越界或支撑不足，请调整`;
+    banner.style.display = count > 0 ? 'flex' : 'none';
+}
+
+// 把无效标记同步到当前可见的网格（自动模式仅限已回放出来的物品）。
+function applyInvalidVisuals(items) {
+    items.forEach(item => updatePlacedBoxVisual(item, invalidItemIds.has(item.id)));
+}
+
+// 按当前容器尺寸重新校验激活布局，标红越界/支撑不足的物品，返回无效件数。
+function refreshLayoutValidity() {
+    if (!lastBinDimensions) { invalidItemIds = new Set(); return 0; }
+    if (activeMode === 'manual') return checkManualPlacementCollisions();
+    const { ids } = validateLayoutItems(autoPackedItems);
+    invalidItemIds = ids;
+    applyInvalidVisuals(autoPackedItems.slice(0, animationStep));
+    updateLayoutAlert(ids.size);
+    return ids.size;
+}
+
+function hasActiveLayout() {
+    return activeMode === 'auto' ? autoPackedItems.length > 0 : placedItems.length > 0;
+}
+
+// 手动模式下按新容器重新计算落底：保持原有堆叠顺序自底向上重新安放，
+// 无法放入的物品保持原位并由校验显式标出。
+function settleManualLayout() {
+    if (!placedItems.length) return;
+    const { h: binH } = lastBinDimensions;
+    const settled = [];
+    [...placedItems].sort((a, b) => a.y - b.y).forEach(item => {
+        const landingY = Packer.getGravityDropY(item, settled, binH, { maxLandingY: item.y });
+        if (landingY !== null) item.y = landingY;
+        clampItemPosition(item);
+        settled.push(item);
+        const mesh = renderedItemMeshes.get(item.id);
+        if (mesh) updateMeshPosition(mesh, item);
+    });
 }
 
 function requestRender() {
@@ -397,10 +527,15 @@ function updateContainer3D() {
         return;
     }
 
-    const dimensionsChanged = lastBinDimensions &&
+    const dimensionsChanged = Boolean(lastBinDimensions) &&
         (lastBinDimensions.l !== l || lastBinDimensions.w !== w || lastBinDimensions.h !== h);
     lastBinDimensions = { l, w, h };
-    if (!scene) { updateStats(); return; }
+    if (!scene) {
+        // 无三维视图时仍需执行失效链，避免派生状态停留在旧容器上。
+        if (dimensionsChanged) handleContainerDimensionsChanged();
+        else updateStats();
+        return;
+    }
 
     // 清理旧容器
     if (containerMesh) {
@@ -454,20 +589,10 @@ function updateContainer3D() {
     updateManualSliderBounds();
 
     if (dimensionsChanged) {
-        invalidateAutoLayout();
+        handleContainerDimensionsChanged();
         fitCamera();
-        if (placedItems.length > 0) {
-            placedItems.forEach(item => {
-                clampItemPosition(item);
-                const mesh = renderedItemMeshes.get(item.id);
-                if (mesh) updateMeshPosition(mesh, item);
-            });
-            checkManualPlacementCollisions();
-            renderPlacedItemsListUI();
-            updateCoordUI();
-        }
     }
-    
+
     // 更新数据统计里容器的总容积
     updateStats();
     requestRender();
@@ -691,6 +816,8 @@ function displayAutoResult(result) {
     updateStepUI();
     updateStats();
     showStep(animationStep);
+    // 展示即按当前容器校验，任何越界/支撑不足都会显式标红。
+    refreshLayoutValidity();
     const metrics = Packer.packingMetrics(autoPackedItems);
     const best = Packer.packingMetrics(bestAutoResult.items);
     const isBest = Packer.layoutSignature(autoPackedItems) === Packer.layoutSignature(bestAutoResult.items);
@@ -703,8 +830,10 @@ function displayAutoResult(result) {
 document.getElementById('run-pack-btn').addEventListener('click', () => calculatePacking());
 document.getElementById('alternative-pack-btn').addEventListener('click', () => calculatePacking(true));
 document.getElementById('restore-best-btn').addEventListener('click', () => {
+    // 最佳方案与当前布局签名绑定容器几何；尺寸变更后它已被清空，这里再兜底确认尺寸未变。
     if (packingController || !bestAutoResult) return;
     displayAutoResult(bestAutoResult);
+    currentLayoutSignature = Packer.layoutSignature(autoPackedItems);
     setWorkspaceStatus('已恢复当前数据下找到的最佳方案');
 });
 async function calculatePacking(explore = false) {
@@ -746,10 +875,15 @@ async function calculatePacking(explore = false) {
         return;
     }
 
-    const previousSignature = Packer.layoutSignature(autoPackedItems);
+    // 失效后 currentLayoutSignature 为空：此刻没有可排除的有效基线，
+    // 不应再拿旧容器下保留下来的布局签名去“换方案”。
+    const previousSignature = currentLayoutSignature;
     const started = performance.now();
     solutionAttempt++;
     packingSeed = explore ? (packingSeed + 0x9e3779b9) >>> 0 : 20260617;
+    // 记录本次任务的布局代数；容器尺寸变更会递增代数并中止任务，
+    // 迟到结果凭代数不匹配被丢弃，绝不写回工作区。
+    const taskEpoch = layoutEpoch;
 
     // 3. 异步并发执行装箱
     const controller = new AbortController();
@@ -770,7 +904,7 @@ async function calculatePacking(explore = false) {
             checkStability, supportRatio: 0.5, biggerFirst, seed: packingSeed, explore,
             excludeSignature: explore ? previousSignature : undefined
         }, controller.signal);
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || taskEpoch !== layoutEpoch) return;
         closeOverlay('loading-modal');
         if (result.noAlternative) {
             setWorkspaceStatus('本次搜索未找到不同的有效方案，现有布局已保留');
@@ -781,6 +915,7 @@ async function calculatePacking(explore = false) {
         const improved = bestAutoResult && Packer.comparePackings(result.items, bestAutoResult.items) > 0;
         if (!bestAutoResult || improved) bestAutoResult = result;
         displayAutoResult(result);
+        currentLayoutSignature = Packer.layoutSignature(result.items);
         const elapsed = ((performance.now() - started) / 1000).toFixed(2);
         setWorkspaceStatus((improved ? '找到更优方案' : explore ? '已生成不同方案' : '装箱完成') +
             '，用时 ' + elapsed + ' 秒' + (result.degraded ? '（基础搜索）' : '，已校验边界、碰撞与支撑'));
@@ -807,10 +942,16 @@ async function calculatePacking(explore = false) {
 
     } catch (error) {
         closeOverlay('loading-modal');
+        const stale = taskEpoch !== layoutEpoch;
         if (error.name !== 'AbortError') {
-            setWorkspaceStatus('计算失败，原布局已保留');
-            showWarningModal('error', '计算未完成', error.message, '请减少数量或检查浏览器设置后重试。');
-        } else setWorkspaceStatus('计算已取消，可以调整参数后重试');
+            if (!stale) {
+                setWorkspaceStatus('计算失败，原布局已保留');
+                showWarningModal('error', '计算未完成', error.message, '请减少数量或检查浏览器设置后重试。');
+            }
+        } else if (!stale) {
+            setWorkspaceStatus('计算已取消，可以调整参数后重试');
+        }
+        // 失效链已经写入更准确的状态（尺寸变更 / 配置更新），不要被迟到任务覆盖。
     } finally {
         clearTimeout(loadingTimer);
         if (packingController === controller) packingController = null;
@@ -818,7 +959,8 @@ async function calculatePacking(explore = false) {
         button.disabled = false;
         button.removeAttribute('aria-busy');
         alternativeButton.removeAttribute('aria-busy');
-        alternativeButton.disabled = autoPackedItems.length === 0;
+        // 只有布局仍然有效时才允许“换一种装箱方式”；失效后需重新计算。
+        alternativeButton.disabled = !currentLayoutSignature || autoPackedItems.length === 0;
         document.getElementById('restore-best-btn').disabled = false;
     }
 }
@@ -881,6 +1023,8 @@ function showStep(stepCount) {
                 const mesh = createBoxMesh(item);
                 scene.add(mesh);
                 renderedItemMeshes.set(item.id, mesh);
+                // 新回放出来的物品同样要带上失效标记，避免标红只覆盖旧网格。
+                updatePlacedBoxVisual(item, invalidItemIds.has(item.id));
             }
         } else {
             if (hasMesh) {
@@ -1315,32 +1459,14 @@ function onGizmoDrag() {
     updateStats();
 }
 
-// 物理碰撞和超出边界高亮高阶检测
+// 物理碰撞和超出边界高亮高阶检测（手动模式）
 function checkManualPlacementCollisions() {
     // 对全部手动物品做全局校验，避免切换选择后清除其他物品的碰撞状态。
-    const { l: binL, w: binW, h: binH } = lastBinDimensions;
-    const invalidIds = new Set();
-
-    const result = Packer.validatePackingResult(placedItems, binW, binH, binL, document.getElementById('cfg-stability').checked, 0.5);
-    for (const error of result.errors) {
-        if (error.item) invalidIds.add(error.item.id);
-        if (error.itemA) invalidIds.add(error.itemA.id);
-        if (error.itemB) invalidIds.add(error.itemB.id);
-    }
-    document.querySelector('#collision-alert .alert-banner-text').textContent =
-        '布局无效：' + invalidIds.size + ' 件存在重叠、越界或支撑不足，请调整';
-
-    for (const item of placedItems) {
-        updatePlacedBoxVisual(item, invalidIds.has(item.id));
-    }
-
-    // D. 显示红色悬浮警报条
-    const alertBanner = document.getElementById('collision-alert');
-    if (invalidIds.size > 0) {
-        alertBanner.style.display = 'flex';
-    } else {
-        alertBanner.style.display = 'none';
-    }
+    const { ids } = validateLayoutItems(placedItems);
+    invalidItemIds = ids;
+    for (const item of placedItems) updatePlacedBoxVisual(item, ids.has(item.id));
+    updateLayoutAlert(ids.size);
+    return ids.size;
 }
 
 // 辅助方法：修改已摆放网格的高亮材质
@@ -1600,6 +1726,8 @@ function switchMode(mode) {
         
         document.getElementById('anim-section').style.display = autoPackedItems.length ? 'block' : 'none';
         showStep(animationStep);
+        // 切回自动模式时按当前容器重新标出无效物品（尺寸变更后可能遗留越界布局）。
+        refreshLayoutValidity();
     } else {
         tabAuto.classList.remove('active');
         tabAuto.setAttribute('aria-selected', 'false');
@@ -1623,7 +1751,7 @@ function switchMode(mode) {
     if (mode === 'auto') {
         selectedPlacedItem = null;
         selectedBoxMesh = null;
-        document.getElementById('collision-alert').style.display = 'none';
+        if (!autoPackedItems.length) document.getElementById('collision-alert').style.display = 'none';
     }
     setWorkspaceStatus(mode === 'auto' ? '自动装箱，配置后开始计算' : '手动排布，从清单放入物品后调整位置');
 

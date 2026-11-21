@@ -31,6 +31,7 @@ A high-performance, responsive 3D bin packing visualization system built using T
 * Follows the system theme by default and updates live. Choose Light, Dark, or System from the theme selector; the choice survives reloads.
 * Responsive configuration disclosure, visible keyboard focus, keyboard tabs, modal focus containment, and reduced-motion support.
 * Auto/manual layouts survive mode switches. Product deletion and manual removal offer Undo for 10 seconds.
+* Changing container dimensions runs a full invalidation chain: the retained layout is re-validated against the new bin with out-of-bounds or under-supported items highlighted, in-flight background jobs are cancelled so late results never write back, the best solution, alternate-plan history and current layout signature are cleared, and undo entries bound to the old geometry are dropped. In manual mode, landing and collision checks are recomputed for the new container.
 
 ---
 
