@@ -1,6 +1,8 @@
 var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 var analyser = audioCtx.createAnalyser();
-var source;
+analyser.fftSize = 256; // 256 for analyser.getByteFrequencyData(dataArray) and 2048 for analyser.getByteTimeDomainData(dataArray)
+var dataArray = new Uint8Array(analyser.frequencyBinCount);
+var source = null;
 var gui;
 var resizeVisualizer;
 var defaultSong = "https://firebasestorage.googleapis.com/v0/b/kantelabs-threejs.appspot.com/o/03%20-%20Smooth%20Operator.mp3?alt=media&token=27e95f4c-b4fb-4160-9bdc-02833cf65a84";
@@ -20,6 +22,23 @@ window.onload = function () {
     var selectedSong;
     var currentSongUrl = defaultSong;
     var searchQuery = '';
+
+    // Playback state. Exactly one audio element, one analyser source and one
+    // render loop exist for the lifetime of the page; switching a track only
+    // re-points them at the new media instead of building the whole pipeline
+    // again.
+    var audioPlayer;
+    var currentObjectUrl = null;
+    var renderLoopId = null;
+    var animateFrame = null;
+    var trackSwitchId = 0;
+    var pendingUpload = null;
+    var renderer;
+    var scene;
+    var camera;
+    var controls;
+    var cubeMaterial;
+    var asteroidMaterial;
 
     function getSongFilename(url) {
         try {
@@ -108,15 +127,25 @@ window.onload = function () {
         }
     });
 
-    var storageRef = firebase.storage().ref();
-    var dbRoot = firebase.database().ref();
-    var songsRef = dbRoot.child('songs');
+    // Audio pipeline. The source node is created once for the single audio
+    // element; track changes disconnect it, swap the media and reconnect it.
     var audioDiv = document.querySelector('.audio-container');
-    var audioPlayer = new Audio(defaultSong)
+    audioPlayer = new Audio(defaultSong);
     audioPlayer.crossOrigin = "anonymous";
-    addAudioPlayer(audioPlayer);
+    audioPlayer.controls = true;
+    audioDiv.replaceChildren(audioPlayer);
+    audioPlayer.addEventListener('play', () => audioCtx.resume());
+    for (const event of ['playing', 'pause', 'ended', 'emptied', 'waiting', 'seeked', 'error']) {
+        audioPlayer.addEventListener(event, updatePlayingIndicator);
+    }
+
+    source = audioCtx.createMediaElementSource(audioPlayer); // Uploaded audio becomes the source for the media stream
+    source.connect(analyser);
+    analyser.connect(audioCtx.destination);
 
     unlockAudioContext(audioCtx);
+
+    setupVisualizer();
 
     if (window.ResizeObserver) {
         new ResizeObserver(() => resizeVisualizer()).observe(document.body);
@@ -124,27 +153,55 @@ window.onload = function () {
         window.addEventListener('resize', () => resizeVisualizer());
     }
 
-    //Searches for and loads previous songs uploaded to firebase
-    songsRef.on('child_added', snapshot => {
-        const songUrl = snapshot.val();
-        const item = document.createElement('li');
-        const button = document.createElement('button');
-        item.dataset.searchText = (snapshot.key + '\n' + getSongFilename(songUrl)).toLowerCase();
-        item.hidden = !item.dataset.searchText.includes(searchQuery);
-        button.type = 'button';
-        button.textContent = button.title = snapshot.key;
-        button.addEventListener('click', () => {
-            audioPlayer.src = songUrl;
-            setCurrentTrack(snapshot.key, songUrl, button);
-            if (narrowLayout.matches) closeLibrary();
-        });
-        item.appendChild(button);
-        prevSongs.appendChild(item);
-        if (searchQuery) updateSearchResults();
-        if (songUrl === currentSongUrl && !selectedSong) {
-            selectSong(button);
+    // Release any local file still backing the player when the page is really
+    // going away. Skip bfcache entries: the blob URL is still needed if the
+    // user navigates back.
+    window.addEventListener('pagehide', (event) => {
+        if (event.persisted) return;
+        cancelPendingUpload();
+        if (currentObjectUrl) {
+            URL.revokeObjectURL(currentObjectUrl);
+            currentObjectUrl = null;
         }
     });
+
+    //Searches for and loads previous songs uploaded to firebase
+    var storageRef = null;
+    var songsRef = null;
+    try {
+        if (window.firebase && typeof window.firebase.storage === 'function' &&
+            typeof window.firebase.database === 'function') {
+            storageRef = window.firebase.storage().ref();
+            songsRef = window.firebase.database().ref().child('songs');
+        }
+    } catch (err) {
+        console.warn('Firebase unavailable', err);
+    }
+
+    if (songsRef) {
+        songsRef.on('child_added', snapshot => {
+            const songUrl = snapshot.val();
+            const item = document.createElement('li');
+            const button = document.createElement('button');
+            item.dataset.searchText = (snapshot.key + '\n' + getSongFilename(songUrl)).toLowerCase();
+            item.hidden = !item.dataset.searchText.includes(searchQuery);
+            button.type = 'button';
+            button.textContent = button.title = snapshot.key;
+            button.addEventListener('click', () => {
+                beginTrackSwitch();
+                var wasPlaying = !audioPlayer.paused && !audioPlayer.ended && !audioPlayer.error;
+                activateTrack(snapshot.key, songUrl, button, null);
+                if (wasPlaying) resumePlayback();
+                if (narrowLayout.matches) closeLibrary();
+            });
+            item.appendChild(button);
+            prevSongs.appendChild(item);
+            if (searchQuery) updateSearchResults();
+            if (songUrl === currentSongUrl && !selectedSong) {
+                selectSong(button);
+            }
+        });
+    }
 
     function updatePlayingIndicator() {
         if (!selectedSong) return;
@@ -177,199 +234,321 @@ window.onload = function () {
         selectSong(button);
     }
 
-    fileUpload.onchange = (event) => {
-        var file = event.target.files[0];
-        if (!file) return;
-        var songName = file.name;
-
-        //Uploads Song to firebase
-        var songRef = storageRef.child(songName)
-        songRef.put(file).then(function (snapshot) {
-            let dlUrl = snapshot.downloadURL;
-            databaseRef = firebase.database().ref().child('songs').child(songName.split('.').slice(0, 1).join(' '))
-            databaseRef.set(dlUrl)
-            console.log("uploaded song");
-        })
-            .then(res => (console.log(res)))
-            .catch(err => console.log(err))
-
-        //Creates a temporary url for the file that was uploaded so that it could be played the audio element
-        audioPlayer = new Audio(URL.createObjectURL(file));
-        audioPlayer.crossOrigin = "anonymous";
-        setCurrentTrack(songName, audioPlayer.src);
-        addAudioPlayer(audioPlayer);
-        if (narrowLayout.matches) closeLibrary();
+    // Swapping src on a playing element kept the new track playing; reproduce
+    // that so the transport and the playing indicator stay in step. The
+    // promise may reject (autoplay policy / unreadable source), so settle the
+    // indicator instead of leaving an unhandled rejection behind.
+    function resumePlayback() {
+        var result;
+        try {
+            result = audioPlayer.play();
+        } catch (err) {
+            updatePlayingIndicator();
+            return;
+        }
+        if (result && typeof result.catch === 'function') {
+            result.catch(() => updatePlayingIndicator());
+        }
     }
 
-    function addAudioPlayer(audioPlayer) {
-        //Prevents local memory of audio files so you can create a new instance on upload
-        audioDiv.firstChild !== null ? (audioDiv.firstElementChild.remove(), (audioDiv.appendChild(audioPlayer))) : audioDiv.appendChild(audioPlayer);
-        audioPlayer.controls = true;
-        audioPlayer.addEventListener('play', () => audioCtx.resume());
-        for (const event of ['playing', 'pause', 'ended', 'emptied', 'waiting', 'seeked', 'error']) {
-            audioPlayer.addEventListener(event, updatePlayingIndicator);
+    // Starts a new switch generation. Any upload that is still being validated
+    // belongs to an older generation and must not take over the player.
+    function beginTrackSwitch() {
+        trackSwitchId += 1;
+        cancelPendingUpload();
+        return trackSwitchId;
+    }
+
+    function cancelPendingUpload() {
+        var pending = pendingUpload;
+        if (!pending) return;
+        pendingUpload = null;
+        pending.cancel();
+    }
+
+    // A new song gets its own palette, as the scene used to provide by
+    // being rebuilt. Recoloring keeps the same geometry and camera state.
+    function recolorScene() {
+        if (cubeMaterial) cubeMaterial.color.setHex(Math.random() * 0xffffff);
+        if (asteroidMaterial) asteroidMaterial.color.setHex(Math.random() * 0xffffff);
+    }
+
+    // Tear down the previous track and point the single audio source at the
+    // new one. The old animation loop is stopped first, the old source node is
+    // disconnected, any local object URL is released, and only then is the new
+    // media loaded and the loop restarted.
+    function activateTrack(name, url, button, objectUrl) {
+        stopRenderLoop();
+
+        audioPlayer.pause();
+        try {
+            audioPlayer.removeAttribute('src');
+            audioPlayer.load();
+        } catch (err) { /* the element may already be empty */ }
+
+        if (source) {
+            try {
+                source.disconnect();
+            } catch (err) { /* already disconnected */ }
         }
 
-        analyzeAudio(audioPlayer);
+        if (currentObjectUrl) {
+            URL.revokeObjectURL(currentObjectUrl);
+            currentObjectUrl = null;
+        }
+        currentObjectUrl = objectUrl;
+
+        audioPlayer.src = url;
+        audioPlayer.load();
+        if (source) source.connect(analyser);
+
+        recolorScene();
+
+        setCurrentTrack(name, url, button);
+        startRenderLoop();
+        updatePlayingIndicator();
     }
-}
 
-function analyzeAudio(audioPlayer) {
-    // AnalyserNode is necessary to provide real-time frequency and time-domain analysis information. It is an AudioNode that passes the audio stream unchanged from the input to the output, but allows you to take the generated data, process it, and create audio visualizations.
-    source = audioCtx.createMediaElementSource(audioPlayer) // Uploaded audio becomes the source for the media stream
-    source.connect(analyser)
-    analyser.connect(audioCtx.destination)
+    fileUpload.addEventListener('change', (event) => {
+        var file = event.target.files && event.target.files[0];
+        // Reset so picking the same file again still fires a change event.
+        fileUpload.value = '';
+        if (!file) {
+            // A cancelled file dialog must leave the current track untouched.
+            return;
+        }
+        startUpload(file);
+    });
 
-    analyser.fftSize = 256; // 256 for analyser.getByteFrequencyData(dataArray) and 2048 for analyser.getByteTimeDomainData(dataArray)
-    var bufferLength = analyser.frequencyBinCount;
-    var dataArray = new Uint8Array(bufferLength)
-    console.log(bufferLength)
+    // The "cancel" event fires when the file picker is dismissed without a
+    // selection; it must not disturb whatever is already playing.
+    fileUpload.addEventListener('cancel', () => {
+        fileUpload.value = '';
+    });
 
-    //Scene Details
-    var scene = new THREE.Scene(); //new scene instance
-    scene.background = new THREE.Color(0x000000);
-    scene.fog = new THREE.FogExp2(0xcccccc, 0.002);
+    function startUpload(file) {
+        var switchId = beginTrackSwitch();
+        var objectUrl = URL.createObjectURL(file);
+        var probe = new Audio();
+        var settled = false;
+        var timer = null;
 
-    var renderer = new THREE.WebGLRenderer();
-    if (document.querySelector('canvas')) {
-        cancelAnimationFrame(animate);
-        scene.remove.apply(scene, scene.children);
-        document.querySelector('canvas').remove();
+        var pending = {
+            cancel: function () {
+                finish(false);
+            }
+        };
+        pendingUpload = pending;
+
+        function finish(valid) {
+            if (settled) return;
+            settled = true;
+            if (pendingUpload === pending) pendingUpload = null;
+            clearTimeout(timer);
+            probe.removeEventListener('loadedmetadata', onLoaded);
+            probe.removeEventListener('error', onError);
+            try {
+                probe.removeAttribute('src');
+                probe.load();
+            } catch (err) { /* released below in every branch */ }
+
+            // Superseded by another switch, invalid audio, or a cancelled
+            // selection: discard the probe URL and keep whatever is playing.
+            if (!valid || switchId !== trackSwitchId) {
+                URL.revokeObjectURL(objectUrl);
+                return;
+            }
+
+            activateTrack(file.name, objectUrl, null, objectUrl);
+            uploadToLibrary(file, file.name);
+            if (narrowLayout.matches) closeLibrary();
+        }
+
+        function onLoaded() {
+            finish(true);
+        }
+
+        function onError() {
+            finish(false);
+        }
+
+        // Validate the local file before touching the live player so an unreadable
+        // or invalid file can never interrupt the track that is currently playing.
+        probe.preload = 'metadata';
+        probe.addEventListener('loadedmetadata', onLoaded);
+        probe.addEventListener('error', onError);
+        timer = setTimeout(() => finish(false), 10000);
+        probe.src = objectUrl;
+        probe.load();
+    }
+
+    function uploadToLibrary(file, songName) {
+        if (!storageRef) return;
+        try {
+            storageRef.child(songName).put(file).then(function (snapshot) {
+                var dlUrl = snapshot.downloadURL;
+                if (!dlUrl) return;
+                return window.firebase.database().ref().child('songs')
+                    .child(songName.split('.').slice(0, 1).join(' ')).set(dlUrl);
+            }).catch(function (err) {
+                // A failed remote upload must not affect local playback.
+                console.log(err);
+            });
+        } catch (err) {
+            console.log(err);
+        }
+    }
+
+    function setupVisualizer() {
+        //Scene Details
+        scene = new THREE.Scene(); //new scene instance
+        scene.background = new THREE.Color(0x000000);
+        scene.fog = new THREE.FogExp2(0xcccccc, 0.002);
+
+        renderer = new THREE.WebGLRenderer();
         document.body.appendChild(renderer.domElement);
 
-    } else {
-        document.body.appendChild(renderer.domElement)
-    }
+        //Lighting Details
+        var light = new THREE.AmbientLight(0x505050);
+        scene.add(light);
+        var directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+        directionalLight.position.set(0, 1, 1);
+        scene.add(directionalLight);
 
-    //Lighting Details
-    var light = new THREE.AmbientLight(0x505050);
-    scene.add(light);
-    var directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
-    directionalLight.position.set(0, 1, 1);
-    scene.add(directionalLight);
-
-    directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
-    directionalLight.position.set(1, 1, 0);
-    scene.add(directionalLight);
+        directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+        directionalLight.position.set(1, 1, 0);
+        scene.add(directionalLight);
 
 
-    directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
-    directionalLight.position.set(0, -1, -1);
-    scene.add(directionalLight);
+        directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+        directionalLight.position.set(0, -1, -1);
+        scene.add(directionalLight);
 
-    directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
-    directionalLight.position.set(-1, -1, 0);
-    scene.add(directionalLight);
+        directionalLight = new THREE.DirectionalLight(0xffffff, 0.7);
+        directionalLight.position.set(-1, -1, 0);
+        scene.add(directionalLight);
 
-    //Camera Details
-    var camera = new THREE.PerspectiveCamera(65, 1, 1, 1000);
-    camera.position.x = 32;
-    camera.position.y = 50;
-    camera.position.z = 50;
-    camera.lookAt(scene.position);
+        //Camera Details
+        camera = new THREE.PerspectiveCamera(65, 1, 1, 1000);
+        camera.position.x = 32;
+        camera.position.y = 50;
+        camera.position.z = 50;
+        camera.lookAt(scene.position);
 
-    resizeVisualizer = function () {
-        var width = document.body.clientWidth;
-        var height = document.body.clientHeight;
-        camera.aspect = width / height;
-        camera.updateProjectionMatrix();
-        renderer.setSize(width, height, false);
-    };
-    resizeVisualizer();
+        resizeVisualizer = function () {
+            var width = document.body.clientWidth;
+            var height = document.body.clientHeight;
+            camera.aspect = width / height;
+            camera.updateProjectionMatrix();
+            renderer.setSize(width, height, false);
+        };
+        resizeVisualizer();
 
-    //Controls Details
-    var controls;
-    controls = new THREE.OrbitControls(camera, document.querySelector('canvas'));
-    controls.autoRotate = false;
+        //Controls Details
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.autoRotate = false;
 
-    if (gui) gui.destroy();
-    gui = new dat.GUI({ autoPlace: false, width: 262 });
-    document.querySelector('#camera-settings').replaceChildren(gui.domElement);
+        if (gui) gui.destroy();
+        gui = new dat.GUI({ autoPlace: false, width: 262 });
+        document.querySelector('#camera-settings').replaceChildren(gui.domElement);
 
-    var f1 = gui.addFolder('Camera')
-    f1.add(controls, 'autoRotate', false, true)
-    f1.add(controls, 'autoRotateSpeed', 0, 10).step(0.5)
-    f1.add(camera.position, 'x', -500, 500).step(5)
-    f1.add(camera.position, 'y', -500, 500).step(5)
-    f1.add(camera.position, 'z', -500, 500).step(5)
-    f1.open()
+        var f1 = gui.addFolder('Camera')
+        f1.add(controls, 'autoRotate', false, true)
+        f1.add(controls, 'autoRotateSpeed', 0, 10).step(0.5)
+        f1.add(camera.position, 'x', -500, 500).step(5)
+        f1.add(camera.position, 'y', -500, 500).step(5)
+        f1.add(camera.position, 'z', -500, 500).step(5)
+        f1.open()
 
 
-    //Cubes Details
-    var cubes = new Array();
-    var cubeGeometry = new THREE.CubeGeometry(1.5, 1.5, 1.5)
-    var cubeMaterial = new THREE.MeshPhongMaterial({
-        color: (Math.random() * 0xffffff),
-        flatShading: false,
-        specular: 0xffffff,
-        shininess: 14,
-        reflectivity: 2,
-        fog: false
-    });
+        //Cubes Details
+        var cubes = new Array();
+        var cubeGeometry = new THREE.CubeGeometry(1.5, 1.5, 1.5)
+        cubeMaterial = new THREE.MeshPhongMaterial({
+            color: (Math.random() * 0xffffff),
+            flatShading: false,
+            specular: 0xffffff,
+            shininess: 14,
+            reflectivity: 2,
+            fog: false
+        });
 
-    var i = 0;
-    for (var x = 0; x <= 256; x += 2) {
-        var j = 0;
-        cubes[i] = new Array();
-        for (var y = 0; y <= 62; y += 2) {
-            cubes[i][j] = new THREE.Mesh(cubeGeometry, cubeMaterial);
-            cubes[i][j].position.x = (y - 30);
-            cubes[i][j].position.y = (0);
-            cubes[i][j].position.z = (x);
-            scene.add(cubes[i][j])
-            j++;
-        }
-        i++;
-    }
-
-    //BackgroundShapes Details
-    var asteroidMesh = new Array()
-    var asteroidGeometry = new THREE.TetrahedronGeometry((Math.random() + 0.5), 2);
-    var asteroidMaterial = new THREE.MeshPhongMaterial({
-        color: (Math.random() * 0xffffff),
-        flatShading: true
-    });
-
-    var i = 0;
-    for (var x = 0; x < 1; x++) {
-        var j = 0;
-        asteroidMesh[i] = new Array();
-        for (var y = 0; y < 1000; y++) {
-            asteroidMesh[i][j] = new THREE.Mesh(asteroidGeometry, asteroidMaterial);
-            asteroidMesh[i][j].position.x = (Math.random() - 0.5) * 300;
-            asteroidMesh[i][j].position.y = (Math.random() - 0.5) * 300;
-            asteroidMesh[i][j].position.z = (Math.random() - 0.5) * 300;
-            asteroidMesh[i][j].scale.z = (Math.random() * 2, Math.random() * 2, Math.random() * 2);
-            asteroidMesh[i][j].rotation.set(Math.random() * 4, Math.random() * 4, Math.random() * 4)
-            scene.add(asteroidMesh[x][j])
-            j++;
-        }
-        i++;
-    }
-
-    function animate() {
-        requestAnimationFrame(animate) //better than set interval because it pauses when user leaves the page
-        analyser.getByteFrequencyData(dataArray)
-        controls.update();
-
-        var k = 0;
-        for (var i = 0; i < cubes.length; i++) {
-            for (var j = 0; j < cubes[i].length; j++) {
-                var scale = dataArray[k] / 10;
-                cubes[i][j].scale.y = (scale < 1 ? 1 : scale);
-                k += (k < dataArray.length ? 1 : 0);
+        var i = 0;
+        for (var x = 0; x <= 256; x += 2) {
+            var j = 0;
+            cubes[i] = new Array();
+            for (var y = 0; y <= 62; y += 2) {
+                cubes[i][j] = new THREE.Mesh(cubeGeometry, cubeMaterial);
+                cubes[i][j].position.x = (y - 30);
+                cubes[i][j].position.y = (0);
+                cubes[i][j].position.z = (x);
+                scene.add(cubes[i][j])
+                j++;
             }
+            i++;
         }
 
-        var k = 0;
-        for (var i = 0; i < asteroidMesh.length; i++) {
-            for (var j = 0; j < asteroidMesh[i].length; j++) {
-                asteroidMesh[i][j].rotation.z += 0.02;
+        //BackgroundShapes Details
+        var asteroidMesh = new Array()
+        var asteroidGeometry = new THREE.TetrahedronGeometry((Math.random() + 0.5), 2);
+        asteroidMaterial = new THREE.MeshPhongMaterial({
+            color: (Math.random() * 0xffffff),
+            flatShading: true
+        });
+
+        var i = 0;
+        for (var x = 0; x < 1; x++) {
+            var j = 0;
+            asteroidMesh[i] = new Array();
+            for (var y = 0; y < 1000; y++) {
+                asteroidMesh[i][j] = new THREE.Mesh(asteroidGeometry, asteroidMaterial);
+                asteroidMesh[i][j].position.x = (Math.random() - 0.5) * 300;
+                asteroidMesh[i][j].position.y = (Math.random() - 0.5) * 300;
+                asteroidMesh[i][j].position.z = (Math.random() - 0.5) * 300;
+                asteroidMesh[i][j].scale.z = (Math.random() * 2, Math.random() * 2, Math.random() * 2);
+                asteroidMesh[i][j].rotation.set(Math.random() * 4, Math.random() * 4, Math.random() * 4)
+                scene.add(asteroidMesh[x][j])
+                j++;
             }
+            i++;
         }
-        renderer.render(scene, camera)
+
+        animateFrame = function animate() {
+            renderLoopId = requestAnimationFrame(animateFrame) //better than set interval because it pauses when user leaves the page
+            analyser.getByteFrequencyData(dataArray)
+            controls.update();
+
+            var k = 0;
+            for (var i = 0; i < cubes.length; i++) {
+                for (var j = 0; j < cubes[i].length; j++) {
+                    var scale = dataArray[k] / 10;
+                    cubes[i][j].scale.y = (scale < 1 ? 1 : scale);
+                    k += (k < dataArray.length ? 1 : 0);
+                }
+            }
+
+            var k = 0;
+            for (var i = 0; i < asteroidMesh.length; i++) {
+                for (var j = 0; j < asteroidMesh[i].length; j++) {
+                    asteroidMesh[i][j].rotation.z += 0.02;
+                }
+            }
+            renderer.render(scene, camera)
+        }
+
+        startRenderLoop();
     }
-    animate() //gets called 60x per sec to render scene
+
+    function startRenderLoop() {
+        if (renderLoopId !== null) return; // never run two loops at once
+        animateFrame(); //gets called 60x per sec to render scene
+    }
+
+    function stopRenderLoop() {
+        if (renderLoopId === null) return;
+        cancelAnimationFrame(renderLoopId);
+        renderLoopId = null;
+    }
 }
 
 function unlockAudioContext(audioCtx) {
