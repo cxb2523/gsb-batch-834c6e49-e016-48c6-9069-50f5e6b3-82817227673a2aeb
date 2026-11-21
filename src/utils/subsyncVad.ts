@@ -296,10 +296,22 @@ export class SpeechAccumulator {
   /** Hand the signal over and reset. Trimmed to the timeline actually covered. */
   finish(): Float64Array {
     const out = this.samples.slice(0, this.length);
+    this.reset();
+    return out;
+  }
+
+  /**
+   * Drop everything held WITHOUT handing anything back.
+   *
+   * `finish` is for a run that completed; this is for one that was cancelled or
+   * superseded. The partial signal is worthless to the next run — and must not
+   * leak into it — and the buffer (~8 MB for a long film) should be let go of
+   * now, not whenever the GC gets around to noticing the run is dead.
+   */
+  reset(): void {
     this.samples = new Float64Array(0);
     this.length = 0;
     this.detected = 0;
-    return out;
   }
 
   /** Seconds of reference DETECTED so far, for progress reporting. */

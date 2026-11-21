@@ -179,4 +179,18 @@ test("SpeechAccumulator", async (t) => {
     assert.equal(accumulator.processedSeconds, 0);
     assert.equal(accumulator.finish().length, 0);
   });
+
+  await t.test("reset() drops a partial signal without handing it back", () => {
+    // The cancel path: whatever was detected so far is worthless to the next
+    // run and must not leak into it.
+    const accumulator = new SpeechAccumulator();
+    accumulator.push(pcm([[0, 100]], 200));
+    assert.ok(accumulator.processedSeconds > 0);
+    accumulator.reset();
+    assert.equal(accumulator.processedSeconds, 0);
+    assert.equal(accumulator.finish().length, 0);
+    // And the accumulator is genuinely reusable afterwards.
+    accumulator.push(pcm([[0, 50]], 60));
+    assert.equal(accumulator.finish().length, 60);
+  });
 });

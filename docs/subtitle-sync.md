@@ -110,6 +110,16 @@ Detection and correlation run in a **Web Worker**, so playback does not stutter
 while a 2²¹-point transform runs. If a worker cannot be created at all, the
 same functions run on the main thread instead.
 
+A sync takes long enough that the user can cancel it, switch tracks, or load a
+different film mid-run, so every run carries a **runId**. Messages from a run
+that has been moved on from are dropped on both sides of the worker boundary:
+audio windows never leak into the next run's reference, and a late result
+never shifts the subtitles of whatever is playing now. Cancelling or
+superseding a run releases its speech accumulator and the FFT twiddle table
+immediately; a re-run rebuilds both from its own inputs. This protocol lives
+in `subsyncRun.ts`, shared by the worker and the main-thread fallback so the
+two cannot drift apart.
+
 ## Before any of that: another subtitle track
 
 ffsubsync's own default (`subs_then_webrtc`) tries the video's embedded
@@ -163,6 +173,7 @@ The manual delay still works afterwards, as an adjustment on top.
 | [`src/utils/subsyncSplit.ts`](../src/utils/subsyncSplit.ts) | Piecewise (alass-style) alignment |
 | [`src/utils/subsyncVad.ts`](../src/utils/subsyncVad.ts) | Voice activity detection over PCM |
 | [`src/utils/subsyncEngine.ts`](../src/utils/subsyncEngine.ts) | The shared pipeline both engines run |
+| [`src/utils/subsyncRun.ts`](../src/utils/subsyncRun.ts) | The run lifecycle: runId filtering, supersede, cancel, resource release |
 | [`src/utils/subsyncAudio.ts`](../src/utils/subsyncAudio.ts) | ffmpeg.wasm extraction, in windows |
 | [`src/utils/subtitleSync.ts`](../src/utils/subtitleSync.ts) | The two engines, and which one to use |
 | [`src/workers/subsync.worker.ts`](../src/workers/subsync.worker.ts) | Worker shell — no algorithm of its own |

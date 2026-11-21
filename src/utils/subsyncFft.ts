@@ -89,6 +89,16 @@ export const releaseFftCache = (): void => {
 };
 
 /**
+ * True while a twiddle table is being held.
+ *
+ * The table is a pure function of the transform length, so holding or dropping
+ * it can never change an alignment's RESULT — this exists so tests can assert
+ * the cache is actually released between runs rather than piling up across
+ * cancels and re-runs.
+ */
+export const fftCacheHeld = (): boolean => twiddleCache !== null;
+
+/**
  * Forward (`inverse = false`) or inverse transform, in place.
  *
  * The inverse is the forward transform with the twiddle sign flipped and a

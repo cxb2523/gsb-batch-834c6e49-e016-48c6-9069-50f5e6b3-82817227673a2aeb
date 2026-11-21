@@ -26,10 +26,9 @@
 import { getRelayBase } from "./secureUrl";
 import { getRelayStatus } from "./relayDiscovery";
 import { EXTRACT_SAMPLE_RATE, extractReferenceAudio } from "./subsyncAudio";
-import { runAlignment } from "./subsyncEngine";
+import { attachWorkerRun, SubsyncRunSession, type SubsyncRunHandle } from "./subsyncRun";
 import { cuesToSpeech, preprocessCues } from "./subsyncSpeech";
-import { SpeechAccumulator } from "./subsyncVad";
-import type { SubsyncRequest, SubsyncResponse } from "./subsyncWorkerProtocol";
+import type { SubsyncRequest } from "./subsyncWorkerProtocol";
 import {
   BackendUnavailableError,
   type SubtitleSyncEngine,
@@ -147,100 +146,46 @@ interface WorkerRun {
 /**
  * Start a run on the worker, or on this thread when there is no worker.
  *
- * The main-thread path deliberately imports the SAME modules the worker does,
- * so the two cannot disagree about anything but where they ran.
+ * Both paths drive the SAME state machine (SubsyncRunSession) — the worker
+ * over postMessage, the fallback directly — so the two cannot disagree about
+ * runId filtering, supersede, or what gets released on cancel. Only where the
+ * work runs differs, which is the whole reason the fallback is acceptable.
  */
 const startRun = (runId: number, signal?: AbortSignal): WorkerRun => {
   const worker = getWorker();
 
   if (!worker) {
-    // No worker: buffer the audio through the same accumulator the worker uses
-    // and align when `finish` arrives.
-    let begin: Extract<SubsyncRequest, { type: "begin" }> | null = null;
-    const accumulator = new SpeechAccumulator();
     let resolve!: (value: SubtitleSyncResult) => void;
     let reject!: (reason: unknown) => void;
     const done = new Promise<SubtitleSyncResult>((res, rej) => {
       resolve = res;
       reject = rej;
     });
+    const session = new SubsyncRunSession((message) => {
+      if (message.type === "result") resolve(message.result);
+      else if (message.type === "error") reject(new Error(message.message));
+      // Progress reaches the UI through extractReferenceAudio's own callbacks.
+    });
+    let cancelled = false;
     return {
       post: (message) => {
-        try {
-          if (message.type === "begin") begin = message;
-          else if (message.type === "pcm") {
-            accumulator.push(new Int16Array(message.buffer), {
-              frameRate: message.frameRate,
-              startSeconds: message.startSeconds,
-            });
-          } else if (message.type === "finish" && begin) {
-            const reference = begin.referenceSpeech ?? accumulator.finish();
-            if (reference.length === 0) {
-              reject(new Error("No speech was detected in this video."));
-              return;
-            }
-            resolve(
-              runAlignment(reference, begin.cues, begin.reference, begin.processingMode, begin.engine, {
-                ...begin.options,
-                referenceNumFrames: begin.referenceNumFrames ?? null,
-              }),
-            );
-          }
-        } catch (error) {
-          reject(error);
-        }
+        // A cancelled run is dead: a late window must not start filling a
+        // fresh accumulator behind a promise that has already rejected.
+        if (!cancelled) session.handle(message);
       },
       done,
-      cancel: () => reject(new DOMException("Subtitle sync was cancelled", "AbortError")),
+      cancel: () => {
+        cancelled = true;
+        // Releases the accumulator and the FFT table, exactly as the worker
+        // would on the same message.
+        session.handle({ type: "cancel", runId });
+        reject(new DOMException("Subtitle sync was cancelled", "AbortError"));
+      },
     };
   }
 
-  let settle!: (value: SubtitleSyncResult) => void;
-  let fail!: (reason: unknown) => void;
-  const done = new Promise<SubtitleSyncResult>((resolve, reject) => {
-    settle = resolve;
-    fail = reject;
-  });
-
-  const onMessage = (event: MessageEvent<SubsyncResponse>) => {
-    const message = event.data;
-    // A reply from a run we have already abandoned.
-    if (message.runId !== runId) return;
-    if (message.type === "result") {
-      cleanup();
-      settle(message.result);
-    } else if (message.type === "error") {
-      cleanup();
-      fail(new Error(message.message));
-    }
-  };
-  const onError = (event: ErrorEvent) => {
-    cleanup();
-    // A worker that threw at module scope will do it again — start fresh.
-    discardWorker();
-    fail(new Error(event.message || "The subtitle sync worker stopped."));
-  };
-  const onAbort = () => {
-    worker.postMessage({ type: "cancel", runId } satisfies SubsyncRequest);
-    cleanup();
-    fail(new DOMException("Subtitle sync was cancelled", "AbortError"));
-  };
-
-  const cleanup = () => {
-    worker.removeEventListener("message", onMessage as EventListener);
-    worker.removeEventListener("error", onError as EventListener);
-    signal?.removeEventListener("abort", onAbort);
-  };
-
-  worker.addEventListener("message", onMessage as EventListener);
-  worker.addEventListener("error", onError as EventListener);
-  signal?.addEventListener("abort", onAbort, { once: true });
-
-  return {
-    post: (message, transfer) => worker.postMessage(message, transfer ?? []),
-    done,
-    cancel: onAbort,
-  };
+  const handle: SubsyncRunHandle = attachWorkerRun(worker, runId, signal, discardWorker);
+  return handle;
 };
 
 /* ------------------------------------------------------------------------ */
