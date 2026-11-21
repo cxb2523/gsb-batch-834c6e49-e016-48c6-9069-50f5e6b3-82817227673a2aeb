@@ -14,12 +14,12 @@ export const attachMediaSessionHandlers = () => {
   if ('mediaSession' in navigator) {
     navigator.mediaSession.setActionHandler('play', () => {
       const audioInstance = AudioX.getAudioInstance();
-      audioInstance.play();
+      audioInstance?.play();
     });
 
     navigator.mediaSession.setActionHandler('pause', () => {
       const audioInstance = AudioX.getAudioInstance();
-      audioInstance.pause();
+      audioInstance?.pause();
     });
 
     // Only add next and previous handler if there is a valid queue

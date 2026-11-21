@@ -149,6 +149,10 @@ const handleLoopPlayback = (loopMode: LoopMode) => {
   const audio = new AudioX();
   const audioInstance = AudioX.getAudioInstance();
 
+  if (!audioInstance) {
+    return;
+  }
+
   if (loopMode === 'OFF') {
     audioInstance.loop = false;
   }

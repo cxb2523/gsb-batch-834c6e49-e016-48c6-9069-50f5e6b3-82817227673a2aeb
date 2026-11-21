@@ -63,6 +63,9 @@ const attachHlsEventsListeners = (
 ) => {
   const hls = new HlsAdapter();
   const hlsInstance = hls.getHlsInstance();
+  if (!hlsInstance) {
+    return;
+  }
   if (isValidArray(Object.keys(hlsEventlistenerCallbackMap))) {
     for (const evt of Object.keys(hlsEventlistenerCallbackMap)) {
       const event = evt as keyof HlsEvents;
