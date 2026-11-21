@@ -26,7 +26,7 @@ import {
   setBossHP, popText, MENU_CB, titlePressed, titleReset, updateMenus, menuBack, refreshTitle, showTitleMenu, setLoading, showResults,
   updateResults, skipResults, resetHUDCache, setGameOverText, clearMarkers,
 } from './hud.js';
-import { AudioSys } from './audio.js';
+import { AudioSys, __audioInternals } from './audio.js';
 
 // Resolve on the next animation frame, or after a short timeout when the tab is in the background.
 const nextFrame = () => new Promise(r => { let done = false; const f = () => { if (!done) { done = true; r(); } }; requestAnimationFrame(f); setTimeout(f, 60); });
@@ -97,7 +97,7 @@ async function boot() {
   enterTitle(true);
   requestAnimationFrame(loop);
   if (__DEV__) Object.assign(window, {
-    G, BOSS, WING, ship, emit, Input, POST, GFX, THREE,
+    G, BOSS, WING, ship, emit, Input, POST, GFX, THREE, AudioSys, __audio: __audioInternals,
     __jump: (d) => { G.run = G.run || newRun(); hideScreens(); setupStage(d, false); },
     __start: () => startMission(),
     CAMP, progress,
@@ -719,11 +719,17 @@ function frame(rdt) {
 
   // time scaling (pause, hit-stop, slow motion)
   let ts = G.paused ? 0 : 1;
-  if (G.hitStop > 0) { G.hitStop -= rdt; ts *= 0.15; }
+  if (G.hitStop > 0 && !G.paused) { G.hitStop -= rdt; ts *= 0.15; }
   ts *= G.slowMo;
   const dt = rdt * ts;
   G.dt = dt;
   G.time += dt;
+
+  // One freeze semantic shared by the pause menu and the settlement states
+  // (clear / game over / results / interludes): combat holds exactly where it
+  // is, while presentation, cinematics and music keep playing.
+  G.frozen = G.paused || (G.state !== 'play' && G.state !== 'dead');
+  AudioSys.setFrozen(G.frozen);
 
   // global input
   if (G.state === 'title') updateTitle(rdt);
@@ -865,13 +871,18 @@ function updateEngineSound() {
 // Shared world simulation
 function simulate(dt, rdt, gameplay) {
   ship.update(dt);
-  if (gameplay) updatePlayerWeapons(dt, ship, ship.controllable && !S.intro && G.state === 'play');
-  updateEnemies(dt);
-  if (BOSS.inst.active) BOSS.inst.update(dt);
-  CUR.onUpdate?.(dt, gameplay);
+  const frozen = G.frozen;
+  if (gameplay && !frozen) updatePlayerWeapons(dt, ship, ship.controllable && !S.intro && G.state === 'play');
+  // Combat actors hold while frozen (pause, settlement); the world, camera, wingmen,
+  // effects and HUD keep breathing so cinematics play out around the frozen battle.
+  if (!frozen) {
+    updateEnemies(dt);
+    if (BOSS.inst.active) BOSS.inst.update(dt);
+    updateProps(dt);
+    updateEnemyBullets(dt, ship);
+  }
+  CUR.onUpdate?.(dt, gameplay && !frozen);
   updateWingmen(dt);
-  updateProps(dt);
-  updateEnemyBullets(dt, ship);
   updateWorld(dt, G.rail.d, ship.pos);
   updateCamera(rdt, ship);
   updateLights(dt, ship.pos);

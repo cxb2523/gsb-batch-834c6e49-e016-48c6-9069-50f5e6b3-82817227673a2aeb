@@ -99,7 +99,8 @@ let G = null;              // graph nodes
 let BUF = null;            // procedural buffers
 let timer = null;          // scheduler interval id
 let resumeAskedAt = -1e9;  // time (ms) of the last resume() request
-let isPaused = false;
+let isPaused = false;      // pause menu: music ducked, loops frozen
+let isFrozen = false;      // combat freeze (pause or settlement): loops faded out, music untouched
 const VOL = { master: 0.8, music: 0.7, sfx: 0.9 };
 const volGain = (v) => clamp(v, 0, 1) * clamp(v, 0, 1) * 1.25; // perceptual slider curve
 
@@ -2314,10 +2315,8 @@ function createContext() {
       b.onended = () => { try { b.disconnect(); } catch (e) { /* ignore */ } };
       b.start(0);
     } catch (e) { /* ignore */ }
-    if (isPaused) {
-      for (const g of G.mPause) g.gain.value = 0.25;
-      G.loopBus.gain.value = 0;
-    }
+    if (isPaused) for (const g of G.mPause) g.gain.value = 0.25;
+    if (isPaused || isFrozen) G.loopBus.gain.value = 0;
     timer = setInterval(tick, 25);
     if (timer && typeof timer.unref === 'function') timer.unref();
     if (typeof document !== 'undefined' && document.addEventListener) {
@@ -2333,6 +2332,19 @@ function createContext() {
     ctx = null;
     G = null;
   }
+}
+
+// Pause duck + loop freeze share one application point, so any combination of
+// pause-menu and settlement-freeze toggles converges to a single ramp — never
+// stacked gains, and loops are only faded (never stopped or re-created here).
+function applyPauseGains() {
+  if (!ctx) return;
+  try {
+    const t = ctx.currentTime;
+    for (const g of G.mPause) glide(g.gain, isPaused ? 0.25 : 1, 0.08, t);
+    const frozen = isPaused || isFrozen;
+    glide(G.loopBus.gain, frozen ? 0 : 1, frozen ? 0.12 : 0.3, t);
+  } catch (e) { /* ignore */ }
 }
 
 export const AudioSys = {
@@ -2444,13 +2456,19 @@ export const AudioSys = {
   },
 
   setPaused(p) {
-    isPaused = !!p;
-    if (!ctx) return;
-    try {
-      const t = ctx.currentTime;
-      for (const g of G.mPause) glide(g.gain, isPaused ? 0.25 : 1, 0.08, t);
-      glide(G.loopBus.gain, isPaused ? 0 : 1, isPaused ? 0.025 : 0.08, t);
-    } catch (e) { /* ignore */ }
+    p = !!p;
+    if (isPaused === p) return;
+    isPaused = p;
+    applyPauseGains();
+  },
+
+  // Combat freeze (settlement states, or anything that holds the battle):
+  // sustained loops fade out, and fade back in when the freeze lifts.
+  setFrozen(f) {
+    f = !!f;
+    if (isFrozen === f) return;
+    isFrozen = f;
+    applyPauseGains();
   },
 };
 

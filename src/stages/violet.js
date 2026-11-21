@@ -419,7 +419,9 @@ export default {
     clearRivals(); stopWarp(); SEQ.length = 0;
     if ((run.squad & 1) && d < KOTA_BACK) WING.byId.kota.hide();   // still being repaired after mission 01
   },
-  onUpdate(dt) { updateRivals(dt); updateWarp(dt); if (G.state === 'play') updateSeq(); },
+  // The warp gate is presentation and keeps animating through the clear cinematic;
+  // the rival squadron is combat AI and holds while the game is frozen.
+  onUpdate(dt, gameplay) { updateWarp(dt); if (gameplay) updateRivals(dt); if (G.state === 'play') updateSeq(); },
   onExit() { clearRivals(); stopWarp(); SEQ.length = 0; },
   warm: () => [...rivalModels(), warpModel()],
   boss: {

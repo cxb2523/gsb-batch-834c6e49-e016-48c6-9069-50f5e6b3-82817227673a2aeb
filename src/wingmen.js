@@ -131,7 +131,7 @@ export class Wingman {
   }
 
   tryFire(dt) {
-    if (this.mode === 'retreat') return;
+    if (this.mode === 'retreat' || G.frozen) return;
     this.fireT -= dt;
     if (this.fireT > 0) return;
     this.fireT = this.sortieT > 0 ? rand(0.9, 1.8) : this.out() ? rand(1.8, 3.6) : rand(2.6, 5);
@@ -217,7 +217,11 @@ export function resetWingmen(visible = true) {
   SORTIE.wait = rand(10, 16); SORTIE.cool = 6;
   for (const w of WING.list) { w.reset(); if (!visible) w.hide(); else w.show(); }
 }
-export function updateWingmen(dt) { for (const w of WING.list) w.update(dt); updateSorties(dt); updateBolts(dt); }
+export function updateWingmen(dt) {
+  for (const w of WING.list) w.update(dt);
+  // Sortie scripting and tracer fire are combat: they hold while the game is frozen.
+  if (!G.frozen) { updateSorties(dt); updateBolts(dt); }
+}
 export function updateWingmenTrails(cam) { for (const w of WING.list) w.updateTrails(cam); }
 export function setWingMode(mode) { for (const w of WING.list) if (!w.gone && w.mode !== 'retreat') { w.mode = mode; w.modeT = 0; } }
 // 'front' = formation ahead of the leader, 'rear' = behind the camera with occasional sorties.

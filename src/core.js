@@ -100,6 +100,8 @@ export const G = {
   camera: null,
   state: 'loading',     // loading | splash | title | play | clear | results | gameover
   paused: false,
+  frozen: false,        // combat freeze: pause menu or any non-gameplay state (settlement
+                        // cinematics keep rendering and the music plays, but the battle holds)
   clock: 0,             // real seconds since boot
   time: 0,              // gameplay seconds (scaled)
   dt: 0,                // scaled delta
