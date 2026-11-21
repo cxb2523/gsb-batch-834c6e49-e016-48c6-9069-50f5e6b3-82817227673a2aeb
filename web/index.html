@@ -29,15 +29,57 @@
     </script>
 
     <script>
+        // ---- valve.zip content-versioning service worker ----
+        // Registers /sw.js (served no-cache, so it updates immediately) and
+        // hands it the current content-fingerprint map. The worker rewrites the
+        // engine's fixed /valve.zip request to /valve.zip?v=<sha256>, giving the
+        // payload a content-addressed URL on top of nginx's ETag revalidation.
+        // Entirely progressive: if SW is unavailable or registration fails, the
+        // ETag path alone still keeps caching correct.
+        (function () {
+            if (!('serviceWorker' in navigator)) return;
+            function pushVersions(reg) {
+                fetch('/valve-versions.json', { cache: 'no-store' })
+                    .then(function (r) { return r.json(); })
+                    .then(function (v) {
+                        if (reg && reg.active && reg.active.postMessage) {
+                            reg.active.postMessage({ type: 'versions', versions: v });
+                        }
+                    })
+                    .catch(function () {});
+            }
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('/sw.js').then(function (reg) {
+                    pushVersions(reg);
+                    reg.addEventListener('updatefound', function () { pushVersions(reg); });
+                }).catch(function () { /* unsupported context — ETag still applies */ });
+            });
+        })();
+    </script>
+
+    <script>
         // ---- In-browser map picker ----
         // Lives in <head> and self-heals (re-injects on a tick) so it survives
-        // any rebuild of <body>. Switches the server map for everyone via
-        // `rcon changelevel`, calling the engine instance web/main.js exposes on
-        // window.__xash. Selection + switching state live on `window` so they
-        // survive a re-inject. Simple UX: instant search, current-map highlight,
-        // "switching…" feedback, Esc / backdrop / ✕ to close, touch-friendly.
+        // any rebuild of <body>. A click no longer fires an unconfirmed rcon
+        // and blindly resets after 4 s. Instead:
+        //
+        //   * every switch request carries a unique monotonic sequence number
+        //     plus an idempotency key; the control service (/api/map) sends the
+        //     rcon changelevel and polls the live server (A2S_INFO) until the
+        //     map really changes, so we stay in "switching" until CONFIRMED;
+        //   * only ONE request can be in flight at a time — repeated clicks and
+        //     Esc are no-ops while a switch is pending (Esc just closes the UI);
+        //   * every connected page polls the same-origin /api/state, so all
+        //     players learn the new map, update the highlight and re-enable
+        //     their buttons together — no stale map, no black-screen guessing;
+        //   * a fresh / refreshed page reads the current map from /api/state
+        //     instead of a hard-coded highlight;
+        //   * an in-engine rcon path remains as an offline fallback if the
+        //     control API can't be reached.
+        // Selection + switching state live on `window` so they survive re-inject.
         (function () {
-            // Must match rcon_password in cstrike/server.cfg. Public on a LAN by design.
+            // Must match rcon_password in cstrike/server.cfg and RCON_PASSWORD
+            // in docker-compose.yml. Public on a LAN by design.
             var RCON_PW = 'cs16lan';
             var MAPS = [
                 'de_dust2', 'de_dust', 'de_inferno', 'de_nuke', 'de_train',
@@ -47,6 +89,39 @@
                 'cs_estate', 'cs_backalley', 'cs_siege', 'cs_747', 'as_oilrig'
             ];
             var CUSTOM = ['cs_mansion']; // non-stock maps added via ./add-maps.sh
+            var DEFAULT_MAP = 'de_dust2'; // boot map (docker-compose `+map`)
+
+            var STATE_URL = '/api/state';
+            var SWITCH_URL = '/api/map';
+            var POLL_MS = 2000;          // same-origin state sync cadence
+            var CONFIRM_MS = 45000;      // match control SWITCH_TIMEOUT
+            var FETCH_MS = 8000;         // per-request fetch timeout
+
+            // Per-page-load identity. Survives picker re-injection via window;
+            // combined with the local sequence it forms the idempotency key so a
+            // double-click replays the SAME request instead of issuing a second.
+            window.__csClientId = window.__csClientId || makeClientId();
+            window.__csSeq = window.__csSeq || 0;
+            // __csSwitching: a switch (local or another player's) is in flight.
+            // __csLocalSwitch: THIS page owns the in-flight request.
+            window.__csSwitching = !!window.__csSwitching;
+            window.__csLocalSwitch = !!window.__csLocalSwitch;
+            window.__csSelectedMap = window.__csSelectedMap || DEFAULT_MAP;
+            window.__csLastError = window.__csLastError || null;
+
+            function makeClientId() {
+                var s = 'p-';
+                try {
+                    if (window.crypto && crypto.getRandomValues) {
+                        var a = new Uint8Array(8);
+                        crypto.getRandomValues(a);
+                        for (var i = 0; i < a.length; i++) s += a[i].toString(16);
+                        return s;
+                    }
+                } catch (e) {}
+                while (s.length < 18) s += Math.floor(Math.random() * 16).toString(16);
+                return s;
+            }
 
             function css(el, s) { for (var k in s) el.style[k] = s[k]; }
             function tiles() { return document.querySelectorAll('#cs-mapgrid .cs-maptile'); }
@@ -56,6 +131,8 @@
                 if (o) o.style.display = 'none';
                 var b = document.getElementById('cs-mapbtn');
                 if (b) { try { b.focus(); } catch (e) {} }
+                // Closing the panel never cancels an in-flight switch — the
+                // state poll keeps running and the UI reconciles on reopen.
             }
             window.__csMapClose = closePicker;
 
@@ -74,33 +151,180 @@
                 }
             }
 
+            function renderStatus() {
+                var st = document.getElementById('cs-mapstatus');
+                if (!st) return;
+                if (window.__csSwitching) {
+                    var pend = window.__csPendingMap || window.__csSelectedMap;
+                    st.style.color = '#f6b265';
+                    st.textContent = 'Switching to ' + pend + '… waiting for server confirmation';
+                    st.style.display = 'block';
+                } else if (window.__csLastError) {
+                    st.style.color = '#ff7676';
+                    st.textContent = '✗ ' + window.__csLastError;
+                    st.style.display = 'block';
+                } else {
+                    st.style.display = 'none';
+                }
+            }
+
+            // Disable the whole picker while ANY switch is in flight (local or
+            // another player's), so a second changelevel cannot be started.
             function setSwitching(on) {
+                window.__csSwitching = on;
                 var t = tiles();
                 for (var i = 0; i < t.length; i++) {
                     t[i].disabled = on; t[i].style.opacity = on ? '.45' : '1'; t[i].style.pointerEvents = on ? 'none' : 'auto';
                 }
                 var s = document.getElementById('cs-mapsearch'); if (s) s.disabled = on;
+                renderStatus();
+            }
+
+            function failLocal(message) {
+                window.__csLocalSwitch = false;
+                setSwitching(false);
+                window.__csLastError = message;
+                renderStatus();
+            }
+
+            // Direct in-engine RCON fallback (the old path), used only when the
+            // control service is unreachable. Confirmation still comes from
+            // /api/state: the service's monitor reconciles the live map, so this
+            // path benefits from the same all-page sync once it's reachable.
+            function rconFallback(name) {
+                var x = window.__xash;
+                if (!x || !x.Cmd_ExecuteString) {
+                    failLocal('control API unreachable and game engine unavailable');
+                    return;
+                }
+                try {
+                    x.Cmd_ExecuteString('rcon_password ' + RCON_PW);
+                    x.Cmd_ExecuteString('rcon changelevel ' + name);
+                } catch (e) {
+                    failLocal('failed to send rcon changelevel: ' + e);
+                    return;
+                }
+                armLocalTimeout(name, true);
+            }
+
+            // The 2 s state poll is the single source of truth; this is only a
+            // local safety net so a stuck/failed confirmation can't leave the
+            // picker locked forever. A successful switch is always unlocked by
+            // applyState() when the pending flag clears (well before this).
+            function armLocalTimeout(target, isFallback) {
+                var started = Date.now();
+                var timer = setInterval(function () {
+                    if (!window.__csSwitching) { clearInterval(timer); return; }
+                    if (Date.now() - started > CONFIRM_MS) {
+                        clearInterval(timer);
+                        failLocal(isFallback
+                            ? 'timed out: engine rcon did not reach ' + target
+                            : 'timed out: server did not confirm ' + target);
+                    }
+                }, 1000);
             }
 
             function switchMap(name) {
-                if (window.__csSwitching) return; // guard against double-fire
+                // Hard guard: one in-flight request at a time. Esc, double
+                // clicks and rapid tile clicks all collapse into this check.
+                if (window.__csSwitching) return;
+                window.__csLastError = null;
                 window.__csSelectedMap = name;
+                window.__csPendingMap = name;
                 applyHighlight();
-                var x = window.__xash;
-                if (x && x.Cmd_ExecuteString) {
-                    x.Cmd_ExecuteString('rcon_password ' + RCON_PW);
-                    x.Cmd_ExecuteString('rcon changelevel ' + name);
-                }
-                window.__csSwitching = true;
                 setSwitching(true);
-                var status = document.getElementById('cs-mapstatus');
-                if (status) { status.textContent = 'Switching to ' + name + '…  (takes a few seconds)'; status.style.display = 'block'; }
-                setTimeout(function () {
-                    window.__csSwitching = false;
+                window.__csLocalSwitch = true;
+
+                // Unique sequence for this request + an idempotency key so a
+                // retried/duplicated POST can never trigger a second changelevel.
+                window.__csSeq += 1;
+                var seq = window.__csSeq;
+                var key = window.__csClientId + '-' + seq;
+                var payload = JSON.stringify({
+                    map: name,
+                    idempotency_key: key,
+                    client: window.__csClientId,
+                    seq: seq
+                });
+
+                var ctrl = new AbortController();
+                var to = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, FETCH_MS);
+
+                fetch(SWITCH_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: payload,
+                    signal: ctrl.signal,
+                    cache: 'no-store'
+                }).then(function (res) {
+                    clearTimeout(to);
+                    if (res.status === 409) {
+                        // Another switch already in flight — adopt it, don't fail.
+                        window.__csLocalSwitch = false;
+                        return res.json().catch(function () { return null; });
+                    }
+                    if (res.status < 200 || res.status >= 300) {
+                        throw new Error('control API HTTP ' + res.status);
+                    }
+                    return res.json().catch(function () { return null; });
+                }).then(function (data) {
+                    if (data && data.state && data.state.pending) {
+                        window.__csPendingMap = data.state.pending.map || name;
+                    }
+                    armLocalTimeout(name, false);
+                }).catch(function (err) {
+                    clearTimeout(to);
+                    // Control plane down: fall back to the direct engine rcon.
+                    rconFallback(name);
+                });
+            }
+
+            // Apply a /api/state snapshot to this page. Runs on load (so new /
+            // refreshed pages show the real current map) and on every poll (so
+            // every connected page follows switches together).
+            function applyState(s) {
+                if (!s) return;
+                var pending = s.pending || null;
+
+                if (pending) {
+                    // A switch is in flight somewhere on the LAN: lock this page
+                    // too, and show which map everyone is moving to.
+                    window.__csPendingMap = pending.map;
+                    window.__csLastError = null;
+                    if (!window.__csSwitching) setSwitching(true);
+                    renderStatus();
+                    return;
+                }
+
+                // No pending switch. If we were locked (by a local or a remote
+                // switch), reconcile to the server-confirmed map and unlock.
+                if (window.__csSwitching) {
                     setSwitching(false);
-                    var st = document.getElementById('cs-mapstatus'); if (st) st.style.display = 'none';
-                    closePicker();
-                }, 4000);
+                    window.__csPendingMap = null;
+                    window.__csLocalSwitch = false;
+                    if (s.map) { window.__csSelectedMap = s.map; applyHighlight(); }
+                    window.__csLastError = s.last_error || null;
+                    renderStatus();
+                    return;
+                }
+
+                // Steady state: track the live map (console changelevels, boot
+                // map) and any error the service recorded. While THIS page owns
+                // an in-flight request, don't let an older poll overwrite the
+                // map the player just picked before the server catches up.
+                if (s.map && !window.__csLocalSwitch) {
+                    window.__csSelectedMap = s.map;
+                    applyHighlight();
+                }
+                window.__csLastError = s.last_error || null;
+                renderStatus();
+            }
+
+            function pollState() {
+                fetch(STATE_URL, { cache: 'no-store' })
+                    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                    .then(applyState)
+                    .catch(function () { /* transient: keep polling, no console spam */ });
             }
 
             function filterMaps() {
@@ -120,9 +344,13 @@
                 if (!o) return;
                 o.style.display = 'flex';
                 if (document.exitPointerLock) { try { document.exitPointerLock(); } catch (e) {} }
+                // Re-render switching/highlight state in case it changed while
+                // the panel was detached by an engine body rebuild.
+                setSwitching(!!window.__csSwitching);
+                applyHighlight();
                 setTimeout(function () {
                     var s = document.getElementById('cs-mapsearch');
-                    if (s) { s.value = ''; filterMaps(); try { s.focus(); } catch (e) {} }
+                    if (s && !window.__csSwitching) { s.value = ''; filterMaps(); try { s.focus(); } catch (e) {} }
                 }, 0);
             }
 
@@ -173,7 +401,7 @@
                 header.appendChild(x);
 
                 var sub = document.createElement('p');
-                sub.textContent = 'Pick a map to switch the whole server. It takes a few seconds — then tap the game to keep playing.';
+                sub.textContent = 'Pick a map to switch the whole server. It switches for everyone once the server confirms — then tap the game to keep playing.';
                 css(sub, { color: '#aaa', margin: '0 0 14px', fontSize: '12.5px', lineHeight: '1.5' });
 
                 var search = document.createElement('input');
@@ -216,7 +444,7 @@
                         borderRadius: '8px', padding: '11px 8px', cursor: 'pointer', fontSize: '13px',
                         transition: 'background .12s, border-color .12s' });
                     m.onmouseover = function () {
-                        if (m.getAttribute('data-map') !== window.__csSelectedMap) { m.style.background = '#383838'; m.style.borderColor = '#f6b265'; }
+                        if (m.getAttribute('data-map') !== window.__csSelectedMap && !window.__csSwitching) { m.style.background = '#383838'; m.style.borderColor = '#f6b265'; }
                     };
                     m.onmouseout = function () { applyHighlight(); };
                     m.onclick = function () { switchMap(name); };
@@ -241,6 +469,7 @@
                 document.body.appendChild(btn);
                 document.body.appendChild(overlay);
                 applyHighlight();
+                setSwitching(!!window.__csSwitching);
             }
 
             function tick() {
@@ -258,6 +487,10 @@
 
             document.addEventListener('pointerlockchange', tick, false);
             setInterval(tick, 800);
+            // Same-origin state channel: immediate read for fresh/reloaded pages,
+            // then a steady poll so every connected page follows map switches.
+            pollState();
+            setInterval(pollState, POLL_MS);
             if (document.readyState !== 'loading') build();
             else document.addEventListener('DOMContentLoaded', build);
         })();

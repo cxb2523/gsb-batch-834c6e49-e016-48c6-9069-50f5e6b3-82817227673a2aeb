@@ -78,13 +78,21 @@ Recommended: 16-player default; pick the map from the in-browser picker once peo
 ## Changing the map
 
 **From the browser (recommended).** While playing, press **Esc** to free the mouse,
-then click the **🗺 Maps** button at the top and choose a map. It switches the map for
-**everyone** within a few seconds — then click back into the game to keep playing.
-(Internally it sends `rcon changelevel` over the existing connection; the RCON password
-lives in `cstrike/server.cfg` and is intentionally public on a LAN.)
+then click the **🗺 Maps** button at the top and choose a map. The picker sends the
+request (with a unique sequence number + idempotency key) to the same-origin control
+service over `/api/map`, which issues `rcon changelevel` and then polls the live
+dedicated server (A2S_INFO) until the new map is actually running. The panel stays in
+a **"switching…"** state until that confirmation arrives; on timeout or failure the
+buttons become clickable again and the error is shown. Only one switch can ever be in
+flight — repeated clicks and **Esc** never start a second `changelevel`. Every open
+page polls `/api/state`, so all players see the new highlight together (no stale map or
+black screen), and a freshly opened / refreshed page reads the current map instead of a
+fixed highlight. If the control service is ever unreachable, the picker falls back to
+sending `rcon changelevel` directly through the game engine.
 
 **Default map at boot.** Edit `command:` in `docker-compose.yml`
-(`["+map", "de_dust2", "+maxplayers", "16"]`) and run `./start.sh`.
+(`["+map", "de_dust2", "+maxplayers", "16"]`) and the matching `DEFAULT_MAP` in
+`docker-compose.yml` (control service) and `web/index.html`, then run `./start.sh`.
 
 ## Custom maps (e.g. cs_mansion)
 
@@ -116,15 +124,29 @@ never modified:
   it reaches the engine. The engine's own in-game menu renders as a black screen in this
   build (its TTF fonts are missing), so we suppress it; the browser still releases the
   mouse, which reveals the map picker instead. The picker lives in `<head>` and
-  self-heals, because the engine rebuilds `<body>` on load.
+  self-heals, because the engine rebuilds `<body>` on load. Each switch carries a unique
+  sequence + idempotency key, stays in "switching" until the server confirms via
+  `/api/state`, and every connected page syncs its highlight from that same endpoint.
+- **`web/sw.js`** — a small service worker that fingerprints the engine's fixed
+  `/valve.zip` URL as `/valve.zip?v=<sha256>` using `proxy/valve-versions.json`, so a
+  rebuilt zip changes its request URL and can never be served from a stale cache.
 - **`web/main.js`** — **generated** by `./prepare-client.sh`; a one-line patch exposing
-  the engine instance on `window.__xash` so the picker can call `rcon changelevel`.
+  the engine instance on `window.__xash` so the picker has a direct-rcon fallback.
+- **`control/`** — a tiny stdlib-only Python service (`control/server.py`,
+  `python:alpine`) that is the single authority for map switching. It serves
+  `GET /api/state` (current map + in-flight switch) and `POST /api/map` (deduped by
+  idempotency key), speaks GoldSrc RCON over UDP to run `changelevel`, and confirms the
+  result by polling the live server with A2S_INFO. No third-party packages.
 - **`proxy/nginx.conf`** — a small nginx reverse-proxy sidecar (added in `docker-compose.yml`)
-  that owns the public port `27016` and forwards to the game container internally. It injects
-  the HTTP caching headers the in-image server can't — `immutable` for the content-hashed
-  bundle/WASM, `no-cache` (store + revalidate) for `valve.zip` so a rebuild is picked up at
-  once — so repeat visits don't re-download the payload. It passes the same-origin
+  that owns the public port `27016` and forwards to the game container internally. It
+  injects the HTTP caching headers the in-image server can't — `immutable` for the
+  content-hashed bundle/WASM and a **content-hash ETag** for `valve.zip`
+  (`proxy/valve-etag.conf`, regenerated from the zip's bytes): an unchanged zip yields a
+  cheap `304`, a rebuilt zip gets a new ETag and a fresh `200` even if its mtime didn't
+  change. It also routes same-origin `/api/` calls to the control service and passes the
   `/websocket` signaling upgrade through; WebRTC media on `27018` stays direct, untouched.
+- **`lib/fingerprint.sh`** — shared helper used by `start.sh` and `add-maps.sh` to hash
+  `valve.zip` and refresh both fingerprint files (the nginx ETag and the SW version map).
 
 The upstream bundle's filename is content-hashed inside the image, so the image is
 **pinned by digest** in `docker-compose.yml`. If you bump the image, re-run
@@ -154,7 +176,9 @@ cd hlds && zip -r ../valve.zip valve cstrike \
 
 (app 90 is flaky — rerun until it reports success. Do **not** exclude `.lst` files —
 the engine crashes on startup without `cstrike/delta.lst`.) After rebuilding, run
-`./add-maps.sh` again to re-add the custom maps.
+`./add-maps.sh` again to re-add the custom maps. Both scripts then recompute the
+`valve.zip` content fingerprint automatically, so the nginx ETag and `sw.js` URL
+version invalidate every old browser cache without any manual step.
 
 > Note: `start.sh` additionally trims Half-Life single-player maps, intro media and HL-only
 > sounds that CS 1.6 never loads (~400 MB → ~210 MB). The manual command above keeps the full
@@ -163,13 +187,18 @@ the engine crashes on startup without `cstrike/delta.lst`.) After rebuilding, ru
 ## Project layout
 
 ```
-docker-compose.yml     # game service + nginx proxy (image pinned by digest) + volume mounts
-start.sh / stop.sh     # launch / stop; start.sh bootstraps client + custom maps
+docker-compose.yml     # game + control + nginx services (image pinned by digest) + mounts
+start.sh / stop.sh     # launch / stop; start.sh bootstraps client, maps, fingerprints
 prepare-client.sh      # regenerate the patched web/main.js from the pinned image
-add-maps.sh            # download custom maps into valve.zip + custom-maps/
-proxy/nginx.conf       # caching reverse-proxy (owns :27016, /websocket passthrough)
+add-maps.sh            # inject custom maps into valve.zip + refresh its fingerprint
+control/               # map-switch control service (Python stdlib): /api/state, /api/map
+lib/fingerprint.sh     # hashes valve.zip -> nginx ETag conf + sw.js version map
+proxy/nginx.conf       # caching reverse-proxy (owns :27016, /api + /websocket passthrough)
+proxy/valve-etag.conf  # generated: $valve_etag content hash consumed by nginx
+proxy/valve-versions.json # generated: ?v= hash map consumed by web/sw.js
 cstrike/server.cfg     # full-money arsenal + RCON password for the map picker
 web/index.html         # patched client page: join UI + loading + map picker + Esc handling
+web/sw.js              # service worker: content-versions the /valve.zip request URL
 web/main.js            # generated, gitignored (run prepare-client.sh)
 custom-maps/*.bsp      # bundled custom maps, committed (mounted into the server)
 valve.zip              # game content, gitignored (rebuild via SteamCMD)

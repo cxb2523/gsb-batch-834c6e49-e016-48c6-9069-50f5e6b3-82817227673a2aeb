@@ -64,6 +64,35 @@ Wi-Fi) + one-time `valve.zip` build (~21 s). Warm restarts reach ready in **~1.7
 
 Remaining (upstream-only): worker decompress, IDBFS unpacked-FS cache, lazy per-map loading, native arm64.
 
+---
+
+## Follow-up — reliable map switching + content-fingerprint caching (2026-11-21)
+
+Two production pain points on the LAN build, both fixed in repo code:
+
+1. **A picker click was fire-and-forget.** It ran `rcon changelevel` in-browser and
+   reset the UI on a hard 4 s timer without checking the server, so other players
+   stayed on the old map or hit a black screen and only a manual refresh recovered.
+   Now a tiny stdlib-Python **control service** (`control/server.py`, added to
+   `docker-compose.yml`) owns same-origin `GET /api/state` and `POST /api/map`
+   (proxied by nginx). Each request carries a unique sequence + idempotency key; the
+   service sends one RCON `changelevel`, then polls the live server (GoldSrc A2S_INFO
+   over UDP) until the map really changes. The picker stays in "switching" until that
+   confirmation, re-enables with an error on timeout/failure, and every connected
+   page polls `/api/state` so highlight + buttons reconcile together. One in-flight
+   request is guaranteed both in the page and server-side; Esc/repeat clicks can't
+   start a second `changelevel`. A direct in-engine RCON path remains as a fallback.
+2. **`valve.zip` caching depended on `Last-Modified`.** A rebuild within the same
+   timestamp could still answer 304 and keep serving the old zip. Caching now follows
+   the content: `lib/fingerprint.sh` (run by `start.sh` and `add-maps.sh`) hashes the
+   zip's bytes into an nginx **ETag** (`proxy/valve-etag.conf`) plus a `?v=<sha256>`
+   map (`proxy/valve-versions.json`) applied by `web/sw.js`. Unchanged zip → matching
+   ETag → cheap 304; rebuilt zip → new hash → fresh 200 regardless of mtime.
+
+Contract for the picker ↔ control API is covered by `tmp-tests/` (node, no deps):
+sequence/idempotency, 409 single-flight, confirmed-state reconciliation, failure
+unlock + retry, and the ETag/304 decision table.
+
 ### P3 detail — the critical path
 The signaling WebSocket is **same-origin** on 27016 (`new WebSocket(.../websocket)`); the proxy MUST
 pass the WS upgrade through or the game never connects. 27018 (WebRTC media, TCP/UDP) is separate —

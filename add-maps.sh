@@ -13,6 +13,10 @@
 set -e
 cd "$(dirname "$0")"
 
+# Refresh valve.zip's content fingerprint (nginx ETag + sw.js ?v= hash) after
+# any map injection, so browsers fetch the new zip instead of a stale 304.
+. ./lib/fingerprint.sh
+
 if [ ! -f valve.zip ]; then echo "valve.zip missing — build it first (see README)."; exit 1; fi
 mkdir -p custom-maps
 
@@ -47,5 +51,12 @@ add_map () {
 
 # Bundled in ./custom-maps/. URL is only a fallback if the .bsp is ever missing.
 add_map cs_mansion "https://ds-servers.com/maps/goldsrc/cstrike/cs_mansion.zip"
+
+# Any injection above changed valve.zip's bytes — recompute the hash so the
+# proxy's ETag and the service worker's ?v= parameter point at the new content.
+update_valve_fingerprint
+if [ "${FINGERPRINT_CHANGED:-0}" = 1 ]; then
+  echo "valve.zip fingerprint changed — recreate the proxy to serve the new ETag: ./start.sh"
+fi
 
 echo "Done. Restart the server to pick up new server-side maps: ./start.sh"

@@ -5,6 +5,9 @@
 set -e
 cd "$(dirname "$0")"
 
+# Content-fingerprint helpers for valve.zip (ETag / ?v= hash refresh).
+. ./lib/fingerprint.sh
+
 # --- portable helpers (macOS + Linux + WSL) ---
 
 # Print this host's LAN IP. Tries macOS, then Linux (default-route src), then
@@ -98,6 +101,13 @@ if [ -f valve.zip ] && ! unzip -l valve.zip "cstrike/maps/cs_mansion.bsp" >/dev/
   CHANGED=1
 fi
 
+# Refresh valve.zip's content fingerprint (nginx ETag + sw.js ?v= hash) whenever
+# the zip's bytes differ from what the proxy currently holds. A rebuild with the
+# same mtime still changes the hash, so stale browser caches cannot survive it;
+# when nothing changed the hash is identical and repeat visits keep using 304.
+update_valve_fingerprint
+[ "${FINGERPRINT_CHANGED:-0}" = 1 ] && CHANGED=1
+
 IP=$(detect_ip)
 if [ -z "$IP" ]; then
   echo "Could not detect LAN IP — is this machine connected to a network?"
@@ -116,10 +126,20 @@ if ! grep -qE "^[[:space:]]*IP:[[:space:]]*$IP([[:space:]]|\$)" docker-compose.y
   CHANGED=1
 fi
 
+# Build the control-service image (a tiny stdlib-Python image, cached after the
+# first run) so `up` never has to pull/build inline and a broken Dockerfile fails
+# here with a clear message instead of leaving the stack half-up. Compose names
+# the built image <project>-control (the project is `cs16-web` per compose.yml).
+# `up --build` rebuilds only on Dockerfile/context changes and never forces a
+# recreate by itself, so warm starts stay fast no-ops.
+if ! docker compose build control; then
+  echo "✗ failed to build the map-switch control service."; exit 1
+fi
+
 # Recreate containers only when something actually changed (rebuilt assets,
-# regenerated client, added maps, or a new IP); a plain `up -d` is a fast no-op
-# otherwise. Don't swallow output, so a real failure is visible.
-if ! docker compose up -d ${CHANGED:+--force-recreate}; then
+# regenerated client, added maps, new fingerprint, or a new IP); a plain
+# `up -d` is a fast no-op otherwise. Don't swallow output, so failures show.
+if ! docker compose up -d --build ${CHANGED:+--force-recreate}; then
   echo "✗ docker compose up failed."; exit 1
 fi
 
@@ -150,6 +170,14 @@ if command -v curl >/dev/null 2>&1; then
   until curl -fsS -o /dev/null "http://127.0.0.1:27016/"; do
     if [ "$SECONDS" -ge "$pdeadline" ]; then
       echo "✗ proxy is not answering on 27016 — recent logs:"; docker logs --tail 30 cs16-proxy 2>&1; exit 1
+    fi
+    sleep 1
+  done
+  # And the same-origin map API behind it: the picker depends on /api/state.
+  cdeadline=$((SECONDS + 30))
+  until curl -fsS -o /dev/null "http://127.0.0.1:27016/api/state"; do
+    if [ "$SECONDS" -ge "$cdeadline" ]; then
+      echo "✗ map control API is not answering — recent logs:"; docker logs --tail 30 cs16-control 2>&1; exit 1
     fi
     sleep 1
   done
