@@ -167,6 +167,10 @@ export default await defineWorklet({
     toValue: 0,
     previewValue: 0,
     times: 0,
+    // Кривая и длительность, под которые посчитан текущий прогресс times.
+    // Смена любого из них на лету пересобирает переход, сохраняя уже выданное значение.
+    type: 'linear' as FunctionType,
+    frames: 1000,
   },
   options: {
     numberOfInputs: 0,
@@ -180,19 +184,44 @@ export default await defineWorklet({
       var count = this.param('frames', i);
       var func = functions[props.type];
 
+      // Длительность без перехода или неизвестная кривая — чистый直通,
+      // состояние сбрасываем, чтобы следующий валидный переход стартовал корректно.
       if (count <= 1 || !func) {
         ctx.fromValue = value;
         ctx.toValue = value;
         ctx.previewValue = value;
         ctx.times = 0;
+        ctx.type = props.type;
+        ctx.frames = count;
         outL[i] = value;
         continue;
       }
 
+      // Новая целевая величина: стартуем от последнего реально выданного значения
+      // и заново отсчитываем время перехода.
       if (ctx.toValue !== value) {
         ctx.fromValue = ctx.previewValue;
         ctx.toValue = value;
         ctx.times = 0;
+        ctx.frames = count;
+      }
+
+      // Смена кривой на лету: текущий выход становится стартовой точкой,
+      // прогресс под новую кривую начинается с нуля — без отката к старому from.
+      if (ctx.type !== props.type) {
+        ctx.fromValue = ctx.previewValue;
+        ctx.times = 0;
+        ctx.type = props.type;
+        ctx.frames = count;
+      }
+
+      // Смена длительности на лету: доля уже пройденного пути сохраняется,
+      // оставшаяся часть доцеливается за новое количество кадров.
+      if (ctx.frames !== count) {
+        var progress = ctx.frames > 0 ? ctx.times / ctx.frames : 0;
+        if (progress > 1) progress = 1;
+        ctx.times = progress * count;
+        ctx.frames = count;
       }
 
       if (ctx.times < count) {
