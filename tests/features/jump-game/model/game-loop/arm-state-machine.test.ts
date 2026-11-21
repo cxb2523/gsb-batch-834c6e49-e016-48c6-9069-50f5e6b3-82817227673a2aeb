@@ -83,4 +83,56 @@ describe('getArmPhaseView', () => {
 
     expect(droppedFrameArm.width).toBeGreaterThan(baselineArm.width);
   });
+
+  it('never starts a new attack from idle while the clear request is active', () => {
+    const chargedArm: ArmState = {
+      ...baseArmState,
+      phase: 'idle',
+      groundChargeStartMs: 0,
+      lastPulseMs: 0,
+      nextAttackAllowedMs: 0,
+    };
+
+    // Enough consecutive grounded frames to pass the full attack charge window.
+    for (let frame = 0; frame < 120; frame += 1) {
+      advanceArmStateMachine({
+        arm: chargedArm,
+        nowMs: 1_000 + frame * 16,
+        deltaTimeMs: 16,
+        targetLen: 120,
+        clearRequested: true,
+        waitAtGround: true,
+        config: getArmFrameConfig(false),
+        isMobileViewport: false,
+      });
+    }
+
+    expect(chargedArm.phase).toBe('idle');
+    expect(chargedArm.width).toBe(0);
+    expect(chargedArm.groundChargeStartMs).toBe(0);
+  });
+
+  it('lets an in-flight attack finish naturally when the clear request arrives mid-cycle', () => {
+    const arm: ArmState = {
+      ...baseArmState,
+      phase: 'extending',
+      targetLen: 120,
+      phaseStartMs: 900,
+    };
+
+    advanceArmStateMachine({
+      arm,
+      nowMs: 1_000,
+      deltaTimeMs: 16,
+      targetLen: 120,
+      clearRequested: true,
+      waitAtGround: false,
+      config: getArmFrameConfig(false),
+      isMobileViewport: false,
+    });
+
+    // The current extension keeps progressing instead of being force-cancelled.
+    expect(arm.phase).toBe('extending');
+    expect(arm.width).toBeGreaterThan(0);
+  });
 });

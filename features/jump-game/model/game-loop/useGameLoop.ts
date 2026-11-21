@@ -69,8 +69,14 @@ type UseGameLoopParams = {
   bossArmRef: RefObject<HTMLDivElement | null>;
   /** Current boss visibility flag from scene state. */
   showBoss: boolean;
+  /** Shared flag flipped to true as soon as the clear request takes effect. */
+  clearRequestedRef?: MutableRefObject<boolean>;
+  /** Shared flag tracking whether the pattern-2 obstacle window is active. */
+  bossPatternTwoActiveRef?: MutableRefObject<boolean>;
   /** Emits whether special pattern-2 attack window is active. */
   onBossPatternTwoActiveChange?: (value: boolean) => void;
+  /** Called once when the run settles (clear success or fault) before game-over flips. */
+  onRunSettled?: () => void;
   /** Called when fish obstacle collides with player. */
   onFishCollected?: () => void;
   /** Updates game-over state. */
@@ -100,7 +106,10 @@ type UseGameLoopParams = {
  * @param params.gameRef - Game viewport element reference.
  * @param params.bossArmRef - Boss arm element reference.
  * @param params.showBoss - Current boss visibility state.
+ * @param params.clearRequestedRef - Optional shared clear-request flag shared with spawn schedulers.
+ * @param params.bossPatternTwoActiveRef - Optional shared pattern-2 window flag shared with schedulers.
  * @param params.onBossPatternTwoActiveChange - Callback for pattern-2 window changes.
+ * @param params.onRunSettled - Optional callback fired once when the run settles (clear or fault).
  * @param params.onFishCollected - Callback for fish pickup collisions.
  * @param params.setGameOver - Setter for game-over state.
  * @param params.setTitle - Setter for top-level game title text.
@@ -120,7 +129,10 @@ export function useGameLoop({
   startTimeRef,
   gameOver,
   showBoss,
+  clearRequestedRef: clearRequestedRefProp,
+  bossPatternTwoActiveRef: bossPatternTwoActiveRefProp,
   onBossPatternTwoActiveChange,
+  onRunSettled,
   onFishCollected,
   setGameOver,
   setTitle,
@@ -139,9 +151,11 @@ export function useGameLoop({
   const requestedBossSpriteRef = useRef<string>(BOSS_BASE_SPRITES[0]);
   const currentBossSpriteRef = useRef<string | null>(null);
   const bossSpriteHostRef = useRef<HTMLImageElement | null>(null);
-  const bossPatternTwoActiveRef = useRef(false);
-  const clearRequestedRef = useRef(false);
+  const internalBossPatternTwoActiveRef = useRef(false);
+  const internalClearRequestedRef = useRef(false);
   const lastFrameAtMsRef = useRef<number | null>(null);
+  const bossPatternTwoActiveRef = bossPatternTwoActiveRefProp ?? internalBossPatternTwoActiveRef;
+  const clearRequestedRef = clearRequestedRefProp ?? internalClearRequestedRef;
   showBossRef.current = showBoss;
 
   const setBossSprite = (spritePath: string) => {
@@ -217,17 +231,31 @@ export function useGameLoop({
     });
   };
 
-  const triggerFault = (icon: string | null) => {
+  /**
+   * Shared end-of-run teardown used by both the fault and clear-success paths.
+   *
+   * Clears every active moving entity, closes the pattern-2 spawn window, returns
+   * the arm finite-state machine to its idle baseline and normalizes boss DOM so
+   * no attack pose, timing marker or removed-entity reference survives the run.
+   */
+  const settleRun = () => {
     clearMovingEntities(obstaclesRef);
-    hidePlayer();
     syncBossPatternTwoActive(false);
+    resetArmCoreState();
+    resetArmPulseState();
+    resetBossDom();
+    onRunSettled?.();
+  };
+
+  const triggerFault = (icon: string | null) => {
+    settleRun();
+    hidePlayer();
     setTitle('');
     setGameOverIcon(icon);
     setGameOver(true);
   };
   const triggerClearSuccess = () => {
-    clearMovingEntities(obstaclesRef);
-    syncBossPatternTwoActive(false);
+    settleRun();
     setTitle('');
     setGameOverIcon(BOSS_CLEAR_ICON);
     setGameOver(true);

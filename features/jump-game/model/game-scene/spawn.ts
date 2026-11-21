@@ -20,6 +20,10 @@ type UseObstacleSpawnSchedulerParams = {
   showBoss: boolean;
   /** True while pattern-2 boss attack is active. */
   bossPatternTwoActive: boolean;
+  /** Shared pattern-2 window flag driven by the arm state machine on the rAF time base. */
+  bossPatternTwoActiveRef: MutableRefObject<boolean>;
+  /** Shared clear-request flag that suppresses all spawning once the clear flow starts. */
+  clearRequestedRef: MutableRefObject<boolean>;
   /** Baseline obstacle spawn interval in milliseconds. */
   obstacleSpawnInterval: number;
   /** Spawn probability used during normal mode ticks. */
@@ -39,6 +43,8 @@ type UseObstacleSpawnSchedulerParams = {
  * @param params.gameOver - Stops scheduling when true.
  * @param params.showBoss - Indicates boss-mode rendering state.
  * @param params.bossPatternTwoActive - Indicates pattern-2 attack window state.
+ * @param params.bossPatternTwoActiveRef - Shared arm-FSM-driven pattern-2 window flag.
+ * @param params.clearRequestedRef - Shared clear-request flag suppressing all spawns.
  * @param params.obstacleSpawnInterval - Base obstacle spawn tick interval.
  * @param params.normalSpawnRate - Probability threshold for normal obstacle spawns.
  * @param params.lastObstacleSpawnAtMsRef - Mutable timestamp of last obstacle spawn.
@@ -50,6 +56,8 @@ export const useObstacleSpawnScheduler = ({
   gameOver,
   showBoss,
   bossPatternTwoActive,
+  bossPatternTwoActiveRef,
+  clearRequestedRef,
   obstacleSpawnInterval,
   normalSpawnRate,
   lastObstacleSpawnAtMsRef,
@@ -78,8 +86,12 @@ export const useObstacleSpawnScheduler = ({
     };
 
     const intervalId = window.setInterval(() => {
+      // The clear request and pattern-2 window are owned by the game loop and read
+      // synchronously here so a pending React state update can never leak a spawn.
+      if (clearRequestedRef.current) return;
+
       if (showBoss) {
-        if (bossPatternTwoActive && Math.random() < BOSS_PATTERN_TWO_OBSTACLE_RATE) {
+        if (bossPatternTwoActiveRef.current && Math.random() < BOSS_PATTERN_TWO_OBSTACLE_RATE) {
           spawnObstacleWithTimingGuard({
             allowedIconIndices: [...BOSS_PATTERN_TWO_ALLOWED_OBSTACLE_INDICES],
           });
@@ -97,6 +109,8 @@ export const useObstacleSpawnScheduler = ({
     gameOver,
     showBoss,
     bossPatternTwoActive,
+    bossPatternTwoActiveRef,
+    clearRequestedRef,
     obstacleSpawnInterval,
     normalSpawnRate,
     lastObstacleSpawnAtMsRef,
@@ -108,6 +122,8 @@ export const useObstacleSpawnScheduler = ({
 type UseFishSpawnSchedulerParams = {
   /** True when gameplay has ended and scheduler should stop. */
   gameOver: boolean;
+  /** Shared clear-request flag that suppresses all fish spawning once clear starts. */
+  clearRequestedRef: MutableRefObject<boolean>;
   /** Match start timestamp shared by scene state. */
   startTimeRef: MutableRefObject<number | null>;
   /** Total number of fish to spawn in this run. */
@@ -129,6 +145,7 @@ type UseFishSpawnSchedulerParams = {
  *
  * @param params - Fish spawn scheduler inputs.
  * @param params.gameOver - Stops scheduling when true.
+ * @param params.clearRequestedRef - Shared clear-request flag suppressing all fish spawns.
  * @param params.startTimeRef - Match start timestamp reference.
  * @param params.fishSpawnTargetRef - Total fish spawn target reference.
  * @param params.fishSpawnedRef - Spawned fish count reference.
@@ -140,6 +157,7 @@ type UseFishSpawnSchedulerParams = {
  */
 export const useFishSpawnScheduler = ({
   gameOver,
+  clearRequestedRef,
   startTimeRef,
   fishSpawnTargetRef,
   fishSpawnedRef,
@@ -157,6 +175,9 @@ export const useFishSpawnScheduler = ({
     };
 
     const runSpawnTick = () => {
+      // Synchronous read of the game-loop-owned flag: no fish may be queued while
+      // the clear flow is waiting for the boss arm attack to finish.
+      if (clearRequestedRef.current) return;
       if (!startTimeRef.current) {
         scheduleNextTick(FISH_SPAWN_TICK_MS);
         return;
@@ -219,6 +240,7 @@ export const useFishSpawnScheduler = ({
     };
   }, [
     gameOver,
+    clearRequestedRef,
     spawnFish,
     fishSpawnTargetRef,
     fishSpawnedRef,

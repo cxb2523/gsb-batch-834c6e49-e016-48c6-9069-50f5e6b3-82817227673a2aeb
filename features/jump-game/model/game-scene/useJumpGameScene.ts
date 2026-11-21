@@ -68,6 +68,10 @@ export function useJumpGameScene({
   const lastObstacleSpawnAtMsRef = useRef(0);
   const lastFishSpawnAtMsRef = useRef(0);
   const hasPlayedFaultSoundRef = useRef(false);
+  // Shared between the game loop (sole writer) and the spawn schedulers (readers)
+  // so gating decisions use the exact same time base as the arm state machine.
+  const clearRequestedRef = useRef(false);
+  const bossPatternTwoActiveRef = useRef(false);
 
   const obstacleSpawnInterval = isMobileViewport
     ? MOBILE_OBSTACLE_SPAWN_INTERVAL
@@ -103,6 +107,20 @@ export function useJumpGameScene({
     lastFishSpawnAtMsRef.current = 0;
   }, []);
 
+  /**
+   * Resets cross-entity timing baselines the moment a run settles.
+   *
+   * Both the clear and fault paths call this through the game loop so the
+   * obstacle/fish separation guards can never reuse timestamps left over from
+   * the previous run. Fish plan counters are deliberately kept here and only
+   * re-rolled on restart so the clear-sequence fish count stays intact.
+   */
+  const handleRunSettled = useCallback(() => {
+    nextFishSpawnAtMsRef.current = 0;
+    lastObstacleSpawnAtMsRef.current = 0;
+    lastFishSpawnAtMsRef.current = 0;
+  }, []);
+
   useGameLoop({
     gameOver,
     bossRef,
@@ -113,7 +131,10 @@ export function useJumpGameScene({
     bossArmRef,
     bossSpriteRef,
     showBoss,
+    clearRequestedRef,
+    bossPatternTwoActiveRef,
     onBossPatternTwoActiveChange: setBossPatternTwoActive,
+    onRunSettled: handleRunSettled,
     onFishCollected: handleFishCollected,
     setGameOver,
     setTitle: (value: string) => setTitle(value),
@@ -147,6 +168,11 @@ export function useJumpGameScene({
 
     startTimeRef.current = null;
     resetJumpState();
+
+    // Clear every shared flow flag before flipping gameOver so no scheduler or
+    // state-machine branch can observe the previous run's attack/clear window.
+    clearRequestedRef.current = false;
+    bossPatternTwoActiveRef.current = false;
 
     setGameOver(false);
     setShowBoss(false);
@@ -217,6 +243,8 @@ export function useJumpGameScene({
     gameOver,
     showBoss,
     bossPatternTwoActive,
+    bossPatternTwoActiveRef,
+    clearRequestedRef,
     obstacleSpawnInterval,
     normalSpawnRate,
     lastObstacleSpawnAtMsRef,
@@ -225,6 +253,7 @@ export function useJumpGameScene({
   });
   useFishSpawnScheduler({
     gameOver,
+    clearRequestedRef,
     startTimeRef,
     fishSpawnTargetRef,
     fishSpawnedRef,
