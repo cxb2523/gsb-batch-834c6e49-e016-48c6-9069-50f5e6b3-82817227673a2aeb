@@ -1,20 +1,21 @@
 <script setup lang="ts">
+import type { Chapter, Track, VideoSource } from '@vue-player/core'
+import { isPiPSupported } from '@vue-player/core'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import type { Chapter, ThumbnailCue, Track, VideoSource } from '@vue-player/core'
-import { isPiPSupported, parseThumbnailVtt } from '@vue-player/core'
 import { usePlayer } from '../../composables/usePlayer'
-import IcoPlay from '../icons/IcoPlay.vue'
-import IcoPause from '../icons/IcoPause.vue'
-import VpPlayButton from '../controls/VpPlayButton.vue'
-import VpTimeline from '../controls/VpTimeline.vue'
-import VpTimeDisplay from '../controls/VpTimeDisplay.vue'
-import VpVolumeControl from '../controls/VpVolumeControl.vue'
-import VpSubtitlesButton from '../controls/VpSubtitlesButton.vue'
-import VpPiPButton from '../controls/VpPiPButton.vue'
+import { useThumbnails } from '../../composables/useThumbnails'
 import VpFullscreenButton from '../controls/VpFullscreenButton.vue'
+import VpPiPButton from '../controls/VpPiPButton.vue'
+import VpPlayButton from '../controls/VpPlayButton.vue'
 import VpSettingsButton from '../controls/VpSettingsButton.vue'
-import VpLoadingOverlay from '../overlays/VpLoadingOverlay.vue'
+import VpSubtitlesButton from '../controls/VpSubtitlesButton.vue'
+import VpTimeDisplay from '../controls/VpTimeDisplay.vue'
+import VpTimeline from '../controls/VpTimeline.vue'
+import VpVolumeControl from '../controls/VpVolumeControl.vue'
+import IcoPause from '../icons/IcoPause.vue'
+import IcoPlay from '../icons/IcoPlay.vue'
 import VpErrorOverlay from '../overlays/VpErrorOverlay.vue'
+import VpLoadingOverlay from '../overlays/VpLoadingOverlay.vue'
 
 interface Props {
   src?: string
@@ -112,9 +113,24 @@ watch(
 
 onBeforeUnmount(() => videoRef.value?.removeEventListener('timeupdate', syncSubtitles))
 
+// ─── Thumbnails ───
+// Cancellable per-generation resolution: the composable watches both the
+// thumbnails address and the source, so switching either one aborts the
+// previous fetch and clears stale cues before the new resolution completes.
+const { thumbnailCues } = useThumbnails(
+  () => props.thumbnails,
+  () => props.src ?? '',
+)
+
+// A source switch is atomic: usePlayer resets currentTrack/qualities/loading,
+// and here we drop the previous source's rendered subtitle cues before the
+// new source resolves. The new source's default track is re-applied by the
+// isLoading watcher once metadata is ready. Thumbnail reset is handled inside
+// useThumbnails via its source watcher.
 watch(
   () => props.src,
   (src) => {
+    currentCues.value = []
     if (src) loadSource(src)
   },
 )
@@ -154,17 +170,6 @@ watch(
   (v) => {
     if (v) emit('error', v)
   },
-)
-
-// ─── Thumbnails ───
-const thumbnailCues = ref<ThumbnailCue[]>([])
-
-watch(
-  () => props.thumbnails,
-  async (url) => {
-    thumbnailCues.value = url ? await parseThumbnailVtt(url) : []
-  },
-  { immediate: true },
 )
 
 // ─── Controls visibility ───

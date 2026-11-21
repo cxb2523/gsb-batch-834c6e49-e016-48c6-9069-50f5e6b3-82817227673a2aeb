@@ -1,5 +1,5 @@
-import { parseTimecode } from './time'
 import type { ThumbnailCue } from '../types/thumbnail'
+import { parseTimecode } from './time'
 
 function resolveUrl(base: string, url: string): string {
   try {
@@ -9,13 +9,22 @@ function resolveUrl(base: string, url: string): string {
   }
 }
 
-export async function parseThumbnailVtt(url: string): Promise<ThumbnailCue[]> {
+export async function parseThumbnailVtt(
+  url: string,
+  signal?: AbortSignal,
+): Promise<ThumbnailCue[]> {
+  if (signal?.aborted) throw new DOMException('Thumbnail request aborted.', 'AbortError')
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, signal ? { signal } : undefined)
     if (!res.ok) return []
     const text = await res.text()
+    if (signal?.aborted) throw new DOMException('Thumbnail request aborted.', 'AbortError')
     return parseVttText(text, url)
-  } catch {
+  } catch (error) {
+    // An aborted request must never resolve into an (empty) result — the newer
+    // generation owns the state now. Re-throw so callers can distinguish
+    // cancellation from a genuine parse failure.
+    if (signal?.aborted || (error as DOMException)?.name === 'AbortError') throw error
     return []
   }
 }
@@ -39,7 +48,10 @@ export function parseVttText(text: string, baseUrl = ''): ThumbnailCue[] {
     // Parse "HH:MM:SS.mmm --> HH:MM:SS.mmm" — ignore position settings after the second timestamp
     const arrowIdx = line.indexOf('-->')
     const start = parseTimecode(line.slice(0, arrowIdx).trim())
-    const endPart = line.slice(arrowIdx + 3).trim().split(/\s/)[0]
+    const endPart = line
+      .slice(arrowIdx + 3)
+      .trim()
+      .split(/\s/)[0]
     const end = parseTimecode(endPart)
 
     i++

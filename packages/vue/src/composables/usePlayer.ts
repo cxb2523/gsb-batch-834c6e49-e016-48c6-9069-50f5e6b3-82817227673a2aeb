@@ -1,4 +1,4 @@
-import { onMounted, onUnmounted, reactive, readonly } from 'vue'
+import type { PlayerError, PlayerState, Track } from '@vue-player/core'
 import type { Ref } from 'vue'
 import {
   createNativeAdapter,
@@ -7,7 +7,7 @@ import {
   exitFullscreen,
   getFullscreenElement,
 } from '@vue-player/core'
-import type { PlayerState, PlayerError, Track } from '@vue-player/core'
+import { onMounted, onUnmounted, reactive, readonly } from 'vue'
 
 export interface PlayerControls {
   play: () => Promise<void>
@@ -61,6 +61,10 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let hlsInstance: any = null
   let lastSrc = ''
+  // Monotonic token identifying the latest loadSource() call. Every async
+  // continuation (dynamic import, manifest/error callbacks, native load) must
+  // capture it and bail out once a newer generation has taken over.
+  let loadGeneration = 0
 
   function clearVideo() {
     const video = videoRef.value
@@ -98,6 +102,10 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     const video = videoRef.value
     if (!video) return
 
+    // Begin a new generation: tear down anything created by the previous one
+    // (instances plus the media element's src) before a single field of state
+    // is touched.
+    const generation = ++loadGeneration
     lastSrc = src
     destroyAdapters()
 
@@ -109,6 +117,10 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     state.isLive = false
     state.availableQualities = []
     state.currentQuality = 'auto'
+    // Subtitles belong to the previous source — reset so no stale currentTrack
+    // survives the switch. The default track of the new source is re-applied
+    // once its metadata becomes ready.
+    state.currentTrack = null
 
     const type = detectSourceType(src)
 
@@ -116,15 +128,33 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
       try {
         const { default: Hls } = await import('hls.js')
 
+        // A newer loadSource() may have started while the dynamic import was
+        // in flight. Its destroyAdapters() could not see this instance, so we
+        // must not create or register it — drop the whole continuation.
+        if (generation !== loadGeneration) return
+
         if (!Hls.isSupported()) {
-          // Safari — native HLS support
+          // Safari — native HLS support. Guard one more time since the
+          // awaited import could have resolved after a newer switch.
+          if (generation !== loadGeneration) return
           video.src = src
           return
         }
 
         const hls = new Hls({ enableWorker: true })
+        let destroyed = false
+        const destroyHls = () => {
+          if (destroyed) return
+          destroyed = true
+          hls.destroy()
+          if (hlsInstance === hls) hlsInstance = null
+        }
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (generation !== loadGeneration) {
+            destroyHls()
+            return
+          }
           const seen = new Set<number>()
           state.availableQualities = (hls.levels as any[])
             .map((level, i) => ({
@@ -142,6 +172,7 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
         })
 
         hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+          if (generation !== loadGeneration) return
           // Only update displayed quality when ABR switches automatically
           if (state.currentQuality === 'auto') return
           const level = (hls.levels as any[])[data.level]
@@ -153,6 +184,12 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
 
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (!data.fatal) return
+          // A fatal error from an abandoned stream must never surface on the
+          // current source, nor clobber its loading state.
+          if (generation !== loadGeneration) {
+            destroyHls()
+            return
+          }
           const code = (data as any).response?.code ?? 0
           const isNotFound = code === 404
           state.error = {
@@ -164,18 +201,33 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
           }
           state.isLoading = false
           state.isBuffering = false
-          hls.destroy()
+          destroyHls()
         })
+
+        // Guard one last time against a switch that happened between the
+        // post-import check and instance construction.
+        if (generation !== loadGeneration) {
+          hls.destroy()
+          return
+        }
 
         hls.loadSource(src)
         hls.attachMedia(video)
         hlsInstance = hls
       } catch {
+        if (generation !== loadGeneration) return
         state.error = { code: 0, message: 'Failed to initialize HLS player.', type: 'source' }
         state.isLoading = false
       }
     } else {
-      nativeAdapter = createNativeAdapter(video)
+      // Registering the adapter before load() keeps the ownership chain
+      // intact: a synchronous follow-up switch destroys it immediately.
+      const adapter = createNativeAdapter(video)
+      if (generation !== loadGeneration) {
+        adapter.destroy()
+        return
+      }
+      nativeAdapter = adapter
       nativeAdapter.load(src)
     }
   }
@@ -188,6 +240,7 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
     const track = state.currentTrack
     Array.from(video.querySelectorAll<HTMLTrackElement>('track')).forEach((el) => {
       const t = el.track
+      if (!t) return
       const isActive = track !== null && t.language === track.language && t.label === track.label
       t.mode = isActive ? 'hidden' : 'disabled'
     })
@@ -325,6 +378,8 @@ export function usePlayer(videoRef: Ref<HTMLVideoElement | null>) {
   })
 
   onUnmounted(() => {
+    // Invalidates every in-flight generation so late async continuations no-op.
+    loadGeneration++
     destroyAdapters()
     document.removeEventListener('fullscreenchange', onFullscreenChange)
   })

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { Chapter, ThumbnailCue } from '@vue-player/core'
 import { formatTime } from '@vue-player/core'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 const props = defineProps<{
   currentTime: number
@@ -151,10 +151,12 @@ const tooltipChapter = computed(() => {
 
 const showTooltip = computed(() => tooltipRatio.value !== null && props.duration > 0)
 
-// Active thumbnail for the hovered/seeking position
+// Active thumbnail for the hovered/seeking position.
+// While duration is unknown (e.g. mid source switch) or no cues have resolved
+// for the current source, no preview is computed — never from stale cues.
 const activeThumbnail = computed<ThumbnailCue | null>(() => {
   const cues = props.thumbnailCues
-  if (!cues?.length) return null
+  if (!cues?.length || !props.duration) return null
   const t = tooltipRatio.value
   if (t === null) return null
   const time = t * props.duration
@@ -189,11 +191,7 @@ const tooltipStyle = computed(() => {
     :class="{ 'vp-timeline--seeking': isSeeking }"
     @pointerdown="onPointerDown"
   >
-    <div
-      class="vp-timeline-track"
-      @mousemove="onMouseMove"
-      @mouseleave="onMouseLeave"
-    >
+    <div class="vp-timeline-track" @mousemove="onMouseMove" @mouseleave="onMouseLeave">
       <div
         v-for="(seg, i) in segments"
         :key="i"
@@ -201,8 +199,8 @@ const tooltipStyle = computed(() => {
         :class="{ 'vp-timeline-segment--active': i === hoverSegmentIndex }"
         :style="{ flex: seg.end - seg.start }"
       >
-        <div class="vp-timeline-buffered" :style="{ width: segmentBuffered(seg) + '%' }" />
-        <div class="vp-timeline-fill" :style="{ width: segmentFill(seg) + '%' }" />
+        <div class="vp-timeline-buffered" :style="{ width: `${segmentBuffered(seg)}%` }" />
+        <div class="vp-timeline-fill" :style="{ width: `${segmentFill(seg)}%` }" />
       </div>
     </div>
 
