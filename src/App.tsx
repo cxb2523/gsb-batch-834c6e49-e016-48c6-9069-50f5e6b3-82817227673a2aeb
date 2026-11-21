@@ -83,7 +83,7 @@ import {
   setBackgroundPlay,
   getCustomPlaylists,
   fetchUserProgress,
-  savePlaybackProgress,
+  syncPlaybackProgressToCloud,
   getLocalProgress,
   getDismissed,
   fetchDismissed,
@@ -276,6 +276,20 @@ export default function App() {
 
     appStore.setBackgroundPlay(getBackgroundPlay());
   }, [user]);
+
+  // Mirror throttled playback-progress flushes to the cloud. Local
+  // persistence of "yt.progress" is owned by appStore; this keeps
+  // Firestore in sync without writing storage on every timeupdate.
+  useEffect(() => {
+    return appStore.onPlaybackProgressFlush((times, changedIds) => {
+      for (const vid of changedIds) {
+        const sec = times[vid];
+        if (typeof sec === "number" && sec > 0) {
+          syncPlaybackProgressToCloud(vid, sec);
+        }
+      }
+    });
+  }, []);
 
   // Listen for YouTube sync completion events
   useEffect(() => {
@@ -796,7 +810,9 @@ export default function App() {
     if (!miniplayer) return;
     const v = miniplayer.video;
     const id = videoIdFromUrl(v.url);
-    const time = (id ? appStore.getPlaybackTime(id) : 0) || miniplayer.time || 0;
+    // The shared playbackTimes map already holds the miniplayer's current
+    // time for this id, so the watch page resumes from it seamlessly.
+    appStore.flushPlaybackTimes();
     appStore.setMiniplayer(null);
     setRoute({ type: "watch", video: v });
     if (id && id !== urlVideoId) void routerNav({ to: "/watch", search: { v: id } });
@@ -846,6 +862,9 @@ export default function App() {
 
       const id = videoIdFromUrl(v.url);
       if (!id) return;
+
+      // Persist the outgoing video's progress before switching videos
+      appStore.flushPlaybackTimes();
 
       if (!forceWatch && isShortsVideo(v)) {
         const idx = shortsItems.findIndex((s) => videoIdFromUrl(s.url) === id);
@@ -1830,13 +1849,6 @@ export default function App() {
           startTime={miniplayer.time}
           onExpand={expandMiniplayer}
           onClose={closeMiniplayer}
-          onTimeUpdate={(t) => {
-            const id = videoIdFromUrl(miniplayer.video.url);
-            if (id) {
-              appStore.setPlaybackTime(id, t);
-              savePlaybackProgress(id, t);
-            }
-          }}
         />
       )}
 
@@ -1868,9 +1880,10 @@ export default function App() {
             autoplay
             title={activeVideo?.title}
             startTime={appStore.getPlaybackTime(activeVideoId)}
-            onTimeUpdate={(t) => {
-              appStore.setPlaybackTime(activeVideoId, t);
-              savePlaybackProgress(activeVideoId, t);
+            onTimeUpdate={(id, t) => {
+              // The id comes from the player that emitted the event, so a
+              // late update from the previous video lands on its own id.
+              appStore.setPlaybackTime(id, t);
             }}
             onEnded={handleVideoEnded}
           />

@@ -8,7 +8,6 @@ interface Props {
   startTime?: number;
   onExpand: () => void;
   onClose: () => void;
-  onTimeUpdate?: (time: number) => void;
 }
 
 export default function Miniplayer({ video, onExpand, onClose }: Props) {

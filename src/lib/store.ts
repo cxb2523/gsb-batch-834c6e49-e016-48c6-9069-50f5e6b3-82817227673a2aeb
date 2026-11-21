@@ -208,10 +208,18 @@ export function savePlaybackProgress(videoId: string, seconds: number) {
   progress[videoId] = Math.floor(seconds);
   setLocalProgress(progress);
 
+  syncPlaybackProgressToCloud(videoId, seconds);
+}
+
+/**
+ * Cloud-only progress sync. Local persistence of "yt.progress" is owned
+ * by appStore's throttled writer; this mirrors an already-flushed value
+ * to Firestore without touching localStorage.
+ */
+export function syncPlaybackProgressToCloud(videoId: string, seconds: number) {
   const currentUser = auth.currentUser;
   if (!currentUser) return;
 
-  const docPath = `users/${currentUser.uid}/history/${videoId}`;
   try {
     const docRef = doc(db, "users", currentUser.uid, "history", videoId);
     // Use updateDoc to avoid overwriting metadata if it exists, but need to handle case where doc doesn't exist
@@ -242,7 +250,11 @@ export async function fetchUserProgress(): Promise<Record<string, number>> {
       }
     });
     if (Object.keys(remote).length > 0) {
-      const merged = { ...local, ...remote };
+      // Never rewind a resume time: keep the furthest known position per video
+      const merged = { ...local };
+      for (const [vid, sec] of Object.entries(remote)) {
+        merged[vid] = Math.max(merged[vid] || 0, sec);
+      }
       setLocalProgress(merged);
       return merged;
     }

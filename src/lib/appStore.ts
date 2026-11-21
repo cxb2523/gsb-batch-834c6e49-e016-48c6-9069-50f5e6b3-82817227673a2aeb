@@ -110,6 +110,75 @@ function persistAutoplay(enabled: boolean) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Playback progress persistence                                      */
+/* Single writer for the "yt.progress" localStorage key. Writes are   */
+/* throttled so per-timeupdate reports don't hit localStorage each    */
+/* time; flushPlaybackTimes() forces a synchronous write on video     */
+/* switches and page unload so the final position is never lost.      */
+/* ------------------------------------------------------------------ */
+
+const PROGRESS_STORAGE_KEY = "yt.progress";
+const PROGRESS_PERSIST_INTERVAL_MS = 2000;
+
+let progressPersistTimer: ReturnType<typeof setTimeout> | null = null;
+let lastProgressPersistAt = 0;
+let progressDirty = false;
+const dirtyProgressIds = new Set<string>();
+
+export type PlaybackProgressFlushListener = (
+  times: Record<string, number>,
+  changedIds: string[],
+) => void;
+
+const progressFlushListeners = new Set<PlaybackProgressFlushListener>();
+
+function persistPlaybackTimesNow() {
+  if (progressPersistTimer !== null) {
+    clearTimeout(progressPersistTimer);
+    progressPersistTimer = null;
+  }
+  if (!progressDirty) return;
+  progressDirty = false;
+  lastProgressPersistAt = Date.now();
+  const changedIds = Array.from(dirtyProgressIds);
+  dirtyProgressIds.clear();
+  try {
+    localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify(state.playbackTimes));
+  } catch (e) {
+    // Silent fail
+  }
+  for (const listener of progressFlushListeners) {
+    try {
+      listener(state.playbackTimes, changedIds);
+    } catch (e) {
+      // A broken listener must not break persistence
+    }
+  }
+}
+
+function schedulePlaybackTimesPersist() {
+  progressDirty = true;
+  if (progressPersistTimer !== null) return;
+  const elapsed = Date.now() - lastProgressPersistAt;
+  const delay = Math.max(0, PROGRESS_PERSIST_INTERVAL_MS - elapsed);
+  progressPersistTimer = setTimeout(() => {
+    progressPersistTimer = null;
+    persistPlaybackTimesNow();
+  }, delay);
+}
+
+// Flush the final progress snapshot when the page is hidden or unloaded.
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("pagehide", persistPlaybackTimesNow);
+  window.addEventListener("beforeunload", persistPlaybackTimesNow);
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") persistPlaybackTimesNow();
+    });
+  }
+}
+
 export const appStore = {
   getSnapshot(): AppStoreState {
     return state;
@@ -167,20 +236,40 @@ export const appStore = {
 
   setPlaybackTime(id: string, time: number) {
     if (!id) return;
-    const nextTimes = { ...state.playbackTimes, [id]: Math.floor(time) };
+    const t = Math.floor(time);
+    if (!Number.isFinite(t) || t < 0) return;
+    if (state.playbackTimes[id] === t) return;
     state = {
       ...state,
-      playbackTimes: nextTimes,
+      playbackTimes: { ...state.playbackTimes, [id]: t },
     };
-    try {
-      localStorage.setItem("yt.progress", JSON.stringify(nextTimes));
-    } catch (e) {
-      // Silent fail
-    }
+    dirtyProgressIds.add(id);
+    schedulePlaybackTimesPersist();
+    notify();
   },
 
   getPlaybackTime(id: string): number {
     return state.playbackTimes[id] || 0;
+  },
+
+  /**
+   * Synchronously persist any pending playback progress.
+   * Called on video switches, queue advances and page unload so the
+   * last reported position of the outgoing video is never lost.
+   */
+  flushPlaybackTimes() {
+    persistPlaybackTimesNow();
+  },
+
+  /**
+   * Subscribe to throttled progress flushes (used to mirror progress to
+   * the cloud without writing localStorage on every timeupdate).
+   */
+  onPlaybackProgressFlush(listener: PlaybackProgressFlushListener): () => void {
+    progressFlushListeners.add(listener);
+    return () => {
+      progressFlushListeners.delete(listener);
+    };
   },
 
   addToQueue(v: PipedVideo) {
@@ -227,6 +316,8 @@ export const appStore = {
   },
 
   setQueueIndex(index: number) {
+    // Persist the current video's progress before switching videos
+    persistPlaybackTimesNow();
     if (index < 0 || index >= state.queue.length) return;
     state = { ...state, queueIndex: index };
     persistQueue(state.queue, index);
@@ -234,6 +325,9 @@ export const appStore = {
   },
 
   advanceQueue(): PipedVideo | null {
+    // Persist the current video's progress before advancing; never move
+    // past the end of the queue or clear it.
+    persistPlaybackTimesNow();
     if (state.queueIndex + 1 < state.queue.length) {
       const nextIndex = state.queueIndex + 1;
       const nextVideo = state.queue[nextIndex];

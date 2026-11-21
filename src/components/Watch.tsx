@@ -582,12 +582,12 @@ export default function Watch({
       // Shift + N -> Next video
       if (e.shiftKey && (key === "N" || key === "n")) {
         e.preventDefault();
-        const storeState = appStore.getSnapshot();
-        const q = storeState.queue;
-        const qIdx = storeState.queueIndex;
-        if (q && q.length > 0 && qIdx + 1 < q.length) {
-          appStore.advanceQueue();
-          onOpen?.(q[qIdx + 1]);
+        // advanceQueue() persists the current video's progress, then moves
+        // to the next queued video; at the end of the queue it returns null
+        // and leaves the queue untouched.
+        const next = appStore.advanceQueue();
+        if (next) {
+          onOpen?.(next);
         } else {
           const iframe = document.querySelector("#persistent-player iframe") as HTMLIFrameElement;
           iframe?.contentWindow?.postMessage(

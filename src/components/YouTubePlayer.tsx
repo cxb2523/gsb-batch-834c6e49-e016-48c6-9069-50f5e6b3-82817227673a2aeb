@@ -1,5 +1,5 @@
 import { useEffect, useRef, useMemo } from "react";
-import { useAppStore } from "../lib/appStore";
+import { appStore, useAppStore } from "../lib/appStore";
 import { useLanguage } from "../lib/i18n";
 
 interface Props {
@@ -11,8 +11,8 @@ interface Props {
   className?: string;
   title?: string;
   startTime?: number;
-  onTimeUpdate?: (currentTime: number) => void;
-  onEnded?: () => void;
+  onTimeUpdate?: (videoId: string, currentTime: number) => void;
+  onEnded?: (videoId: string) => void;
 }
 
 /**
@@ -45,6 +45,28 @@ export default function YouTubePlayer({
     initialStartTime.current = { id: videoId, time: startTime };
   }
 
+  // After a video switch, the previous iframe can still deliver a few
+  // trailing postMessage events. Ignore progress/ended events during a
+  // short grace window so the old video's state never lands on the new id.
+  const SWITCH_EVENT_GRACE_MS = 1000;
+  const videoSwitchedAtRef = useRef(0);
+  const prevVideoIdRef = useRef(videoId);
+
+  useEffect(() => {
+    if (prevVideoIdRef.current !== videoId) {
+      prevVideoIdRef.current = videoId;
+      videoSwitchedAtRef.current = Date.now();
+    }
+    // Flush the outgoing video's progress before the switch (and on unmount)
+    return () => {
+      appStore.flushPlaybackTimes();
+    };
+  }, [videoId]);
+
+  const isInSwitchGrace = () =>
+    videoSwitchedAtRef.current > 0 &&
+    Date.now() - videoSwitchedAtRef.current < SWITCH_EVENT_GRACE_MS;
+
   // Handle postMessage to receive playback progress from YouTube JS API
   useEffect(() => {
     const handleMsg = (e: MessageEvent) => {
@@ -54,16 +76,20 @@ export default function YouTubePlayer({
 
         if (data.event === "infoDelivery" && data.info) {
           const info = data.info;
-          if (typeof info.currentTime === "number") {
-            onTimeUpdate?.(info.currentTime);
+          const stale = isInSwitchGrace();
+          if (typeof info.currentTime === "number" && !stale) {
+            onTimeUpdate?.(videoId, info.currentTime);
           }
-          if (info.playerState === 0) {
-            onEnded?.();
+          if (info.playerState === 0 && !stale) {
+            onEnded?.(videoId);
           }
           window.dispatchEvent(new CustomEvent("yt:player-info", { detail: info }));
         } else if (data.event === "onStateChange") {
-          if (data.info === 0 || data.data === 0 || data.playerState === 0) {
-            onEnded?.();
+          if (
+            !isInSwitchGrace() &&
+            (data.info === 0 || data.data === 0 || data.playerState === 0)
+          ) {
+            onEnded?.(videoId);
           }
         }
       } catch {
@@ -73,7 +99,7 @@ export default function YouTubePlayer({
 
     window.addEventListener("message", handleMsg);
     return () => window.removeEventListener("message", handleMsg);
-  }, [onTimeUpdate, onEnded]);
+  }, [videoId, onTimeUpdate, onEnded]);
 
   // Activate YouTube JS API listening on load
   const handleIframeLoad = () => {
