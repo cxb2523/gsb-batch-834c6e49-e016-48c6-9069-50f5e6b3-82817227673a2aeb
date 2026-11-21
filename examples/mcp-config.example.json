@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "xinggou": {
+      "command": "python",
+      "args": [
+        "C:/path/to/XingGou/mcp_server.py"
+      ]
+    }
+  }
+}

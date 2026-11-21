@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.runtime/
+projects/
+exports/
+config.local.json
+examples/*.local.json
+node_modules/
+*.glb
+*.blend
+*.fbx
+*.png
+*.jpg
+*.zip
+!docs/images/editor-example.png
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+
+# Large model/runtime payloads are distributed in the full release archive.
+library/
+runtime/

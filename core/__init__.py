@@ -1,0 +1,1 @@
+"""XingGou local authoring tools."""
