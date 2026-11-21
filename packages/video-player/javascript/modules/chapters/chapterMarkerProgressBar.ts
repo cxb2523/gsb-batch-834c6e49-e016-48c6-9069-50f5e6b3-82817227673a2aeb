@@ -24,18 +24,45 @@ class ChapterMarkersProgressBarControl extends Component {
   private chapterBoundaries: HTMLElement[] = [];
   private chapters: ChapterMarker[] = [];
   private cleanup_ = new CleanupRegistry();
+  private disposed_ = false;
 
   constructor(player: Player, options: ChapterMarkersProgressBarControlOptions) {
     super(player, options);
     this.chapters = options.chapters || [];
 
     player.ready(() => {
+      // A language/source switch can dispose this component before this queued
+      // callback runs. Re-injecting markers afterwards would leave orphaned
+      // boundaries and a hover tooltip belonging to a dead component, which is
+      // how duplicate segments and stuck tooltips appear after rapid switching.
+      if (this.disposed_) {
+        return;
+      }
       this.addMarkers(this.chapters, player);
       this.attachHoverHandlers(player);
-      // After addMarkers: it "clears previous markers" by calling this.dispose(),
-      // which would also undo this hookup.
       this.addChapterToSeekBarValueText_(player);
     });
+  }
+
+  /**
+   * Removes every marker element and detaches listeners while keeping the
+   * component itself alive. Unlike dispose(), this does not tear down the
+   * component, so it is safe to call from addMarkers().
+   */
+  private clearMarkers(): void {
+    this.chapterBoundaries.forEach((boundary) => {
+      if (boundary && boundary.parentNode) {
+        boundary.remove();
+      }
+    });
+    this.chapterBoundaries = [];
+
+    if (this.chapterTooltipContainer && this.chapterTooltipContainer.parentNode) {
+      this.chapterTooltipContainer.remove();
+    }
+    this.chapterTooltipContainer = null;
+
+    this.cleanup_.dispose();
   }
 
   /**
@@ -47,9 +74,11 @@ class ChapterMarkersProgressBarControl extends Component {
 
     const playheadWell = player.el().querySelector('.vjs-progress-holder');
     if (!playheadWell) return;
-    
-    // Clear any previous markers
-    this.dispose(); 
+
+    // Clear any previous markers without disposing the component itself:
+    // calling this.dispose() here would tear the component down mid-setup
+    // (and its queued ready callback could then resurrect stale DOM).
+    this.clearMarkers();
 
     // Create a single container for the chapter tooltip
     this.chapterTooltipContainer = document.createElement('div');
@@ -78,6 +107,9 @@ class ChapterMarkersProgressBarControl extends Component {
    * Attaches mouse move and leave handlers to the main progress control.
    */
   attachHoverHandlers(player: Player) {
+    if (this.disposed_) {
+      return;
+    }
     // Access controlBar.progressControl via type assertion (Video.js internal API)
     const playerWithControlBar = player as unknown as {
       controlBar: {
@@ -158,13 +190,41 @@ class ChapterMarkersProgressBarControl extends Component {
    * attribute as time moves, so we re-append whenever it changes.
    */
   private addChapterToSeekBarValueText_(player: Player) {
+    if (this.disposed_) {
+      return;
+    }
     const seekBarEl = (player as any).getChild('ControlBar')?.getChild('ProgressControl')?.getChild('SeekBar')?.el() as HTMLElement | undefined;
     if (!seekBarEl || typeof MutationObserver === 'undefined') return;
 
+    // Strips any chapter suffix previously appended to the seek bar text,
+    // including one left behind by an older chapter component/language, so
+    // suffixes can never accumulate on language switches.
+    const stripChapterSuffix = (value: string): string => {
+      const marker = player.localize('Chapter: {1}', ['']);
+      const idx = marker.indexOf('{1}');
+      if (idx >= 0) {
+        const prefix = marker.slice(0, idx);
+        const at = value.lastIndexOf(prefix);
+        if (at >= 0) {
+          return value.slice(0, at).replace(/[,\s]+$/, '');
+        }
+      }
+      // Fallback: match the literal localized "Chapter:" token.
+      const literal = player.localize('Chapter:');
+      const literalAt = value.lastIndexOf(literal);
+      if (literalAt >= 0) {
+        return value.slice(0, literalAt).replace(/[,\s]+$/, '');
+      }
+      return value;
+    };
+
     let suffix = '';
     const apply = () => {
+      if (this.disposed_) {
+        return;
+      }
       const current = seekBarEl.getAttribute('aria-valuetext') || '';
-      const base = suffix && current.endsWith(suffix) ? current.slice(0, -suffix.length) : current;
+      const base = stripChapterSuffix(current);
       const time = player.currentTime() ?? 0;
       const chapter = this.chapters.find(c => time >= c.startTime && time < c.endTime);
       suffix = chapter ? `, ${player.localize('Chapter: {1}', [chapter.label])}` : '';
@@ -177,7 +237,8 @@ class ChapterMarkersProgressBarControl extends Component {
     this.cleanup_.register(() => {
       observer.disconnect();
       const current = seekBarEl.getAttribute('aria-valuetext') || '';
-      if (suffix && current.endsWith(suffix)) seekBarEl.setAttribute('aria-valuetext', current.slice(0, -suffix.length));
+      const stripped = stripChapterSuffix(current);
+      if (stripped !== current) seekBarEl.setAttribute('aria-valuetext', stripped);
     });
     apply();
   }
@@ -186,6 +247,8 @@ class ChapterMarkersProgressBarControl extends Component {
    * On dispose, remove all created elements.
    */
   dispose() {
+    this.disposed_ = true;
+
     this.chapterBoundaries.forEach((boundary) => {
       if (boundary && boundary.parentNode) {
         boundary.remove();
@@ -197,7 +260,7 @@ class ChapterMarkersProgressBarControl extends Component {
       this.chapterTooltipContainer.remove();
       this.chapterTooltipContainer = null;
     }
-    
+
     this.cleanup_.dispose();
     super.dispose();
   }
