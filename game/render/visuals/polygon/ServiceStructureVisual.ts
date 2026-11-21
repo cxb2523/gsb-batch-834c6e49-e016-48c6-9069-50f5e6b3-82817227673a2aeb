@@ -11,7 +11,7 @@
 
 import { Graphics, Container } from 'pixi.js';
 import { tileToScreenWithHeight } from '@/game/render/IsoTransform';
-import { computeZIndex } from './cubeBuildingZIndex';
+import { structureWorldZIndex } from '../../terrain/worldZIndex';
 import { shadeColor } from './cubePalette';
 import {
   serviceStructureBaseColor,
@@ -87,7 +87,7 @@ export class ServiceStructureVisual {
 
     const wrapper = new Container();
     wrapper.position.set(screen.x, screen.y);
-    wrapper.zIndex = computeZIndex(structure.footprint);
+    wrapper.zIndex = structureWorldZIndex(terrain.getRenderHeight(structure.anchor.x, structure.anchor.y), structure.footprint);
 
     const gfx = new Graphics();
     wrapper.addChild(gfx);
@@ -104,7 +104,7 @@ export class ServiceStructureVisual {
     const anchor = structure.anchor;
     const screen = tileToScreenWithHeight(anchor, terrain.getRenderHeight(anchor.x, anchor.y));
     displayObject.position.set(screen.x, screen.y);
-    displayObject.zIndex = computeZIndex(structure.footprint);
+    displayObject.zIndex = structureWorldZIndex(terrain.getRenderHeight(structure.anchor.x, structure.anchor.y), structure.footprint);
   }
 
   unmount(displayObject: Container): void {

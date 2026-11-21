@@ -27,6 +27,11 @@ import {
   isNwAnchoredFullRectFootprint,
 } from './cubeGeometry';
 import { cubeShadowPolygon, SHADOW_COLOR, SHADOW_ALPHA } from './cubeDropShadow';
+import { castTerrainShadow } from './terrainShadow';
+import {
+  buildingFaceWorldZIndex,
+  buildingShadowWorldZIndex,
+} from '../../terrain/worldZIndex';
 import {
   getWallTexture,
   wallFaceFillMatrix,
@@ -45,7 +50,6 @@ import {
   type MassingProp,
 } from './buildingMassing';
 import { fracToLocal, massingBoxFaces, massingGableFaces } from './massingGeometry';
-import { computeZIndex } from './cubeBuildingZIndex';
 import type { BuildingVisual, BuildingVisualInput } from '../TileVisual';
 import type { BuildingType } from '@/game/core/Building';
 import type { Terrain } from '@/game/core/Terrain';
@@ -144,12 +148,6 @@ function geometryKey(input: BuildingVisualInput): string {
   return `${input.type}:${input.level}:${input.density}:${shape}`;
 }
 
-// Shadow key: geometry plus the massing seed — the shadow silhouette follows the
-// massing plan (jittered height, box extents), not just the footprint shape.
-function shadowKey(input: BuildingVisualInput): string {
-  return `${geometryKey(input)}:m${massingSeed(input.buildingId)}`;
-}
-
 // Faces key: geometry plus the facade variant, the per-building window seed,
 // AND the massing seed, so buildings with different window-light patterns or
 // silhouettes don't share one cached context. The abandoned discriminator (:d/:o)
@@ -162,8 +160,11 @@ function facesKey(input: BuildingVisualInput): string {
   return `${base}:s${windowSeed(input.buildingId)}:m${massingSeed(input.buildingId)}:${input.abandoned ? 'd' : 'o'}`;
 }
 
-// All shadows must draw before any face — large negative offset puts every shadow zIndex
-// below any computeZIndex(footprint) value while preserving relative depth among shadows.
+// Deprecated: shadows now occupy the WORLD_SHADOW_BASE sub-layer (see
+// terrain/worldZIndex.ts) inside the shared world container instead of a
+// negative offset within the old building-only layer. Retained as an export so
+// the historical depth-invariant test keeps a stable symbol to pin; no runtime
+// path uses it anymore.
 export const SHADOW_Z_OFFSET = -1_000_000;
 
 // ---------------------------------------------------------------------------
@@ -447,24 +448,50 @@ function drawBuildingMassing(
   return true;
 }
 
+/**
+ * Build the shadow geometry for one building, re-cast onto the actual terrain.
+ *
+ * The shadow is derived from the SAME mass geometry as the faces (the massing
+ * plan for canonical rectangular footprints, per-cell cubes otherwise): each
+ * mass's top-face polygon is grounded and marched along the light ray by
+ * `castTerrainShadow`, which drapes the landing vertices to the ground height
+ * and clips them at any higher blocker tile's front edge. On flat terrain the
+ * result is bit-identical to the old `cubeShadowPolygon` output.
+ *
+ * Position/terrain dependent, so this returns a per-instance GraphicsContext
+ * (not part of the shape-only global cache); terrain edits rebuild it through
+ * update(). Returns null for level 0 / empty plans.
+ */
 function buildShadowContext(input: BuildingVisualInput): GraphicsContext | null {
   if (input.level === 0) return null;
+  const terrain = input.terrain;
 
   const ctx = new GraphicsContext();
 
   if (isNwAnchoredFullRectFootprint(input.footprint, input.anchor)) {
-    // Shadow from the massing plan so it matches the drawn silhouette: one
-    // ground-shadow polygon per box (cast from that box's own top height), all
-    // filled in a single pass so overlaps don't double-darken. Props (antennas,
-    // vents) are too thin to read in a soft blob and are excluded.
     const plan = massingPlanFor(input);
     if (plan.boxes.length === 0) return null;
+    const origin = input.anchor;
+    const originHeight = input.renderHeight ?? 0;
+
     ctx.beginPath();
     for (const b of plan.boxes) {
       const top = b.baseLiftPx + b.wallHeightPx + (b.roof.kind === 'gable' ? b.roof.risePx : 0);
-      // Virtual ground-to-top box: cubeShadowPolygon grounds the shadow at the
-      // faces' wall bottom, so the box must start at the tile plane.
-      const poly = cubeShadowPolygon(massingBoxFaces(b.rect, 0, top));
+      const topFace = massingBoxFaces(b.rect, 0, top).top;
+      let poly: Point[];
+      if (terrain) {
+        poly = castTerrainShadow({
+          origin,
+          originHeight,
+          massHeightPx: top,
+          footprintTop: topFace,
+          terrain,
+        }).points;
+      } else {
+        // Flat fallback (fixtures without terrain): preserve the original
+        // grounded + light-offset polygon exactly.
+        poly = cubeShadowPolygon(massingBoxFaces(b.rect, 0, top));
+      }
       ctx.moveTo(poly[0].x, poly[0].y);
       for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i].x, poly[i].y);
       ctx.closePath();
@@ -485,7 +512,23 @@ function buildShadowContext(input: BuildingVisualInput): GraphicsContext | null 
     const faces = cubeFacePolygons(input.type, input.level, input.density, [cell], cell);
     if (faces === null) continue;
     const cellScreen = tileToScreen(cell);
-    drawCubeShadow(ctx, faces, cellScreen.x - anchorScreen.x, cellScreen.y - anchorScreen.y);
+    const ox = cellScreen.x - anchorScreen.x;
+    const oy = cellScreen.y - anchorScreen.y;
+    if (terrain) {
+      const mainLift = faces.left[2].y - faces.left[1].y;
+      const cast = castTerrainShadow({
+        origin: cell,
+        originHeight: terrain.getRenderHeight(cell.x, cell.y),
+        massHeightPx: mainLift,
+        footprintTop: faces.top,
+        terrain,
+      });
+      // Re-anchor the cell-local polygon into the building's anchor frame.
+      const poly = cast.points.map((p) => ({ x: p.x + ox, y: p.y + oy }));
+      drawShadow(ctx, poly, 0, 0);
+    } else {
+      drawCubeShadow(ctx, faces, ox, oy);
+    }
     drew = true;
   }
   return drew ? ctx : null;
@@ -526,8 +569,13 @@ function buildFacesContext(input: BuildingVisualInput): GraphicsContext | null {
 export class CubeBuildingVisual implements BuildingVisual {
   readonly layer = 'building' as const;
 
-  /** Separate caches — shadow and faces share the same key but are distinct GraphicsContexts. */
-  private shadowCache: Map<string, GraphicsContext> = new Map();
+  /**
+   * Faces remain a global shape-only cache (geometry is position-independent).
+   * Shadows are NOT cached globally: they are re-cast onto the terrain, so
+   * their geometry depends on the building's world position and the surrounding
+   * heights. Each wrapper owns a per-instance shadow GraphicsContext instead,
+   * rebuilt in update() whenever the terrain revision changes.
+   */
   private facesCache: Map<string, GraphicsContext> = new Map();
 
   /** Singleton empty context for level-0 / downgrade — avoids leaking a fresh
@@ -539,20 +587,12 @@ export class CubeBuildingVisual implements BuildingVisual {
   /** Maps the tracked wrapper Container → its sibling shadowGfx so update/unmount can reach both. */
   private shadowByFaces: WeakMap<Container, Graphics> = new WeakMap();
 
+  /** Per-instance shadow GraphicsContext (terrain-dependent, not globally cached). */
+  private shadowCtxByFaces: WeakMap<Container, GraphicsContext> = new WeakMap();
+
   /** Maps the wrapper Container → its Graphics child so update() can swap the context in-place
    *  and unmount() can destroy it with the right options. */
   private wrapperChild: WeakMap<Container, Graphics> = new WeakMap();
-
-  private getOrBuildShadowContext(input: BuildingVisualInput): GraphicsContext | null {
-    if (input.level === 0) return null;
-    const key = shadowKey(input);
-    let ctx = this.shadowCache.get(key);
-    if (!ctx) {
-      ctx = buildShadowContext(input) ?? undefined;
-      if (ctx) this.shadowCache.set(key, ctx);
-    }
-    return ctx ?? null;
-  }
 
   private getOrBuildFacesContext(input: BuildingVisualInput): GraphicsContext | null {
     if (input.level === 0) return null;
@@ -565,6 +605,20 @@ export class CubeBuildingVisual implements BuildingVisual {
     return ctx ?? null;
   }
 
+  /**
+   * Build (or rebuild) the terrain-cast shadow context for one mounted wrapper.
+   * Called on mount and on every update so terrain/height changes re-cast the
+   * shadow rather than keeping a mount-time snapshot.
+   */
+  private rebuildShadowContext(wrapper: Container, input: BuildingVisualInput): GraphicsContext | null {
+    const existing = this.shadowCtxByFaces.get(wrapper);
+    if (existing) existing.destroy();
+    const ctx = buildShadowContext(input);
+    if (ctx) this.shadowCtxByFaces.set(wrapper, ctx);
+    else this.shadowCtxByFaces.delete(wrapper);
+    return ctx;
+  }
+
   mount(input: BuildingVisualInput, parent: Container): Container {
     // input.footprint is the LOT; structureInput.footprint is the STRUCTURE — cube/shadow geometry uses structureInput, yard layer uses input.footprint.
     const structureInput = structureInputOf(input);
@@ -573,7 +627,7 @@ export class CubeBuildingVisual implements BuildingVisual {
     // position-independent. Terrain elevation is applied here on the wrapper.
     const h = input.renderHeight ?? 0;
     const screen = tileToScreenWithHeight(structureInput.anchor, h);
-    const zIndex = computeZIndex(structureInput.footprint);
+    const zIndex = buildingFaceWorldZIndex(h, structureInput.footprint);
 
     const wrapper = new Container();
     wrapper.position.set(screen.x, screen.y);
@@ -587,15 +641,16 @@ export class CubeBuildingVisual implements BuildingVisual {
 
     parent.addChild(wrapper);
 
-    // Shadow Graphics is a sibling of the wrapper (added to `parent`), not a
-    // child of the wrapper. Sort order between shadow and faces uses zIndex.
-    const shadowCtx = this.getOrBuildShadowContext(structureInput);
+    // Shadow Graphics is a sibling of the wrapper (added to the shared world
+    // container), so the unified depth sort can place it against terrain too.
+    const shadowCtx = this.rebuildShadowContext(wrapper, structureInput);
     if (shadowCtx) {
       const shadowGfx = new Graphics();
       shadowGfx.context = shadowCtx;
       shadowGfx.position.set(screen.x, screen.y);
-      // SHADOW_Z_OFFSET ensures every shadow draws before every face in the sorted building layer.
-      shadowGfx.zIndex = SHADOW_Z_OFFSET + zIndex;
+      // Shadows occupy their own compact sub-layer above all terrain, below
+      // all structure faces; slope correctness comes from geometric clipping.
+      shadowGfx.zIndex = buildingShadowWorldZIndex(structureInput.anchor);
       parent.addChild(shadowGfx);
       this.shadowByFaces.set(wrapper, shadowGfx);
     }
@@ -609,7 +664,7 @@ export class CubeBuildingVisual implements BuildingVisual {
 
     const h = input.renderHeight ?? 0;
     const screen = tileToScreenWithHeight(structureInput.anchor, h);
-    const zIndex = computeZIndex(structureInput.footprint);
+    const zIndex = buildingFaceWorldZIndex(h, structureInput.footprint);
     wrapper.position.set(screen.x, screen.y);
     wrapper.zIndex = zIndex;
 
@@ -621,20 +676,22 @@ export class CubeBuildingVisual implements BuildingVisual {
       facesGfx.context = facesCtx ?? CubeBuildingVisual.emptyContext;
     }
 
-    // Shadow update — keyed by wrapper.
-    const newShadowCtx = this.getOrBuildShadowContext(structureInput);
+    // Re-cast the terrain shadow on EVERY update so terrain edits, height
+    // changes and re-grading all re-drape/re-clip it — never a mount-time
+    // snapshot. Reuse the existing sibling Graphics when present.
+    const newShadowCtx = this.rebuildShadowContext(wrapper, structureInput);
     const existingShadowGfx = this.shadowByFaces.get(wrapper);
 
     if (existingShadowGfx) {
       existingShadowGfx.context = newShadowCtx ?? CubeBuildingVisual.emptyContext;
       existingShadowGfx.position.set(screen.x, screen.y);
-      existingShadowGfx.zIndex = SHADOW_Z_OFFSET + zIndex;
+      existingShadowGfx.zIndex = buildingShadowWorldZIndex(structureInput.anchor);
     } else if (newShadowCtx) {
       // Level rose from 0: create the shadow sibling now.
       const shadowGfx = new Graphics();
       shadowGfx.context = newShadowCtx;
       shadowGfx.position.set(screen.x, screen.y);
-      shadowGfx.zIndex = SHADOW_Z_OFFSET + zIndex;
+      shadowGfx.zIndex = buildingShadowWorldZIndex(structureInput.anchor);
       // update() is only called while mounted, so parent is non-null.
       wrapper.parent!.addChild(shadowGfx);
       this.shadowByFaces.set(wrapper, shadowGfx);
@@ -646,12 +703,19 @@ export class CubeBuildingVisual implements BuildingVisual {
     const child = this.wrapperChild.get(wrapper);
 
     // Destroy the Graphics child WITHOUT destroying its shared GraphicsContext
-    // (contexts live in facesCache and are reused across buildings).
+    // (faces contexts live in facesCache and are reused across buildings).
     if (child) {
       child.destroy({ context: false });
     }
 
-    // Shadow sibling — added directly to parent.
+    // Per-instance terrain-cast shadow context is owned by this wrapper.
+    const shadowCtx = this.shadowCtxByFaces.get(wrapper);
+    if (shadowCtx) {
+      shadowCtx.destroy();
+      this.shadowCtxByFaces.delete(wrapper);
+    }
+
+    // Shadow sibling — added directly to the world container.
     const shadowGfx = this.shadowByFaces.get(wrapper);
     if (shadowGfx) {
       shadowGfx.destroy();
@@ -680,10 +744,9 @@ export class CubeBuildingVisual implements BuildingVisual {
   }
 
   dispose(): void {
-    for (const ctx of this.shadowCache.values()) ctx.destroy();
-    this.shadowCache.clear();
+    // Faces remain globally cached; per-instance shadow contexts are owned by
+    // their wrappers and released in unmount(). WeakMaps self-clear.
     for (const ctx of this.facesCache.values()) ctx.destroy();
     this.facesCache.clear();
-    // wrapperChild, shadowByFaces are WeakMaps — self-clear.
   }
 }

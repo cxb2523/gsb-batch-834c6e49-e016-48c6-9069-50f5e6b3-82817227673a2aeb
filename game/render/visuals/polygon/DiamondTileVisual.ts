@@ -8,7 +8,7 @@ import type { Texture } from 'pixi.js';
 import { projectTileCornerScreen, ISO_CONFIG } from '@/game/render/IsoTransform';
 import type { ScreenCoord } from '@/game/types/coordinates';
 import { tileFillColor, WATER_COLOR, cornersRenderAsWater, TILE_COLORS } from '../palette';
-import { computeTerrainZIndex } from '../../terrain/terrainZIndex';
+import { computeWorldZIndex } from '../../terrain/worldZIndex';
 import { roadAutoTile, type RoadDescriptor } from '../../roadAutoTile';
 import { TileType } from '@/game/core/Tile';
 import type { TerrainTileVisual, TileVisualInput } from '../TileVisual';
@@ -703,7 +703,7 @@ export const DiamondTileVisual: TerrainTileVisual = {
     // sufficient for z-order globally — same-height non-adjacent tiles CAN area-overlap
     // when one tile's drops extend through another's lifted polygon. computeTerrainZIndex's
     // secondary keys (x+y) then y resolve those cases; see slopeOcclusion.test.ts.
-    gfx.zIndex = computeTerrainZIndex(input.renderHeight ?? 0, input.x, input.y);
+    gfx.zIndex = computeWorldZIndex(input.renderHeight ?? 0, input.x, input.y);
     parent.addChild(gfx);
     return gfx;
   },
@@ -712,7 +712,7 @@ export const DiamondTileVisual: TerrainTileVisual = {
     const gfx = displayObject as Graphics;
     gfx.clear();
     drawDiamond(gfx, input);
-    gfx.zIndex = computeTerrainZIndex(input.renderHeight ?? 0, input.x, input.y);
+    gfx.zIndex = computeWorldZIndex(input.renderHeight ?? 0, input.x, input.y);
   },
 
   unmount(displayObject: Container): void {

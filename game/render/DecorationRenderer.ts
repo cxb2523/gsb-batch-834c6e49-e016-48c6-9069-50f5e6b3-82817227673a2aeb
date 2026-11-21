@@ -21,7 +21,7 @@ import type { World } from '@/game/core/World';
 import { tileToScreenWithHeight, ISO_CONFIG } from './IsoTransform';
 import { isBuildingVisible, iterateVisibleTiles } from './viewportCulling';
 import type { VisibleTileBounds } from './viewportCulling';
-import { computeZIndex } from './visuals/polygon/cubeBuildingZIndex';
+import { computeWorldZIndex } from './terrain/worldZIndex';
 import { parkObjectsForCell, streetTreeForCell, landTreesForCell } from './visuals/polygon/decorationPlacement';
 import type { ParkObjectKind } from './visuals/polygon/decorationPlacement';
 import {
@@ -111,7 +111,7 @@ export class DecorationRenderer {
 
       // Hoist loop-invariant computations: both depend only on the anchor.
       const screen = tileToScreenWithHeight({ x: ax, y: ay }, terrain.getRenderHeight(ax, ay));
-      const baseZ = computeZIndex([structure.anchor]);
+      const baseZ = computeWorldZIndex(terrain.getRenderHeight(ax, ay), ax, ay);
 
       for (let slotIndex = 0; slotIndex < slots.length; slotIndex++) {
         const slot = slots[slotIndex];
@@ -135,7 +135,7 @@ export class DecorationRenderer {
         const screen = tileToScreenWithHeight({ x, y }, terrain.getRenderHeight(x, y));
         const posX = screen.x + candidate.dx;
         const posY = screen.y + ISO_CONFIG.TILE_HEIGHT / 2 + candidate.dy;
-        const zIndex = computeZIndex([{ x, y }]);
+        const zIndex = computeWorldZIndex(terrain.getRenderHeight(x, y), x, y);
         this.mountOrUpdate(candidate.key, getTreeTexture(candidate.variant), posX, posY, zIndex, visibleKeys);
         // Roadside cell hosts a street tree — skip land trees to avoid double-placement.
         continue;
@@ -147,7 +147,7 @@ export class DecorationRenderer {
       const landTrees = landTreesForCell(x, y, isPlainGrass);
       if (landTrees.length === 0) continue;
       const screen = tileToScreenWithHeight({ x, y }, terrain.getRenderHeight(x, y));
-      const baseZ = computeZIndex([{ x, y }]);
+      const baseZ = computeWorldZIndex(terrain.getRenderHeight(x, y), x, y);
       for (const tree of landTrees) {
         const posX = screen.x + tree.dx;
         const posY = screen.y + ISO_CONFIG.TILE_HEIGHT / 2 + tree.dy;

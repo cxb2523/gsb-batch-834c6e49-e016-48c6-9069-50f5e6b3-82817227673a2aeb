@@ -59,6 +59,13 @@ export interface BuildingVisualInput {
   structureRect: Rect;
   /** Render reads core state; muted derelict variant when true. */
   abandoned: boolean;
+  /**
+   * Read-only terrain surface, supplied so the shadow pass can re-cast the
+   * mass's flat shadow onto sloped ground (draping + blocker clipping). The
+   * visual only READS corner heights through it and never mutates core.
+   * Optional for fixtures that exercise flat-ground-only geometry.
+   */
+  terrain?: Terrain;
 }
 
 export interface TerrainTileVisual {

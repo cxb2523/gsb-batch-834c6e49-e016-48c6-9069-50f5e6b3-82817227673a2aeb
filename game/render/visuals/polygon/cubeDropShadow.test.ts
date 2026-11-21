@@ -238,25 +238,38 @@ describe('cubeDropShadow', () => {
     expect(out[3].y).toBeCloseTo(24.58, 6);
   });
 
-  // SHADOW_Z_OFFSET invariant: shadow Graphics draw before all face Graphics in the building layer.
-  // The building layer uses sortableChildren=true; shadows get SHADOW_Z_OFFSET + computeZIndex,
-  // faces get computeZIndex alone — so every shadow zIndex is strictly less than every face zIndex.
-  describe('SHADOW_Z_OFFSET: shadow zIndex is always below any face zIndex', () => {
-    it('SHADOW_Z_OFFSET is a large negative constant', () => {
+  // Unified world-depth invariant: inside the single sorted world container the
+  // three sub-layers (terrain/road, shadow, structure face) occupy disjoint
+  // bands. Every terrain/road z stays below every shadow z, which stays below
+  // every face z, regardless of map position — so a camera pan (a pure parent
+  // transform) can never reorder them.
+  describe('world sub-layers: terrain < shadow < face for every map position', () => {
+    it('SHADOW_Z_OFFSET is retained as a stable negative constant (deprecated symbol)', () => {
       expect(SHADOW_Z_OFFSET).toBe(-1_000_000);
-      expect(SHADOW_Z_OFFSET).toBeLessThan(-1000);
     });
 
-    it('SHADOW_Z_OFFSET + computeZIndex < computeZIndex for extreme plausible values', () => {
-      // computeZIndex = depth*1000 + tiebreakY; max plausible on a 256×256 map ≈ 512*1000+256 = 512256
-      const maxPlausibleFacesZIndex = 512_256;
-      const shadowZIndex = SHADOW_Z_OFFSET + maxPlausibleFacesZIndex;
-      expect(shadowZIndex).toBeLessThan(maxPlausibleFacesZIndex);
+    it('the three sub-layer bands are disjoint across the whole plausible map', async () => {
+      const {
+        WORLD_SHADOW_BASE,
+        WORLD_STRUCTURE_BASE,
+        computeWorldZIndex,
+        buildingShadowWorldZIndex,
+        buildingFaceWorldZIndex,
+      } = await import('../../terrain/worldZIndex');
+      const MAX_ELEV = 8;
+      // Extreme plausible terrain/road cell on a 256×256 map.
+      const maxTerrainZ = computeWorldZIndex(MAX_ELEV, 255, 255);
+      // Extreme plausible shadow (back-to-front origin key).
+      const minShadowZ = buildingShadowWorldZIndex({ x: 0, y: 0 });
+      const maxShadowZ = buildingShadowWorldZIndex({ x: 255, y: 255 });
+      // Extreme plausible structure face.
+      const minFaceZ = buildingFaceWorldZIndex(0, [{ x: 0, y: 0 }]);
+      const maxFaceZ = buildingFaceWorldZIndex(MAX_ELEV, [{ x: 255, y: 255 }]);
 
-      // Also check the minimum (negative depth tiles near origin)
-      const minPlausibleFacesZIndex = -512_256;
-      const shadowZIndexMin = SHADOW_Z_OFFSET + minPlausibleFacesZIndex;
-      expect(shadowZIndexMin).toBeLessThan(minPlausibleFacesZIndex);
+      expect(maxTerrainZ).toBeLessThan(minShadowZ);
+      expect(maxShadowZ).toBeLessThan(minFaceZ);
+      expect(WORLD_SHADOW_BASE).toBeLessThan(WORLD_STRUCTURE_BASE);
+      expect(maxFaceZ).toBeGreaterThan(maxShadowZ);
     });
   });
 

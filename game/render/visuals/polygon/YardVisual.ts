@@ -1,6 +1,6 @@
 import { Container, Graphics } from 'pixi.js';
 import { projectTileCornerScreen } from '@/game/render/IsoTransform';
-import { computeTerrainZIndex } from '@/game/render/terrain/terrainZIndex';
+import { computeWorldZIndex } from '@/game/render/terrain/worldZIndex';
 import { baseColor, lerpToWhite } from './cubePalette';
 import type { BuildingType } from '@/game/core/Building';
 import type { Terrain } from '@/game/core/Terrain';
@@ -28,7 +28,7 @@ export function mountYardCell(
 ): Graphics {
   const gfx = new Graphics();
   drawYardDiamond(gfx, cell, type, terrain);
-  gfx.zIndex = computeTerrainZIndex(terrain.getRenderHeight(cell.x, cell.y), cell.x, cell.y);
+  gfx.zIndex = computeWorldZIndex(terrain.getRenderHeight(cell.x, cell.y), cell.x, cell.y);
   parent.addChild(gfx);
   return gfx;
 }
@@ -41,7 +41,7 @@ export function updateYardCell(
 ): void {
   gfx.clear();
   drawYardDiamond(gfx, cell, type, terrain);
-  gfx.zIndex = computeTerrainZIndex(terrain.getRenderHeight(cell.x, cell.y), cell.x, cell.y);
+  gfx.zIndex = computeWorldZIndex(terrain.getRenderHeight(cell.x, cell.y), cell.x, cell.y);
 }
 
 function drawYardDiamond(

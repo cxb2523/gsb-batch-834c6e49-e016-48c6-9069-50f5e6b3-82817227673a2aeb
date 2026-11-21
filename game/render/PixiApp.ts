@@ -40,6 +40,13 @@ export class PixiApp {
   private decorationRenderer: DecorationRenderer | null = null;
   private dataViewOverlay: DataViewOverlay | null = null;
   private terrainContainer: Container | null = null;
+  /**
+   * Same container instance as `terrainContainer`. Kept under a separate name
+   * because the old two-container split assigned buildings their own layer;
+   * terrain, roads, yards, shadows, buildings and decorations now share one
+   * sortable world container so their unified world z-index values interleave
+   * correctly (a raised slope can occlude a shadow, a front building a back one).
+   */
   private buildingContainer: Container | null = null;
   private dataViewContainer: Container | null = null;
   private overlayContainer: Container | null = null;
@@ -100,17 +107,19 @@ export class PixiApp {
 
     this.camera = new Camera(this.app.stage, constraints);
 
-    // Create explicit layer containers in draw order: terrain → building → overlay → selection.
-    // addChild order enforces z-layering; no zIndex tricks needed for cross-layer ordering.
+    // One sortable WORLD container for terrain, roads, yards, shadows,
+    // buildings and decorations. They all speak the unified world z-index
+    // vocabulary (see terrain/worldZIndex.ts), so a single depth sort gives
+    // correct terrain↔shadow↔building occlusion on slopes — the previous
+    // two-container split kept buildings on a separate layer and could never
+    // let raised terrain occlude a shadow or interleave with a building.
     this.terrainContainer = new Container();
-    // Elevation-aware iso depth sort: higher cells (and their south/east walls)
-    // must draw after lower neighbors. See DiamondTileVisual.computeTerrainZIndex.
     this.terrainContainer.sortableChildren = true;
+    // Same instance: every "building layer" renderer receives this container
+    // and its children sort against the terrain by their world z-index.
+    this.buildingContainer = this.terrainContainer;
 
-    this.buildingContainer = new Container();
-    this.buildingContainer.sortableChildren = true; // buildings sort within their own layer
-
-    // Data-view colored-diamond layer sits above buildings but below the utility
+    // Data-view colored-diamond layer sits above the world but below the utility
     // badge overlay so badges remain readable on top of the recolor.
     this.dataViewContainer = new Container();
     this.dataViewContainer.sortableChildren = false;
@@ -122,7 +131,6 @@ export class PixiApp {
     this.selectionContainer.sortableChildren = false;
 
     this.app.stage.addChild(this.terrainContainer);
-    this.app.stage.addChild(this.buildingContainer);
     this.app.stage.addChild(this.dataViewContainer);
     this.app.stage.addChild(this.overlayContainer);
     this.app.stage.addChild(this.selectionContainer);
@@ -328,8 +336,9 @@ export class PixiApp {
     // so this is a defensive double-cleanup — it ensures any shared-cache
     // scenarios (e.g. visuals holding refs to these containers) are released
     // deterministically, before the renderer context is torn down.
+    // terrainContainer and buildingContainer are the SAME instance now (one
+    // sorted world container), so destroy it once.
     this.terrainContainer?.destroy({ children: true });
-    this.buildingContainer?.destroy({ children: true });
     this.dataViewContainer?.destroy({ children: true });
     this.overlayContainer?.destroy({ children: true });
     this.selectionContainer?.destroy({ children: true });

@@ -15,7 +15,7 @@
 
 import { Graphics, Container } from 'pixi.js';
 import { tileToScreenWithHeight } from '@/game/render/IsoTransform';
-import { computeZIndex } from './cubeBuildingZIndex';
+import { structureWorldZIndex } from '../../terrain/worldZIndex';
 import { shadeColor } from './cubePalette';
 import {
   powerPlantCubeSpecs,
@@ -77,7 +77,7 @@ export class PowerPlantVisual {
     const anchor = structure.anchor;
 
     const screen = tileToScreenWithHeight(anchor, terrain.getRenderHeight(anchor.x, anchor.y));
-    const zIndex = computeZIndex(structure.footprint);
+    const zIndex = structureWorldZIndex(terrain.getRenderHeight(anchor.x, anchor.y), structure.footprint);
 
     const wrapper = new Container();
     wrapper.position.set(screen.x, screen.y);
@@ -101,7 +101,7 @@ export class PowerPlantVisual {
     const wrapper = displayObject;
     const screen = tileToScreenWithHeight(anchor, terrain.getRenderHeight(anchor.x, anchor.y));
     wrapper.position.set(screen.x, screen.y);
-    wrapper.zIndex = computeZIndex(structure.footprint);
+    wrapper.zIndex = structureWorldZIndex(terrain.getRenderHeight(anchor.x, anchor.y), structure.footprint);
   }
 
   unmount(displayObject: Container): void {
