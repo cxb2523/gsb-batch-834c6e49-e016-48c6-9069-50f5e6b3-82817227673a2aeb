@@ -1,6 +1,6 @@
 ---
 title: Tennis scoring rules the sim implements
-updated: 2026-09-19
+updated: 2026-11-21
 tags: [reference, domain, rules]
 status: current
 code:
@@ -50,9 +50,20 @@ not be built until it is in.
 
 ## Serving
 
-- Serve alternates every game.
+- **The serve changes after every second point, not every game.** Points
+  1–2 are served by the set's first server, 3–4 by the other side, and so
+  on. `scoring.ts` derives this in `servingSide(score)` from
+  `score.pointsPlayed` and `score.firstServer`; `score.server` is a
+  consequence of the count, never a field flipped by hand. (Real tennis
+  changes at game boundaries; this match's rule is the two-point rotation,
+  and the whole point of the derivation is that positioning, aim and
+  `toHit` cannot disagree about who is serving.)
+
+  At 6–6 the tiebreak's own rotation takes over (below); once the set has a
+  winner the last server stands and nothing rotates again.
 - Two serve attempts. A missed first serve is a fault; a missed second is a
-  double fault and loses the point.
+  double fault and loses the point. **A fault awards no point**, so it moves
+  no `pointsPlayed` and the same side serves the second ball.
 - **A let is ignored: a serve that clips the net and lands in plays on**,
   decided before any simulation code was written and implemented in
   `sim/ball.ts`'s `stepBall`: when the ball's centre
@@ -60,7 +71,8 @@ not be built until it is in.
   carries on over, damped by `NET_CLIP_DAMPING`, rather than being treated as
   a fault. Real tennis replays a let; replaying it in a motion game means a
   player swings and nothing happens, which feels broken, so CouchCourt does
-  not replay it.
+  not replay it. The server still alternates deuce and ad court point by
+  point within a game.
 
 ## Deliberately simplified
 

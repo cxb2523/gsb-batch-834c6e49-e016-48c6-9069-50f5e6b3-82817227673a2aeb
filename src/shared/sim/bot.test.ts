@@ -60,10 +60,13 @@ describe("createBot", () => {
 		expect(hits).toBeGreaterThanOrEqual(2);
 	});
 
-	// Five minutes, not three: since hard swings are capped until earned,
-	// rallies are longer and three minutes held only 14 points.
+	// Ten minutes, not five: the serve now changes after every two points
+	// rather than every game (`scoring.ts`, `servingSide`), which moves who
+	// serves the early points and left five minutes dead level at 2–2 games
+	// while the better bot already led on points. Ten is a full set either
+	// way (6–2 here) and still a single deterministic run.
 	it("wins more points the higher its skill", () => {
-		const { final } = play(120 * 60 * 5, 0.95, 0.5);
+		const { final } = play(120 * 60 * 10, 0.95, 0.5);
 		expect(final.score.games.near).toBeGreaterThan(final.score.games.far);
 	});
 

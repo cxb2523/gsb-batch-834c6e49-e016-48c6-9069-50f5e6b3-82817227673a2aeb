@@ -8,7 +8,14 @@ import {
 	type RallyInput,
 	tick,
 } from "./rally.ts";
-import { TOSS_APEX, TOSS_MIN_HIT } from "./serve.ts";
+import { other } from "./scoring.ts";
+import {
+	handOf,
+	heldBall,
+	serveSetup,
+	TOSS_APEX,
+	TOSS_MIN_HIT,
+} from "./serve.ts";
 import {
 	POWER_CAP,
 	POWER_RALLY,
@@ -511,6 +518,149 @@ describe("serving positions", () => {
 			DT,
 		);
 		expect(next.players.near.x).toBeLessThan(0);
+	});
+});
+
+describe("serve rotation through tick", () => {
+	/** Ends a point with `winner`: an unreturned ball on the ground out of
+	 * the receiver's reach, one tick short of a second bounce. */
+	function pointTo(prev: MatchState, winner: Side): MatchState {
+		const loser = winner === "near" ? "far" : "near";
+		const s = until(prev, (x) => x.phase === "waiting-serve");
+		const ending = tick(
+			{
+				...s,
+				phase: "rally",
+				toHit: loser,
+				bounces: 1,
+				ball: still({ x: 12, y: BALL_RADIUS + 0.005, z: -5 }),
+			},
+			[],
+			DT,
+		);
+		expect(ending.phase).toBe("point-over");
+		expect(ending.lastPoint).toBe(winner);
+		return tick(ending, [], DT); // the point-over → next serve transition
+	}
+
+	/** The server's stance for the point just set up, against `serveSetup`. */
+	function expectServerInPlace(s: MatchState) {
+		const setup = serveSetup(s.score);
+		expect(s.toHit).toBe(setup.serverSide);
+		expect(s.players[s.toHit]).toEqual({
+			side: s.toHit,
+			...setup.server,
+		});
+		expect(s.players[s.toHit === "near" ? "far" : "near"]).toEqual({
+			side: s.toHit === "near" ? "far" : "near",
+			...setup.receiver,
+		});
+		expect(s.ball).toEqual(heldBall(handOf(s.toHit, s.players[s.toHit])));
+		expect(s.players[s.toHit].z).toBe(
+			s.toHit === "near" ? BASELINE_Z + 0.3 : -BASELINE_Z - 0.3,
+		);
+	}
+
+	it("changes the server after every two points, through the real transition", () => {
+		let s = createMatch("near");
+		expect(s.toHit).toBe("near"); // point 1
+		expectServerInPlace(s);
+
+		s = pointTo(s, "near"); // played point 1; point 2 is still near's
+		expect(s.toHit).toBe("near");
+		expectServerInPlace(s);
+
+		s = pointTo(s, "far"); // played point 2; point 3 is far's
+		expect(s.toHit).toBe("far");
+		expectServerInPlace(s);
+
+		s = pointTo(s, "near"); // played point 3; point 4 is still far's
+		expect(s.toHit).toBe("far");
+		expectServerInPlace(s);
+
+		s = pointTo(s, "far"); // played point 4; point 5 is near's
+		expect(s.toHit).toBe("near");
+		expectServerInPlace(s);
+	});
+
+	it("alternates the serve stance left and right across the change of server", () => {
+		let s = createMatch("near");
+		const xs: number[] = [s.players.near.x];
+		s = pointTo(s, "near"); // point 2: still near, ad court
+		xs.push(s.players.near.x);
+		s = pointTo(s, "near"); // point 3: far serves from far's deuce court
+		xs.push(s.players.far.x);
+		expect(Math.sign(xs[0] ?? 0)).toBe(1); // near faces -z: deuce is +x
+		expect(Math.sign(xs[1] ?? 0)).toBe(-1); // second point, ad court
+		expect(Math.sign(xs[2] ?? 0)).toBe(-1); // far faces +z: deuce is -x
+	});
+
+	it("keeps the same server on a second serve after a first-serve fault", () => {
+		const s = createMatch("near");
+		const server = s.toHit;
+		const faulted = tick(
+			{
+				...s,
+				phase: "serve-flight",
+				toHit: "far",
+				ball: still({ x: 0, y: BALL_RADIUS + 0.005, z: -8 }),
+			},
+			[],
+			DT,
+		);
+		expect(faulted.phase).toBe("waiting-serve");
+		expect(faulted.serveNumber).toBe(2);
+		expect(faulted.score.points).toEqual({ near: 0, far: 0 });
+		expect(faulted.score.pointsPlayed).toBe(0);
+		expect(faulted.toHit).toBe(server);
+		expectServerInPlace(faulted);
+		// The stance is still the first point's (deuce court), and while no
+		// point has been awarded the rotation has not moved.
+		expect(faulted.players[server]).toEqual({
+			side: server,
+			...serveSetup(s.score).server,
+		});
+	});
+
+	it("resets the serve number at the next point after the faulted second serve", () => {
+		// Get to point 2 — the last point of a pair, so a fault that wrongly
+		// counted as a completed point would flip the server and be caught.
+		const s = pointTo(createMatch("near"), "near");
+		expect(s.toHit).toBe("near");
+		expect(s.score.pointsPlayed).toBe(1);
+		const server = s.toHit;
+		const fault = (prev: MatchState) =>
+			tick(
+				{
+					...prev,
+					phase: "serve-flight",
+					toHit: other(prev.toHit),
+					ball: still({ x: 0, y: BALL_RADIUS + 0.005, z: -8 }),
+				},
+				[],
+				DT,
+			);
+		const second = fault(s); // 1st fault
+		expect(second.serveNumber).toBe(2);
+		expect(second.toHit).toBe(server);
+		expect(second.score.pointsPlayed).toBe(1);
+		const over = fault(second); // double fault, point to the receiver
+		expect(over.phase).toBe("point-over");
+		expect(over.score.pointsPlayed).toBe(2);
+		const next = tick(over, [], DT);
+		expect(next.serveNumber).toBe(1);
+		expect(next.score.pointsPlayed).toBe(2);
+		// Two points played: the rotation has now moved to far.
+		expect(next.toHit).toBe(other(server));
+	});
+
+	it("freezes the serve on a set already won — no rotation, no swap", () => {
+		const s = state({
+			phase: "point-over",
+			score: { ...createMatch("near").score, setWinner: "near" },
+		});
+		expect(tick(s, [], DT)).toEqual(s);
+		expect(tick(s, [input("near", s, swing(1))], DT)).toEqual(s);
 	});
 });
 

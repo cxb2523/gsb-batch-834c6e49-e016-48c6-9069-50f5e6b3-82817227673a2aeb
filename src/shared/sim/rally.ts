@@ -195,10 +195,17 @@ export function envFor(state: MatchState): BallEnv {
 
 const halfSign = (side: Side): number => (side === "near" ? 1 : -1);
 
-/** Everyone in place for the next serve, ball in the server's hand. */
+/** Everyone in place for the next serve, ball in the server's hand.
+ *
+ * The server is **derived by scoring**, not read off a remembered field:
+ * `ServeSetup.serverSide` is `servingSide(score)` — the two-point rotation
+ * (`scoring.ts`), or the tiebreak's own rotation — and `serveSetup` already
+ * places, aims and receivers from that same answer. That is what makes a
+ * second serve (a `fault`, which awards no point) keep the same server, and
+ * what makes "who serves" the same question in positioning, aim and state. */
 function setUpServe(state: MatchState, serveNumber: 1 | 2): MatchState {
-	const server = state.score.server;
 	const setup = serveSetup(state.score);
+	const server = setup.serverSide;
 	const players: Record<Side, Player> = {
 		near: { side: "near", x: 0, z: 0 },
 		far: { side: "far", x: 0, z: 0 },

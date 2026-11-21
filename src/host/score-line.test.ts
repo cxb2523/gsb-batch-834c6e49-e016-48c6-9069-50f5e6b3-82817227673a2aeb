@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createMatch, type MatchState, tick } from "../shared/sim/index.ts";
+import { awardPoint, initialScore } from "../shared/sim/scoring.ts";
 import { scoreLine } from "./score-line.ts";
 
 const swing = { kind: "forehand" as const, power: 0.6, at: 0, lag: 0 };
@@ -41,5 +42,18 @@ describe("scoreLine", () => {
 			},
 		};
 		expect(scoreLine(state).points).toEqual({ near: "4", far: "5" });
+	});
+
+	// The phone's "your serve" hint is only right if it reads the same
+	// derivation the sim placed the players from.
+	it("reports the derived server after every two points", () => {
+		let score = initialScore("near");
+		expect(scoreLine({ ...createMatch("near"), score }).serving).toBe("near");
+		score = awardPoint(score, "far");
+		expect(scoreLine({ ...createMatch("near"), score }).serving).toBe("near");
+		score = awardPoint(score, "near");
+		expect(scoreLine({ ...createMatch("near"), score }).serving).toBe("far");
+		score = awardPoint(score, "far");
+		expect(scoreLine({ ...createMatch("near"), score }).serving).toBe("far");
 	});
 });

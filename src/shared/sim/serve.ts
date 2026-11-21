@@ -15,6 +15,7 @@ import type { Side } from "../protocol.ts";
 import { type BallEnv, DRAG_K, stepBall } from "./ball.ts";
 import { BASELINE_Z } from "./court.ts";
 import type { PointValue, Score } from "./scoring.ts";
+import { servingSide } from "./scoring.ts";
 import { forwardOf, rightOf } from "./shot.ts";
 import type { Ball, Vec3 } from "./state.ts";
 
@@ -105,6 +106,9 @@ export function deuceCourt(score: Score): boolean {
 }
 
 export interface ServeSetup {
+	/** Who serves this point, from the rotation. The one answer positions,
+	 * aim and `rally.ts`'s `toHit` all read. */
+	readonly serverSide: Side;
 	readonly server: { x: number; z: number };
 	readonly receiver: { x: number; z: number };
 	/** World `x` the serve aims at when struck dead on the top of the toss. */
@@ -112,10 +116,14 @@ export interface ServeSetup {
 }
 
 export function serveSetup(score: Score): ServeSetup {
-	const side = score.server;
+	// Who serves is `servingSide`'s answer — the two-point rotation, or the
+	// tiebreak's — never a field someone remembered to flip. This is the one
+	// place positions and aim learn it, so `rally.ts` cannot disagree.
+	const side = servingSide(score);
 	const lean = rightOf(side) * (deuceCourt(score) ? 1 : -1);
 	const back = (s: Side) => (s === "near" ? 1 : -1) * (BASELINE_Z + 0.3);
 	return {
+		serverSide: side,
 		server: { x: lean * SERVE_STAND_X, z: back(side) },
 		receiver: {
 			x: -lean * SERVE_BOX_X,

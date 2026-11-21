@@ -656,3 +656,24 @@ tuning is against a simulated human.
 
 Added a 25-second trailer to the README, made with the
 [brag](https://github.com/latent-spaces/brag) skill.
+
+## [2026-11-21] fix | Serve changes after every two points, derived end to end
+
+`point-over` used to re-set the court off a fixed `Score.server` that only
+moved at a game boundary, so the server never changed mid-game and a first
+serve fault could not be shown to keep the same server by anything but luck.
+Scoring now records `pointsPlayed` and `firstServer` and derives the server in
+`servingSide` — two points each, tiebreak rotation at 6–6, frozen once the set
+is won. `serveSetup` reports that as `serverSide` and `setUpServe` takes
+`toHit`, the stance, the receiver and the ball in hand from it, so the
+transition to the next point is consistent by construction; a `fault` awards
+no point, so the second serve stays with the same side for free. Position,
+aim and `toHit` cannot disagree. Tests: the two-point timing, the deuce/ad
+stance alternating across a change of server, the second serve keeping its
+server and points, and the set-winner freeze, all through `tick`.
+
+The bot balance test moved from five to ten minutes: the changed serving order
+left five minutes dead level at 2–2 games though the better bot led on points;
+ten minutes is 6–2 to it.
+
+Promoted: amended [[tennis-scoring]] and [[modules/shared-sim]].

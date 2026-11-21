@@ -31,11 +31,11 @@ is [[0015-contact-model]]; where it then goes is
 | --- | --- |
 | `src/shared/sim/rally.ts` | `tick`, `MatchState`, the phase machine, the contact model (plan, arm, strike, rewind, revise), point resolution |
 | `src/shared/sim/shot.ts` | Timing windows, `timingOf`, `SCREEN_LEFT`, `isPowerShot`, and the launch solvers `groundstroke` / `smash` / `serveShot`. The feel core |
-| `src/shared/sim/serve.ts` | The toss, `TOSS_APEX`, deuce/ad positions and serve aim |
+| `src/shared/sim/serve.ts` | The toss, `TOSS_APEX`, deuce/ad positions and serve aim; `serveSetup` reports the server from `servingSide` |
 | `src/shared/sim/players.ts` | `predictStrike` — where and when a player meets the ball, including the overhead chance at `SMASH_HEIGHT`; stance, recovery, `movePlayer` |
 | `src/shared/sim/ball.ts` | `stepBall` — integration, net and bounce crossings |
 | `src/shared/sim/court.ts` | ITF geometry, `netHeightAt`, `isInBounds`, `isInServiceBox` |
-| `src/shared/sim/scoring.ts` | `awardPoint`, `Score`, tiebreak rotation |
+| `src/shared/sim/scoring.ts` | `awardPoint`, `Score`, `servingSide` — the two-point serve rotation and the tiebreak rotation |
 | `src/shared/sim/state.ts` | `Vec3`, `Ball`, `Player` (`{side, x, z}`) — flat readonly data |
 | `src/shared/sim/bot.ts` | `createBot(side, skill)` — the solo opponent. **Not part of `tick`** |
 | `src/shared/sim/index.ts` | Barrel re-export. No logic |
@@ -49,7 +49,7 @@ rally.ts  ── imports ──▶  ball.ts     (stepBall)
    │                      serve.ts    (toss, serveSetup, serveTargetX, serveTiming)
    │                      shot.ts     (groundstroke, smash, serveShot, timingOf, windows)
    │                      scoring.ts, state.ts, ../protocol.ts
-serve.ts  ── imports ──▶  ball.ts, court.ts, scoring.ts (types), shot.ts (forwardOf, rightOf)
+serve.ts  ── imports ──▶  ball.ts, court.ts, scoring.ts (types; servingSide), shot.ts (forwardOf, rightOf)
 shot.ts   ── imports ──▶  ball.ts (stepBall — the solver flies the real physics), court.ts
 players.ts ── imports ──▶ ball.ts (stepBall — the SAME physics), court.ts
 bot.ts    ── imports ──▶  rally.ts (MatchState type), serve.ts (TOSS_APEX),
@@ -84,6 +84,13 @@ The consumers are `src/host/main.ts` and `src/host/render/` — see
   means "changed" in `main.ts` and `events.ts`.
 - **Nothing non-deterministic enters `tick`.** The two-bot full-set replay in
   `rally.test.ts` is the regression net for every tuning change.
+- **Who serves is derived, never remembered.** `scoring.ts`'s `servingSide`
+  computes the server from `pointsPlayed` and `firstServer` (two points each,
+  or the tiebreak rotation, frozen once the set is won). `serveSetup` returns
+  that as `serverSide` and `setUpServe` takes `toHit`, the stance and the
+  receiver from it — so a `fault` (no point, no `awardPoint`) keeps the same
+  server, and positioning, aim and `toHit` cannot disagree. Do not reintroduce
+  a hand-flipped server field at the game boundary.
 - **A swing is compared with the frozen contact, never a fresh prediction.**
   Re-predicting at arrival is the bug that made every return whiff
   ([[0015-contact-model]]). The contact freezes on the receiver's bounce or when

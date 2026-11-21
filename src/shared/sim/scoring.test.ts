@@ -180,6 +180,53 @@ describe("games within a set", () => {
 	});
 });
 
+describe("serve rotation within the match", () => {
+	/** Plays `winners` from a fresh score, recording who serves each point. */
+	function serversFor(
+		winners: readonly ("near" | "far")[],
+	): ("near" | "far")[] {
+		let score = initialScore("near");
+		const servers: ("near" | "far")[] = [];
+		for (const winner of winners) {
+			servers.push(score.server);
+			score = awardPoint(score, winner);
+		}
+		servers.push(score.server);
+		return servers;
+	}
+
+	test("changes after every second point", () => {
+		expect(
+			serversFor(["near", "near", "near", "far", "far", "far", "far"]),
+		).toEqual(["near", "near", "far", "far", "near", "near", "far", "far"]);
+	});
+
+	test("keeps rotating across a game boundary", () => {
+		let score = initialScore("near");
+		for (let i = 0; i < 4; i++) score = awardPoint(score, "near");
+		expect(score.games.near).toBe(1);
+		expect(score.pointsPlayed).toBe(4);
+		expect(score.server).toBe("near"); // points 5 and 6 are near's
+		score = awardPoint(score, "near");
+		expect(score.server).toBe("near");
+		score = awardPoint(score, "near");
+		expect(score.server).toBe("far"); // point 7
+	});
+
+	test("leaves the server alone on the point that wins the set", () => {
+		let score = initialScore("near");
+		while (score.games.far < 5 && !score.setWinner) {
+			score = awardPoint(score, "far");
+		}
+		// Take the last game's points, then the set, and freeze there.
+		while (!score.setWinner) {
+			const before = score.server;
+			score = awardPoint(score, "far");
+			if (score.setWinner) expect(score.server).toBe(before);
+		}
+	});
+});
+
 describe("tiebreak", () => {
 	function reachTiebreak(server: "near" | "far") {
 		let score = initialScore(server);
