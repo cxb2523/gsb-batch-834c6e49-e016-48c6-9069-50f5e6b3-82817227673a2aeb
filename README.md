@@ -134,6 +134,17 @@ Skybridge spreads `view._meta` over the metadata it generates, so never put a `u
 with a `startOffset`, counts down the window and pauses at its end, then shows the hand-off and a replay button.
 Seeking back before the window returns to its start. The player only picks renditions no larger than itself.
 
+**The reel's one current trailer.** The Trailer Reel plays previews back to back, so its progress lives in a single
+reducer (`src/discover/reel.ts`, unit-tested in `test/unit/reel.test.ts`): the current index, whether it is playing
+or showing an end/error card, the failure streak and the pending automatic advance. Each switch starts a new
+"generation"; a player's `onEnded`/`onError`/`onReplay` callback carries the generation it mounted with, so a player
+that has already been torn down cannot move the reel or bump the failure count. Before a new player is created,
+`PreviewPlayer` queues the old one's `unload()`, UI release and `destroy()` through `playerLifecycle.ts`, and the new
+instance waits for that queue, so the two asynchronous lifecycles never overlap. The 4-second wait is a token in the
+same state: picking a film, "Next preview", replay, turning auto-advance off or the failure limit all drop the token,
+and a timer that still fires is ignored. Turning auto-advance back on over a card schedules a fresh full wait. Three
+consecutive failures stop the reel for that session; a manual pick resets the budget.
+
 **Content.** Eleven [Blender Studio open movies](https://studio.blender.org/projects/); three (Sintel, Tears of
 Steel, Big Buck Bunny) have previews, and every "Watch" link goes to the film's page on Blender Studio. Previews
 stream from Google's [Shaka Player demo assets](https://storage.googleapis.com/shaka-demo-assets/) and

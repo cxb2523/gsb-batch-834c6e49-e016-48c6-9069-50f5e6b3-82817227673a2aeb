@@ -1,4 +1,11 @@
-import { Player, type PlayerAPI, PlayerEvent, type SourceConfig } from 'bitmovin-player';
+import {
+  Player,
+  type PlayerAPI,
+  type ErrorEvent as PlayerErrorEvent,
+  PlayerEvent,
+  type SourceConfig,
+  type TimeChangedEvent,
+} from 'bitmovin-player';
 import { UIFactory } from 'bitmovin-player-ui';
 import 'bitmovin-player-ui/dist/css/bitmovinplayer-ui.css';
 import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from 'react';
@@ -6,6 +13,7 @@ import { type Film, type Preview, isBeforePreview, isPastPreview, previewRemaini
 import '../../utils/routeWindowOpenToHost.js';
 import { ICON } from '../cover.js';
 import { Icon } from '../Icon.js';
+import { previewPlayersRetired, retirePreviewPlayer } from './playerLifecycle.js';
 import { PlayerLoading, PreviewErrorCard } from './shared.js';
 
 const LOAD_TIMEOUT_MS = 30_000; // how long a source may take to load before the stage reports a failure
@@ -68,31 +76,22 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
     const container = document.createElement('div');
     node.appendChild(container);
 
-    const player: PlayerAPI = new Player(container, {
-      key: licenseKey,
-      // Playback starts manually after load() so the play() promise is ours to
-      // catch; config autoplay leaves an uncaught rejection when blocked.
-      playback: { autoplay: false, muted: true },
-      // A preview plays in a small widget: never fetch renditions larger than
-      // the player, which would otherwise climb to 4K on a fast connection.
-      adaptation: { limitToPlayerSize: true },
-      ui: false,
-    });
-    playerRef.current = player;
-    const uiManager = UIFactory.buildUI(player);
+    let player: PlayerAPI | undefined;
+    let uiManager: ReturnType<typeof UIFactory.buildUI> | undefined;
+    let loadTimer: ReturnType<typeof setTimeout> | undefined;
 
     const fail = (detail: string) => {
       if (cancelled || failed) {
         return;
       }
       failed = true;
-      void player.unload().catch(() => {}); // stop a load that is still in flight
+      void player?.unload().catch(() => {}); // stop a load that is still in flight
       setError(detail);
       fireError();
     };
 
     const finish = () => {
-      if (cancelled || failed || endedRef.current) {
+      if (cancelled || failed || endedRef.current || !player) {
         return;
       }
       endedRef.current = true;
@@ -102,13 +101,17 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
       fireEnded();
     };
 
-    player.on(PlayerEvent.Ready, () => {
+    // Every handler checks `cancelled` and is also detached on teardown, so a
+    // callback that a destroyed player still delivers (an in-flight Ready, a
+    // late TimeChanged, a load that times out after unmount) can neither touch
+    // this component's UI nor reach the reel's failure count.
+    const onReady = () => {
       if (!cancelled) {
         setLoading(false);
       }
-    });
-    player.on(PlayerEvent.TimeChanged, e => {
-      if (cancelled || failed) {
+    };
+    const onTimeChanged = (e: TimeChangedEvent) => {
+      if (cancelled || failed || !player) {
         return;
       }
       if (isBeforePreview(previewWindow, e.time)) {
@@ -124,43 +127,89 @@ export function PreviewPlayer({ film, licenseKey, onEnded, onError, onReplay, ha
       if (isPastPreview(previewWindow, e.time)) {
         finish();
       }
-    });
-    player.on(PlayerEvent.PlaybackFinished, finish);
-    player.on(PlayerEvent.Error, e => fail(`Error ${e.code}: ${e.message ?? 'playback failed'}`));
+    };
+    const onError = (e: PlayerErrorEvent) => {
+      fail(`Error ${e.code}: ${e.message ?? 'playback failed'}`);
+    };
 
-    const source: SourceConfig = { title: film.title, options: { startOffset: startSec } };
-    if (stream.type === 'hls') {
-      source.hls = stream.url;
-    } else {
-      source.dash = stream.url;
-    }
+    // The previous player must be fully retired (source unloaded, UI released,
+    // instance destroyed) before this one exists and starts loading. The queue
+    // in `playerLifecycle` serializes the two asynchronous lifecycles, so they
+    // never overlap; a re-render that cancelled this effect removes it from
+    // the queue by simply not creating anything.
+    void previewPlayersRetired().then(() => {
+      if (cancelled) {
+        return;
+      }
+      player = new Player(container, {
+        key: licenseKey,
+        // Playback starts manually after load() so the play() promise is ours
+        // to catch; config autoplay leaves an uncaught rejection when blocked.
+        playback: { autoplay: false, muted: true },
+        // A preview plays in a small widget: never fetch renditions larger than
+        // the player, which would otherwise climb to 4K on a fast connection.
+        adaptation: { limitToPlayerSize: true },
+        ui: false,
+      });
+      const sdk = player;
+      playerRef.current = sdk;
+      uiManager = UIFactory.buildUI(sdk);
 
-    let loadTimer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, rej) => {
-      loadTimer = setTimeout(
-        () => rej(new Error(`The preview did not load within ${LOAD_TIMEOUT_MS / 1000}s.`)),
-        LOAD_TIMEOUT_MS,
-      );
+      sdk.on(PlayerEvent.Ready, onReady);
+      sdk.on(PlayerEvent.TimeChanged, onTimeChanged);
+      sdk.on(PlayerEvent.PlaybackFinished, finish);
+      sdk.on(PlayerEvent.Error, onError);
+
+      const source: SourceConfig = { title: film.title, options: { startOffset: startSec } };
+      if (stream.type === 'hls') {
+        source.hls = stream.url;
+      } else {
+        source.dash = stream.url;
+      }
+
+      const timeout = new Promise<never>((_, rej) => {
+        loadTimer = setTimeout(
+          () => rej(new Error(`The preview did not load within ${LOAD_TIMEOUT_MS / 1000}s.`)),
+          LOAD_TIMEOUT_MS,
+        );
+      });
+      Promise.race([sdk.load(source), timeout])
+        .then(() => {
+          if (cancelled || failed) {
+            return;
+          }
+          // In a sandbox that blocks even muted autoplay the rejection is
+          // benign; the user can press play.
+          sdk.play().catch(() => {});
+        })
+        .catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)))
+        .finally(() => clearTimeout(loadTimer));
     });
-    Promise.race([player.load(source), timeout])
-      .then(() => {
-        if (cancelled || failed) {
-          return;
-        }
-        // In a sandbox that blocks even muted autoplay the rejection is benign;
-        // the user can press play.
-        player.play().catch(() => {});
-      })
-      .catch((e: unknown) => fail(e instanceof Error ? e.message : String(e)))
-      .finally(() => clearTimeout(loadTimer));
 
     return () => {
       cancelled = true;
       clearTimeout(loadTimer);
       playerRef.current = null;
-      uiManager.release();
+      const retiring = player;
+      const ui = uiManager;
+      if (!retiring) {
+        container.remove();
+        return;
+      }
+      // Detach first so nothing the teardown itself emits (a source-unload
+      // error, a Ready already queued) reaches our handlers, then stop the
+      // source, release the UI and destroy the instance. The next player's
+      // mount waits on this queue, so the two never run at the same time.
+      retiring.off(PlayerEvent.Ready, onReady);
+      retiring.off(PlayerEvent.TimeChanged, onTimeChanged);
+      retiring.off(PlayerEvent.PlaybackFinished, finish);
+      retiring.off(PlayerEvent.Error, onError);
       container.remove();
-      void player.destroy().catch(() => {});
+      void retirePreviewPlayer(async () => {
+        await retiring.unload().catch(() => {});
+        ui?.release();
+        await retiring.destroy().catch(() => {});
+      });
     };
   }, [film.title, stream.url, stream.type, startSec, durationSec, licenseKey]);
 
