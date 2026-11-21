@@ -1,0 +1,80 @@
+# CI workflow — Playwright smoke test for Spike Sprint (static HTML/CSS/JS game)
+# This project has no build step, no package manager, and no server —
+# a single self-contained index.html file. CI verifies the game loads
+# without console errors and core gameplay logic (score, jump, collisions,
+# high score) behaves correctly using a headless browser.
+# Docs: https://docs.github.com/en/actions
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  playwright-smoke-test:
+    name: Playwright Smoke Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run smoke test
+        run: |
+          cat > smoke_test.py << 'EOF'
+          import asyncio, sys
+          from playwright.async_api import async_playwright
+
+          async def run_test():
+              errors = []
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch()
+                  page = await browser.new_page(viewport={"width": 1280, "height": 720})
+                  page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
+                  page.on("pageerror", lambda exc: errors.append(str(exc)))
+
+                  await page.goto("file://" + __file__.replace("smoke_test.py", "index.html"))
+                  await page.wait_for_timeout(300)
+
+                  start_visible = await page.is_visible("#startScreen")
+                  assert start_visible, "Start screen did not render"
+
+                  await page.click("#startBtn")
+                  await page.wait_for_timeout(1200)
+
+                  hud_1 = await page.text_content("#hud")
+                  await page.wait_for_timeout(1000)
+                  hud_2 = await page.text_content("#hud")
+                  assert int(hud_2) >= int(hud_1), "Score did not increase over time"
+
+                  await page.mouse.down()
+                  await page.wait_for_timeout(150)
+                  await page.mouse.up()
+                  await page.wait_for_timeout(500)
+
+                  await browser.close()
+
+                  if errors:
+                      print("Console/page errors detected:", errors)
+                      sys.exit(1)
+                  print("Smoke test passed: no console errors, start screen renders, score increments, jump works.")
+
+          asyncio.run(run_test())
+          EOF
+          python3 smoke_test.py
