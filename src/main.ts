@@ -381,6 +381,9 @@ $('#fullscreen-button').addEventListener('click', async () => {
 document.addEventListener('fullscreenchange', () => $('#fullscreen-button').setAttribute('aria-label', document.fullscreenElement ? '退出全屏' : '进入全屏'));
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) requestPause();
+  // Sync the audio phase immediately: rAF is suspended while hidden, so waiting
+  // for the next frame would briefly restart racing music over the pause dialog.
+  audio.setPhase(simulation.state.phase);
   audio.setFocused(!document.hidden && document.hasFocus()); updateSound();
 }, { signal: audioEvents.signal });
 

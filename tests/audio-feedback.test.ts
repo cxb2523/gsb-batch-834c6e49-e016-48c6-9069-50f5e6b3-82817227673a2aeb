@@ -323,3 +323,102 @@ test('dispose stops feedback and music, removes listeners and cannot unlock or s
   assert.ok(gainNodes.every(node => node.disconnected), 'pending one-shot gains also release without waiting for onended');
   assert.equal(audio.snapshot.contextState, 'locked');
 });
+
+test('mute, music toggle and both volumes persist independently across sessions', () => {
+  const fresh = new GameAudio();
+  fixtures.push(fresh);
+  assert.equal(fresh.muted, false);
+  assert.equal(fresh.musicEnabled, true);
+  assert.equal(fresh.musicVolume, 0.4);
+  assert.equal(fresh.effectsVolume, 0.8);
+  fresh.setMusicVolume(0.23);
+  fresh.setEffectsVolume(0.61);
+  fresh.setMusicEnabled(false);
+  fresh.setMuted(true);
+  const restored = new GameAudio();
+  fixtures.push(restored);
+  assert.equal(restored.musicVolume, 0.23);
+  assert.equal(restored.effectsVolume, 0.61);
+  assert.equal(restored.musicEnabled, false);
+  assert.equal(restored.muted, true);
+  // Changing one preference must not rewrite the others.
+  restored.setMuted(false);
+  const again = new GameAudio();
+  fixtures.push(again);
+  assert.equal(again.muted, false);
+  assert.equal(again.musicEnabled, false, 'unmuting does not re-enable music');
+  assert.equal(again.musicVolume, 0.23);
+  assert.equal(again.effectsVolume, 0.61);
+});
+
+test('stored preferences are clamped and malformed values fall back to defaults', () => {
+  localStorage.setItem('sand-rally-muted', 'yes');
+  localStorage.setItem('sand-rally-music-enabled', '0');
+  localStorage.setItem('sand-rally-music-volume', '1.7');
+  localStorage.setItem('sand-rally-effects-volume', 'loud');
+  const audio = new GameAudio();
+  fixtures.push(audio);
+  assert.equal(audio.muted, false, 'only the exact string true mutes');
+  assert.equal(audio.musicEnabled, true, 'only the exact string false disables music');
+  assert.equal(audio.musicVolume, 1, 'out-of-range volumes are clamped');
+  assert.equal(audio.effectsVolume, 0.8, 'malformed volumes fall back to the default');
+});
+
+test('engine, wind and tire beds fall silent while paused and recover on resume', async () => {
+  const { audio } = await setup();
+  const beds = audio as unknown as { engineGain: MockNode; windGain: MockNode; tireGain: MockNode };
+  const lastTarget = (node: MockNode) => node.gain.events.filter(event => event.method === 'target').at(-1)?.value;
+  audio.update(90, true, true, true);
+  assert.ok(lastTarget(beds.engineGain)! > 0);
+  assert.ok(lastTarget(beds.windGain)! > 0);
+  assert.ok(lastTarget(beds.tireGain)! > 0);
+  audio.setPhase('paused');
+  audio.update(90, true, true, false);
+  assert.equal(lastTarget(beds.engineGain), 0, 'engine is silent while paused');
+  assert.equal(lastTarget(beds.windGain), 0, 'wind is silent while paused');
+  assert.equal(lastTarget(beds.tireGain), 0, 'tires are silent while paused');
+  audio.setPhase('racing');
+  audio.update(90, true, true, true);
+  assert.ok(lastTarget(beds.engineGain)! > 0, 'beds recover with the race');
+});
+
+test('pause, hidden and resume keep exactly one music scheduler and release every voice', async () => {
+  const { audio, context } = await setup();
+  audio.setMusicEnabled(true);
+  assert.equal(timers.size, 1);
+  const music = () => audio.snapshot.music!;
+  for (let i = 0; i < 12; i++) {
+    audio.setPhase('racing');
+    context.advance(0.09);
+    for (const callback of [...timers.values()]) callback();
+    assert.equal(timers.size, 1, 'resume never stacks a second scheduler');
+    audio.setPhase('paused');
+    assert.equal(music().mode, 'paused');
+    assert.equal(timers.size, 0, 'pause stops scheduling');
+    context.advance(0.2);
+    assert.equal(music().activeSources, 0, 'paused voices are released after the short fade');
+  }
+  documentState.hidden = true;
+  audio.setFocused(true);
+  assert.equal(music().mode, 'hidden');
+  assert.equal(timers.size, 0);
+  documentState.hidden = false;
+  audio.setPhase('racing');
+  assert.equal(timers.size, 1, 'a single scheduler restarts on return');
+  assert.equal(audio.musicEnabled, true, 'pause/hidden cycles never rewrite the user preference');
+  assert.equal(audio.musicVolume, 0.4);
+  assert.equal(music().enabled, true);
+});
+
+test('interface clicks never restart or stack the music transport', async () => {
+  const { audio, context } = await setup();
+  audio.setMusicEnabled(true);
+  assert.equal(timers.size, 1);
+  for (let i = 0; i < 3; i++) {
+    const notes = audio.snapshot.music!.scheduledNotes;
+    assert.equal(playSources(audio, context, 'click').length, 1);
+    assert.equal(timers.size, 1, 'a click does not create another scheduler');
+    assert.equal(audio.snapshot.music!.scheduledNotes, notes, 'a click does not reschedule music');
+    context.advance(0.1);
+  }
+});

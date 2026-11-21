@@ -287,6 +287,97 @@ test('suspended contexts stay silent and resume safely without changing the pref
   assert.equal(timers.size, 0, 'context resume cannot override a disabled preference');
 });
 
+test('resume quantizes to the next whole beat and never replays the paused gap', () => {
+  const { music, context } = setup();
+  music.setMode('racing');
+  music.setEnabled(true);
+  advance(context, 1.37);
+  music.setMode('paused');
+  const notesWhenPaused = music.snapshot.scheduledNotes;
+  advance(context, 3);
+  assert.equal(music.snapshot.scheduledNotes, notesWhenPaused, 'a long pause queues nothing');
+  const internals = music as unknown as { transportStep: number };
+  const skipped = internals.transportStep;
+  const startedBefore = context.started.length;
+  const resumedAt = context.currentTime;
+  music.setMode('racing');
+  // The synchronous pump schedules exactly one step (the lookahead window fits a
+  // single 16th), so the first step scheduled after resume is transportStep - 1.
+  assert.equal((internals.transportStep - 1) % 4, 0, 'the first step after resume is beat-aligned');
+  assert.ok(internals.transportStep > skipped, 'transport never rewinds');
+  assert.ok(music.snapshot.scheduledNotes - notesWhenPaused < 24, 'only the lookahead window is scheduled');
+  advance(context, 0.5);
+  for (const source of context.started.slice(startedBefore)) {
+    assert.ok(source.startTime >= resumedAt, 'no note is scheduled into the paused gap');
+  }
+  assert.ok(music.snapshot.scheduledNotes - notesWhenPaused < 48, 'no backlog burst after resume');
+});
+
+test('rapid pause, resume and menu toggling keep one scheduler and a bounded voice pool', () => {
+  const { music, context } = setup();
+  music.setEnabled(true);
+  let peak = 0;
+  for (let i = 0; i < 30; i++) {
+    music.setMode(i % 2 ? 'racing' : 'menu');
+    advance(context, 0.09);
+    assert.equal(timers.size, 1, 'exactly one scheduler while playing');
+    music.setMode(i % 3 ? 'paused' : 'hidden');
+    advance(context, 0.07);
+    assert.equal(timers.size, 0, 'silent modes stop scheduling');
+    assert.equal(music.snapshot.activeSources, 0, 'every voice is released after the short fade');
+    peak = Math.max(peak, music.snapshot.activeSources);
+  }
+  music.setMode('racing');
+  advance(context, 0.4);
+  peak = Math.max(peak, music.snapshot.activeSources);
+  assert.ok(peak < 60, `voice pool stays bounded, observed ${peak}`);
+  music.setMode('paused');
+  advance(context, 0.2);
+  assert.equal(music.snapshot.activeSources, 0);
+  assert.equal(timers.size, 0);
+});
+
+test('re-applying the current mode or changing volume never restarts the transport', () => {
+  const { music, context } = setup();
+  music.setMode('racing');
+  music.setEnabled(true);
+  advance(context, 0.8);
+  const internals = music as unknown as { transportStep: number };
+  const notes = music.snapshot.scheduledNotes;
+  const step = internals.transportStep;
+  for (let i = 0; i < 8; i++) {
+    music.setMode('racing');
+    music.setVolume(0.3 + i * 0.05);
+    music.setIntensity(0.5);
+  }
+  assert.equal(timers.size, 1, 'no additional scheduler is created');
+  assert.equal(music.snapshot.scheduledNotes, notes, 'no extra notes are scheduled');
+  assert.equal(internals.transportStep, step, 'transport position is untouched');
+  advance(context, 0.5);
+  assert.ok(music.snapshot.scheduledNotes > notes, 'the original transport keeps playing');
+  assert.equal(music.snapshot.volume, 0.65);
+});
+
+test('pause and resume preserve the user volume and enabled preference', () => {
+  const { music, context } = setup();
+  music.setMode('racing');
+  music.setVolume(0.72);
+  music.setEnabled(true);
+  advance(context, 0.4);
+  music.setMode('paused');
+  advance(context, 0.2);
+  music.setVolume(0.65);
+  assert.equal(music.snapshot.volume, 0.65, 'adjusting the slider while paused stores the preference');
+  assert.equal(music.snapshot.timerActive, false, 'but does not restart playback');
+  music.setMode('racing');
+  advance(context, 0.3);
+  assert.equal(music.snapshot.volume, 0.65);
+  assert.equal(music.snapshot.enabled, true);
+  const master = (music as unknown as { master: { gain: { events: { method: string; value: number }[] } } }).master;
+  const targets = master.gain.events.filter(event => event.method === 'target');
+  assert.equal(targets.at(-1)!.value, 0.65, 'master fades back to the user volume, not a default');
+});
+
 test('the full arrangement stays finite and bounded; dispose releases nodes and listeners', () => {
   const { music, context } = setup();
   music.setMode('racing'); music.setIntensity(1); music.setEnabled(true);
