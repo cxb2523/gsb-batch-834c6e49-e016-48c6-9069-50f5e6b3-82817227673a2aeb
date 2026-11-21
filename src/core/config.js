@@ -111,6 +111,31 @@ export const CFG = {
     // in-frustum lights are dropped — dimmest first, so a bright nearby flash always
     // survives — and F3 reports `lights dropped` live so the trade is never silent.
     lightBudget: null,
+    // Performance-adaptive light budget. When wall-clock frame time stays over
+    // `frameMsDown` for `downFrames` consecutive frames, the visible-light ceiling
+    // walks one rung DOWN the existing (prewarmed) ladder; once frame time holds
+    // under `frameMsUp` for `upFrames` frames it walks back up, one rung at a time.
+    // Every shift couples ALL FOUR lighting chains atomically — light ceiling
+    // (lightcull), GTAO/contact-AO sample tier (pipeline), sky/ambient intensity
+    // (sky), and a forced CSM material rescan so materials born on the shift frame
+    // still get shadow cascades. See src/render/perfadapt.js.
+    perfAdapt: {
+      enabled: true,
+      frameMsDown: 34,        // ~29 fps: a frame over this counts toward a downshift
+      frameMsUp: 25,          // 40 fps: a frame under this counts toward recovery
+      downFrames: 45,         // ~0.75 s sustained over-budget before stepping down
+      upFrames: 180,          // 3 s sustained headroom before stepping back up
+      cooldownFrames: 60,     // min frames between any two shifts, either direction
+      warmupFrames: 120,      // no decisions for the first ~2 s after (re)enable
+      stallMs: 100,           // dt above this is a tab/background stall, not load
+      // Coupling tiers, one entry per ALL_RUNGS rung, LOW rung first. A shorter
+      // budget-capped ladder aligns from the TOP (its top rung always takes the
+      // initial/high tier). AO SAMPLES and ambient scale therefore move in lockstep
+      // with the light rung — lights can never drop while AO keeps sampling high,
+      // and ambient can never stay scaled after the ceiling is restored.
+      aoSamples:   [6, 9, 12, 16, 16, 16],
+      ambientMult: [1.15, 1.10, 1.06, 1.02, 1.0, 1.0],
+    },
   },
   world: {
     tile: 4,               // metres per dungeon cell

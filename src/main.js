@@ -16,6 +16,7 @@ import loot      from './game/loot.js';
 import camera    from './render/camera.js';
 import pipeline  from './render/pipeline.js';
 import lightcull from './render/lightcull.js';
+import perfadapt from './render/perfadapt.js';
 import hud       from './ui/hud.js';
 import audio     from './audio/audio.js';
 
@@ -56,6 +57,11 @@ engine
 // culler never chose (measured: 18 AND 23 both rendering).
 engine.systems.push({ name: 'input-flush', frame: () => Input.endFrame() });
 engine.use(lightcull);
+// PerfAdapt registers AFTER lightcull on purpose: its frame() sets the adaptive
+// ceiling through World.lightCull, and the cull reads that ceiling later in the
+// same frame list — so a cap change takes effect the very next cull, one frame
+// after the policy decision. It never touches light visibility itself.
+engine.use(perfadapt);
 
 engine.boot().then(() => {
   // Compile every light-count rung while the loading curtain is still up. Three.js
@@ -82,3 +88,12 @@ engine.boot().then(() => {
 });
 
 window.__ENGINE = engine;
+// Console/F3 debug handles onto the existing blackboards — no new singletons, just
+// named access to objects the systems already publish. From DevTools:
+//   World.perfAdapt.stats          // adaptive level, rung, AO tier, ambient, streaks
+//   World.lightCull.stats          // shown/inFrustum, droppedInFrustum, droppedByAdapt
+//   World.lightCull.capRung        // null when the adaptive ceiling is lifted
+//   World.perfAdapt.setEnabled(false) // manual off: restores initial lighting
+import * as THREE_NS from 'three';
+window.World = World;
+window.THREE = THREE_NS;

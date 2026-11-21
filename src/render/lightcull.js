@@ -170,9 +170,24 @@ let enabled = true;
 let dirty = true;       // rescan the scene graph for lights
 let lastRung = -1;
 
+// ---------------------------------------------------------------- adaptive cap
+// The runtime "performance ladder" sits ON TOP of the static ladder, never beside
+// it. `capRung` is one of RUNGS (null = no cap); the cull quantises demand to the
+// highest rung that is BOTH >= demand AND <= capRung. Every rung was prewarmed at
+// boot, so capping compiles nothing in play — it only narrows the visible ladder.
+//
+// The perf-adapt system (src/render/perfadapt.js) owns the policy that moves the
+// cap; this module only enforces it and counts what it costs. A contributing light
+// hidden because of the cap is still a real drop and is counted in BOTH
+// `droppedInFrustum` (the existing never-silent total) and `droppedByAdapt` (the
+// share attributable to adaptation), so F3 and the console can separate
+// ladder-overflow losses from adaptive-budget losses.
+let capRung = null;
+
 const stats = {
   live: 0, inFrustum: 0, shown: 0, rung: 0,
   culled: 0, padded: 0, droppedInFrustum: 0, rungChanges: 0, offRung: 0,
+  droppedByAdapt: 0, capRung: null, capped: false,
 };
 
 /** Rescan the scene for PointLights. Cheap, but not per-frame: pools are created
@@ -187,6 +202,17 @@ function collect() {
 function rungFor(n) {
   for (let i = 0; i < RUNGS.length; i++) if (RUNGS[i] >= n) return RUNGS[i];
   return RUNGS[RUNGS.length - 1];
+}
+
+/** Smallest rung fitting demand `n` that does not exceed the adaptive cap; the
+ *  capped ladder's top rung when demand exceeds it. No cap -> plain rungFor(). */
+function effectiveRungFor(n) {
+  if (capRung == null) return rungFor(n);
+  for (let i = 0; i < RUNGS.length; i++) {
+    if (RUNGS[i] > capRung) break;
+    if (RUNGS[i] >= n) return RUNGS[i];
+  }
+  return capRung;
 }
 
 function cull() {
@@ -243,7 +269,8 @@ function cull() {
     }
   }
 
-  const rung = rungFor(_in.length);
+  const uncappedRung = rungFor(_in.length);
+  const rung = effectiveRungFor(_in.length);
   if (rung !== lastRung) { stats.rungChanges++; lastRung = rung; }
 
   // Shadow-casting lights must keep a stable slot: dropping one changes the
@@ -278,9 +305,18 @@ function cull() {
   stats.inFrustum = _in.length;            // of those, able to affect a visible pixel
   stats.shown = shown;                     // MUST equal rung, every frame
   stats.rung = rung;
+  stats.capRung = capRung;                 // null = uncapped; otherwise the adaptive ceiling rung
+  stats.capped = capRung != null;          // boolean convenience for F3/console
   stats.culled = _out.length + _parked.length - padded;   // hidden as zero-contribution
   stats.padded = padded;                   // shown only to hold the count on a rung
   stats.droppedInFrustum = dropped;        // >0 means real light was lost — never silent
+  // Of this frame's drops, how many were forced by the ADAPTIVE cap rather than the
+  // static ladder overflowing? Uncapped, the demand would have taken `uncappedRung`;
+  // every in-frustum light past that rung's capacity beyond the cap is an adaptation
+  // loss. Equal to `dropped` while capped, 0 uncapped — but reported separately so a
+  // config `lightBudget` cap and runtime adaptation remain distinguishable.
+  stats.droppedByAdapt = capRung == null ? 0 : Math.max(0, _in.length - capRung)
+    - Math.max(0, _in.length - uncappedRung);
   // Landing off-rung is the one failure that costs hundreds of milliseconds, so it is
   // asserted rather than trusted. `offRung` accumulating means the prewarm is being
   // bypassed and something else is toggling light visibility after this system runs.
@@ -340,6 +376,22 @@ const api = {
   get stats() { return { ...stats }; },
   get rungs() { return RUNGS.slice(); },
   get enabled() { return enabled; },
+  /** Current adaptive ceiling as a rung value; null when uncapped. */
+  get capRung() { return capRung == null ? null : capRung; },
+  /** Runtime ceiling over the visible ladder, driven by perfadapt. `rung` must be
+   *  a value on RUNGS (it is clamped to the nearest rung at or below it); null
+   *  removes the cap. Prewarmed rungs only, so this never compiles a material.
+   *  Returns the effective ceiling after clamping. */
+  setAdaptiveCap(rung) {
+    if (rung == null) { capRung = null; return null; }
+    let chosen = RUNGS[0];
+    for (let i = 0; i < RUNGS.length; i++) {
+      if (RUNGS[i] <= rung) chosen = RUNGS[i];
+      else break;
+    }
+    capRung = chosen;
+    return capRung;
+  },
   /** Toggle for same-tree A/B. Off restores every live light to visible. */
   setEnabled(on) {
     enabled = !!on;
@@ -361,6 +413,7 @@ export default {
   init(ctx) {
     scene = ctx.scene; camera = ctx.camera; renderer = ctx.renderer;
     enabled = CFG.graphics.lightCull !== false;
+    capRung = null;   // adaptive ceiling starts lifted; perfadapt may lower it at runtime
     // Apply the optional budget cap. Rungs above it are removed entirely, so they are
     // never prewarmed and never reached — the shader variant count falls with the cap.
     const cap = CFG.graphics.lightBudget;

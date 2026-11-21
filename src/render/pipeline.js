@@ -246,6 +246,29 @@ const api = {
     return renderer.toneMappingExposure;
   },
 
+  /** Performance-adaptive AO sample tier. The perf-adapt ladder calls this when the
+   *  visible-light rung moves, so AO and contact-shadow sampling can never stay on
+   *  the high tier while the light budget drops (or vice versa). Only SAMPLES
+   *  changes — pass enable/disable, radius and blend are untouched, so this never
+   *  alters which effects are on, only how many occlusion samples they take.
+   *  GTAOPass no-ops the define when it already matches, so repeated same-value
+   *  calls cost nothing. Returns the applied sample count. */
+  setPerfSamples(samples) {
+    const n = Math.max(1, Math.floor(samples));
+    if (contactPass && contactPass.gtaoMaterial.defines.SAMPLES !== n) {
+      contactPass.updateGtaoMaterial({ samples: n });
+    }
+    if (gtaoPass && gtaoPass.gtaoMaterial.defines.SAMPLES !== n) {
+      gtaoPass.updateGtaoMaterial({ samples: n });
+    }
+    return n;
+  },
+
+  /** Introspection for perfadapt (initial tier capture + F3/console checks). */
+  get perfSamples() {
+    return gtaoPass ? gtaoPass.gtaoMaterial.defines.SAMPLES : null;
+  },
+
   /** Contact-AO term on/off — for same-tree A/B (toggle MY change, capture, revert)
    *  and for the quality/critique loop. Returns effective enabled state. */
   setContactAO(on) {

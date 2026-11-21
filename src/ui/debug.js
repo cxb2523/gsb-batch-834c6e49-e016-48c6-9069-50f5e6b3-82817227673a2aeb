@@ -22,6 +22,13 @@ export class DebugOverlay {
       // `drop` is the one alarming number: >0 means demand exceeded the top rung and a
       // CONTRIBUTING light was discarded, i.e. a visible quality loss. It should read 0.
       ['lights', 'lights'], ['drop', 'lights dropped'],
+      // Performance-adaptive budget (src/render/perfadapt.js). `adapt` shows the live
+      // ceiling as "level rung" plus the coupled AO sample tier and ambient scale, so a
+      // single row proves all four chains moved together. OFF means the policy is
+      // disabled and the full static ladder + authored lighting are in force.
+      // `adapt drop` counts only the in-frustum lights the ADAPTIVE cap (not a static
+      // ladder overflow) hid this frame — the acceptance-visible cost of adaptation.
+      ['adapt', 'perf adapt'], ['adrop', 'adapt drop'],
     ]) {
       const r = el('div', 'd-row', this.box);
       el('span', 'd-k', r).textContent = label;
@@ -75,6 +82,21 @@ export class DebugOverlay {
       if (this.rows.drop.className !== 'd-v' + dCls) this.rows.drop.className = 'd-v' + dCls;
     }
 
+    const pa = World.perfAdapt && World.perfAdapt.stats;
+    if (pa) {
+      if (!pa.enabled) {
+        set('adapt', 'OFF');
+        set('adrop', '0');
+      } else {
+        // "L0/5 12 ao6 a1.15" — level index, rung, coupled AO tier, ambient scale.
+        set('adapt', `L${pa.level}/${pa.topLevel} ${pa.rung} ao${pa.aoSamples} a${pa.ambientMult.toFixed(2)}`);
+        // Adaptive drops come straight from the culler's per-frame attribution.
+        const ad = lc ? lc.droppedByAdapt : 0;
+        set('adrop', ad > 0 ? `${ad} THIS FRAME` : '0');
+        const aCls = ad > 0 ? ' warn' : '';
+        if (this.rows.adrop.className !== 'd-v' + aCls) this.rows.adrop.className = 'd-v' + aCls;
+      }
+    }
     this._acc = 0; this._frames = 0; this._ftSum = 0; this._ftPeak = 0;
   }
 

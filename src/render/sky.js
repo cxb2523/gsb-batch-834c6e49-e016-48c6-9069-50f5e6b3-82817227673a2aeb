@@ -321,7 +321,9 @@ let skylightBase = SKY.skylight.baseInt;
 let brazierLevel = SKY.brazierIntensity;   // warm-pool exposure; props reads World.lighting.brazierIntensity
 let frameCount = 0;
 let sunIntensityBase = SKY.sunIntensity;   // mutable so runtime tuning survives per-frame drift
+let ambientMult = 1;                        // live scale vs authored env/hemi baseline
 const _csmSeen = new WeakSet();
+let csmSweepCount = 0;                      // total material sweeps run (debug/console check)
 
 function isLitMaterial(m) {
   return !!(m && (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial ||
@@ -344,6 +346,7 @@ function registerCSMMaterial(mat) {
 // by ALL cascade lights at once (over-bright) — this guarantees correctness even
 // if a sibling forgets to call World.registerCSMMaterial.
 function sweepMaterials(scene) {
+  csmSweepCount++;
   scene.traverse((o) => {
     if (o.isMesh && o.material) registerCSMMaterial(o.material);
   });
@@ -720,6 +723,12 @@ export default {
     World.sunColor = sunColor.clone();
     World.sunPosition = _sunWorld.copy(camera.position).addScaledVector(sunDir, 900).clone();
     World.registerCSMMaterial = registerCSMMaterial;
+    // Forced full-scene rescan. The per-frame path already sweeps every 20 frames as a
+    // backstop; perfadapt calls this explicitly at a light-ladder shift so a lit material
+    // added in the SAME frame as the shift (which triggers material re-registration in
+    // Three's program cache) cannot miss its CSM defines and render without shadows.
+    World.rescanCSMMaterials = () => sweepMaterials(scene);
+    World.getCSMSweepCount = () => csmSweepCount;
 
     // Runtime-tunable lighting surface (the critique loop drives ambient here
     // without re-editing this file — ambient level is the highest-leverage knob).
@@ -749,9 +758,13 @@ export default {
     };
     // Single-knob ambient scale relative to the authored baseline.
     World.setAmbientIntensity = (mult = 1) => {
+      ambientMult = mult;
       scene.environmentIntensity = SKY.envIntensity * mult;
       hemi.intensity = SKY.hemiIntensity * mult;
     };
+    // Read-back of the scale currently applied (1 = authored baseline). perfadapt
+    // uses it to prove its teardown restores the initial lighting exactly.
+    World.getAmbientIntensityMult = () => ambientMult;
 
     // Register any materials that already exist, then again after the level
     // announces itself (level/props build most geometry on LEVEL_READY).
