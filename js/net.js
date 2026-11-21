@@ -216,6 +216,7 @@ class NetClient {
       }
       this.applySelf(m);
     } else if (m.t === 'ro') this.roster(m.list);
+    else if (m.t === 'ev') this.event(m.ev);   // 房主点对点补发的事件（如中途加入时的已有掉落物）
     else if (m.t === 'ctr') HUD.center(...m.a);
     else if (m.t === 's2') Sound.play(m.n, { vol: m.v });
     else if (m.t === 'ob') { if (this.g.player.alive) HUD.openBuy(this.g); }
@@ -421,7 +422,16 @@ class NetClient {
         break;
       }
       case 'nade': { const a = A(ev.a); if (a) g.spawnGrenade(ev.id, vn(ev.p), vn(ev.v), a); break; }
-      case 'clr': g.clearRoundFx(); this.drops.clear(); break;
+      case 'clr': {
+        // 清场是立即执行的，而队列里还压着比它早的延迟事件（上一轮最后瞬间的
+        // 掉落/手雷/击杀）。若先清场再补这些事件，会把房主已经回收的掉落物、
+        // 飞行中手雷和布娃娃在本地“复活”（房主已删、远端仍在）。
+        // 所以先把队列里更早的事件按序执行完，再统一清场；
+        // 清场之后到达的事件属于新回合，照常排队，不受影响。
+        let q; while ((q = this.evq.shift())) this.event(q);
+        g.clearRoundFx(); this.drops.clear();
+        break;
+      }
       case 'c4x': g.c4Fx(vn(ev.p)); break;
       default: break;
     }
@@ -598,8 +608,9 @@ const Lobby = {
   },
   addToGame(p) {
     const g = Engine.game; if (!g || !this.ctx) return;
-    g.addRemote({ pid: p.pid, name: p.name, team: p.team, knife: p.knife });
+    // 先发 start（对方建好本地对局），再补发场景里已存在的掉落物
     this.conn.sendTo(p.pid, { t: 'start', opts: this.opts, team: p.team });
+    g.addRemote({ pid: p.pid, name: p.name, team: p.team, knife: p.knife });
     this.ctx.rosterDirty = true;
   },
   // 对局结束 / 房主退出：通知所有人回大厅

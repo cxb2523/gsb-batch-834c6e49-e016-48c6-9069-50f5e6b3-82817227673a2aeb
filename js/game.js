@@ -60,6 +60,10 @@ class Game {
     const a = this.createActor(h.team, false, h.name, h), md = this.mode;
     if (md.id === 'tdm') { md.loadout(a); md.spawn(a); }
     else { a.money = 800; a.stripForNewGame(); a.alive = false; }   // 爆破：下一回合出生
+    // 快照只带增量事件：把场景里已存在的掉落物（含掉落的 C4）补发给新加入的人
+    if (this.net && this.net.host) {
+      for (const d of this.drops) this.net.tell(a, { t: 'ev', ev: { t: 'drop', n: d.nid, w: d.c4 ? 'c4' : d.inst.id, c4: d.c4 ? 1 : 0, p: nv(d.pos), v: nv(d.vel), ry: r3(d.ry), sp: r3(d.spin) } });
+    }
     return a;
   }
   removeRemote(pid) { const a = this.actors.find((x) => x.remote && x.pid === pid); if (a) this.removeActor(a); }
@@ -1186,8 +1190,9 @@ class ModeComp {
         if (t.timer > rand(14, 30) && t.grp && a.team === 'CT' && !(B && B.planted)) { const h = pick(map.holds[t.grp]); t.pos = h.pos.clone(); t.look = h.look.clone(); t.timer = 0; }
       }
     }
-    // 掉落的炸弹：最近的 T 去捡
+    // 掉落的炸弹：位置跟着实体走（弹跳/滚动后雷达和机器人才找得到），最近的 T 去捡
     if (B && B.dropped && !B.planted) {
+      if (B.drop) B.pos.copy(B.drop.pos);
       let best = null, bd = 1e9;
       for (const a of g.actors) if (a.isBot && a.alive && a.team === 'T') { const d = a.pos.distanceTo(B.pos); if (d < bd) { bd = d; best = a; } }
       if (best && (!best.brain.task || best.brain.task.type !== 'fetch')) best.brain.task = { type: 'fetch', pos: B.pos.clone(), urgent: true };
@@ -1198,7 +1203,6 @@ class ModeComp {
     const g = this.g, B = this.bomb; if (!B) return;
     const d = g.dropWeapon(a, null, true);
     B.dropped = true; B.carrier = null; B.drop = d; B.pos.copy(a.pos);
-    g.later(1.5, () => { if (B.drop && B.drop.rest) B.pos.copy(B.drop.pos); });
     g.center((P) => P.team === 'T' ? ['炸弹已掉落', '', 2] : null);
   }
   pickupBomb(a) {
