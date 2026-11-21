@@ -33,10 +33,38 @@
           <h3 class="text-sm font-bold uppercase tracking-wider">Playlist Display</h3>
 
           <div class="playlist-toggles mt-3 flex justify-center space-x-2">
-            <button class="button jp-next selected" role="button" data-display="hide">Hide</button>
-            <button class="button jp-next" role="button" data-display="bottom">Bottom</button>
-            <button class="button jp-next" role="button" data-display="scroll">Scroll</button>
-            <button class="button jp-next" role="button" data-display="side">Side</button>
+            <button
+              class="button toggle-hide selected"
+              type="button"
+              aria-pressed="true"
+              data-display="hide"
+            >
+              Hide
+            </button>
+            <button
+              class="button toggle-bottom"
+              type="button"
+              aria-pressed="false"
+              data-display="bottom"
+            >
+              Bottom
+            </button>
+            <button
+              class="button toggle-scroll"
+              type="button"
+              aria-pressed="false"
+              data-display="scroll"
+            >
+              Scroll
+            </button>
+            <button
+              class="button toggle-side"
+              type="button"
+              aria-pressed="false"
+              data-display="side"
+            >
+              Side
+            </button>
           </div>
         </div>
       </header>
@@ -130,6 +158,8 @@
               <a href="https://get.adobe.com/flashplayer/" target="_blank">Flash plugin</a>.
             </p>
           </div>
+
+          <div class="player-notice" role="status" aria-live="polite" hidden></div>
         </div>
         <!-- .jp-audio -->
       </div>

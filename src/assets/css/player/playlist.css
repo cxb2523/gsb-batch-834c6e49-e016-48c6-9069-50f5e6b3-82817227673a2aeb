@@ -14,14 +14,29 @@
   @apply truncate;
 }
 
-.jp-state-playing {
-  .jp-playlist-current {
-    @apply bg-gray-100 text-gray-900;
+/* The highlight is applied by PlaylistView from the store snapshot, so it is
+ * kept visible whether or not playback is running (e.g. after pausing or
+ * after switching display mode). */
+.jp-playlist-current {
+  @apply bg-gray-100 text-gray-900;
+}
+
+.jp-playlist-failed {
+  .jp-playlist-item {
+    @apply text-gray-400 line-through;
   }
 }
 
 .jp-artist,
 .jp-free-media,
 .jp-playlist-item-remove {
+  @apply hidden;
+}
+
+.player-notice {
+  @apply mx-5 mb-3 rounded border border-primary-300 bg-primary-50 px-3 py-2 text-xs text-primary-800;
+}
+
+.player-notice[hidden] {
   @apply hidden;
 }

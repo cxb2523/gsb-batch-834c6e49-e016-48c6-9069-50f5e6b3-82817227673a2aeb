@@ -1,3 +1,7 @@
+/* Each display mode is purely presentational: it never touches playback,
+ * the current track or the highlight. PlaylistView re-scrolls the current
+ * track into view after every mode switch. */
+
 .playlist-hide {
   .jp-playlist {
     @apply absolute left-0 right-0 top-full;
@@ -15,12 +19,13 @@
 }
 
 .playlist-scroll {
+  /* A bounded pane so the list becomes its own scroll container. */
   .jp-audio {
-    @apply overflow-auto;
+    @apply max-h-[24rem] overflow-y-auto;
   }
 
   .jp-playlist {
-    @apply absolute left-0 right-0 top-full block;
+    @apply block;
   }
 }
 

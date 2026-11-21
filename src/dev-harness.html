@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Audiocheck — local verification harness</title>
+    <link rel="stylesheet" href="./assets/css/index.css" />
+  </head>
+
+  <body class="bg-gray-100">
+    <div class="m-auto max-w-lg px-5 py-12">
+      <header class="mb-8 text-center">
+        <h1 class="text-2xl font-bold">Local verification harness</h1>
+        <p class="mt-2 text-sm text-gray-600">
+          Drives the real store / view / controller wiring against a deterministic fake jPlayer
+          playlist. No network audio, no jQuery required.
+        </p>
+
+        <div class="mt-4">
+          <h3 class="text-sm font-bold uppercase tracking-wider">Playlist Display</h3>
+          <div class="playlist-toggles mt-3 flex justify-center space-x-2">
+            <button class="button selected" type="button" aria-pressed="true" data-display="hide">
+              Hide
+            </button>
+            <button class="button" type="button" aria-pressed="false" data-display="bottom">
+              Bottom
+            </button>
+            <button class="button" type="button" aria-pressed="false" data-display="scroll">
+              Scroll
+            </button>
+            <button class="button" type="button" aria-pressed="false" data-display="side">
+              Side
+            </button>
+          </div>
+        </div>
+
+        <p id="harness-results" class="mt-4 text-sm font-bold">Running…</p>
+      </header>
+
+      <div class="audio-player playlist-hide">
+        <div id="jplayer-1" class="jp-jplayer h-0 w-0"></div>
+
+        <div id="jplayer-container-1" class="jp-audio" role="application" aria-label="media player">
+          <div class="jp-interface group">
+            <div class="track-info">
+              <figure class="track-poster">
+                <img id="track-poster-img" src="" alt="Track poster" />
+              </figure>
+              <div class="track-title"></div>
+              <div class="track-artist"></div>
+              <div class="track-record"></div>
+            </div>
+          </div>
+
+          <div class="jp-playlist">
+            <ul>
+              <li>&nbsp;</li>
+            </ul>
+          </div>
+
+          <div class="player-notice" role="status" aria-live="polite" hidden></div>
+        </div>
+      </div>
+
+      <section class="mt-8">
+        <h2 class="text-sm font-bold uppercase tracking-wider">Checks</h2>
+        <ul id="harness-log" class="mt-2 space-y-1 text-sm"></ul>
+      </section>
+    </div>
+
+    <style>
+      #harness-log .pass {
+        color: #15803d;
+      }
+      #harness-log .fail {
+        color: #b91c1c;
+      }
+      #harness-results.pass {
+        color: #15803d;
+      }
+      #harness-results.fail {
+        color: #b91c1c;
+      }
+    </style>
+
+    <script type="module" src="./assets/js/dev-harness.js"></script>
+  </body>
+</html>
