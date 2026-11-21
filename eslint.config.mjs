@@ -23,5 +23,16 @@ export default [
         rules: {
             'import-x/no-unresolved': 'off'
         }
+    },
+    {
+        // Headless engine fakes: no-op gpu methods and single-constructor wrapper classes are the
+        // point of the mock, and its import order differs from application modules
+        files: ['test/module/helpers/**/*.mjs'],
+        rules: {
+            'import-x/order': 'off',
+            'import-x/no-duplicates': 'off',
+            '@typescript-eslint/no-empty-function': 'off',
+            '@typescript-eslint/no-extraneous-class': 'off'
+        }
     }
 ];

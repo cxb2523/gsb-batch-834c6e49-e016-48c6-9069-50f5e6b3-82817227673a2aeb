@@ -73,6 +73,8 @@ import type { AppBase, CameraComponent, GraphicsDevice, Layer } from 'playcanvas
 import { captureCameraSnapshot, createPickCameraSnapshot } from '../picker';
 import type { PickCameraSnapshot } from '../picker';
 
+import { sameFrameIdentity } from './frame-state';
+import type { FrameIdentity } from './frame-state';
 import { EngineResidentSetProvider } from './resident-set';
 import type { EngineManager, ResidentSet } from './resident-set';
 import { argsWGSL, setArgsWGSL } from './shaders/args';
@@ -557,8 +559,16 @@ class SplatView {
 
     readonly reduceL2: Compute;
 
-    // the previous frame the grid and the reprojection describe; valid only when that frame
-    // rendered to the same target at the same size from the same world state
+    // The identity the view's cross-frame state was built for, or null while none is valid. The
+    // state below is trusted only while this equals the frame about to render (frame-state.ts):
+    // the occlusion grid and previous matrices (prevValid), the TAA history (taaHistoryValid)
+    // and the projected cache. A changed identity drops them all together in invalidateFrame().
+    frameIdentity: FrameIdentity | null = null;
+
+    // whether the view's gpu resources have been released (a removed eye or a disable cycle)
+    destroyed = false;
+
+    // the previous frame the grid and the reprojection describe; valid only with frameIdentity
     prevValid = false;
 
     readonly prevViewProjection = new Mat4();
@@ -578,13 +588,8 @@ class SplatView {
 
     prevFlip = 1;
 
-    prevWidth = 0;
-
-    prevHeight = 0;
-
+    // the resident-set version the previous frame culled against, for the cull:auto restarts
     prevVersion = -1;
-
-    prevOrtho = false;
 
     // this frame's projection, and the splats it projected
     readonly shaderProjection = new Mat4();
@@ -715,7 +720,9 @@ class SplatView {
         }
     }
 
-    // switch the history's colour format; the history starts over, sized on the next frame
+    // switch the history's colour format; the new textures hold nothing, so the history starts
+    // over. The frame identity (historyHalf) changes with it, and frameView's identity check
+    // invalidates the rest of the cross-frame state before the next frame reads anything
     setTaaHalf(half: boolean) {
         this.releaseTaaSetTargets();
         for (const target of this.taaTargets) target.destroy();
@@ -727,11 +734,13 @@ class SplatView {
         for (const texture of this.taaInfo) texture.resize(4, 4);
         this.taaWidth = 0;
         this.taaHeight = 0;
-        this.taaHistoryValid = false;
-        this.restFrames = 0;
+        this.taaWrite = 0;
+        this.frameIdentity = null;
     }
 
-    // render through a warp's table from now on, or unwarped (null)
+    // render through a warp's table from now on, or unwarped (null). A different table changes
+    // the target's layout and size: frameView's identity check (or setTaaHalf's) drops the
+    // history, the previous frame and the projected cache before anything reads them
     setWarp(key: string, map: WarpMap | null) {
         const table = map ? buildWarpTable(map) : null;
         const bytes = table ? table.byteLength : 16;
@@ -744,10 +753,27 @@ class SplatView {
         this.warpKey = key;
         this.warpWidth = map ? map.width : 0;
         this.warpHeight = map ? map.height : 0;
-        // a history or a previous frame laid out otherwise would be read in the wrong places
+        this.frameIdentity = null;
+    }
+
+    // Drop every state that assumes the previous frame is still valid: the temporal history,
+    // the previous-frame matrices and occlusion grid the cull reads, and the projected cache the
+    // raster draws. The next frame rebuilds them all under a fresh identity. Camera motion and
+    // resident-set changes do not come here: they keep the history, shortened by its own rules.
+    invalidateFrame() {
         this.taaHistoryValid = false;
         this.restFrames = 0;
+        this.taaWrite = 0;
         this.prevValid = false;
+        this.frameIdentity = null;
+        // the cache holds projections for the old target's pixels; order lists address it
+        this.cacheBuffer?.destroy();
+        this.orderedBuffer?.destroy();
+        this.cacheBuffer = null;
+        this.orderedBuffer = null;
+        this.cacheSlots = 0;
+        this.cacheStereo = false;
+        this.orderedCapacity = 0;
     }
 
     get gpuBytes() {
@@ -778,6 +804,7 @@ class SplatView {
     }
 
     destroy() {
+        this.destroyed = true;
         this.destroyProjectorComputes();
         for (const compute of [this.args, this.orderScan, this.orderScatter, this.orderScatterSets, this.setArgs])
             compute.destroy();
@@ -1472,15 +1499,13 @@ class StochasticSplatRenderer {
     }
 
     /**
-     * Drop the temporal history; the next frame starts accumulating from its own sample. The
-     * coverage seeds restart too, so a variant accumulates the same samples every time (the
+     * Drop the temporal history and every other cross-frame state; the next frame starts
+     * accumulating from its own sample and rebuilding its previous frame and projected cache.
+     * The coverage seeds restart too, so a variant accumulates the same samples every time (the
      * harness compares builds image for image).
      */
     resetHistory() {
-        for (const view of this.views) {
-            view.taaHistoryValid = false;
-            view.restFrames = 0;
-        }
+        for (const view of this.views) view.invalidateFrame();
         this.frameIndex = 0;
     }
 
@@ -1542,9 +1567,25 @@ class StochasticSplatRenderer {
         this.depthFrame = null;
         // the views' memory too: their caches, history and targets (125 MB at the 1M budget on an
         // iPhone), which the first frame after attach() sizes again into one empty view, as it
-        // does for a session's eyes. The passes and materials take them from each frame's bindings
+        // does for a session's eyes. The passes and materials take them from each frame's
+        // bindings. Every view's cross-frame state dies with it, so the view attach() makes can
+        // never read a destroyed buffer or a previous session's history
         for (const view of this.views) view.destroy();
         this.views = [new SplatView(this.device, this.viewShaders, '')];
+        // the persistent compose material still names the destroyed view's textures; rebind the
+        // fresh view's before any pass can draw, so the first frame after re-enabling is safe
+        const view = this.views[0];
+        this.composeMaterial.setParameter('splatColor', view.colorTexture);
+        this.composeMaterial.setParameter('splatDepth', view.depthTexture);
+        this.composeMaterial.setParameter('taaColor', view.taaColor[0]);
+        this.composeMaterial.setParameter('taaInfo', view.taaInfo[0]);
+        this.bindSetTextures(view);
+        // the session whose eyes the old views served is over; the next session starts clean and
+        // rebuilds the stereo pipeline defines from its own first frame
+        this.stereo = false;
+        this.stereoDefined = false;
+        this.rasterMaterial.setDefine('SSE_STEREO', undefined);
+        this.rasterMaterial.update();
         this.worldLayer.removeMeshInstances([this.composeInstance]);
         // the source first: the engine's renderer draws from the work buffer it may have patched
         this.source.suspend();
@@ -1629,7 +1670,13 @@ class StochasticSplatRenderer {
         while (this.views.length < count) {
             this.views.push(new SplatView(device, this.viewShaders, `-eye${this.views.length}`));
         }
-        while (this.views.length > count) this.views.pop()!.destroy();
+        // a view that leaves (a stereo session ends) releases everything it owned: its caches,
+        // history textures, render targets and projector computes, so the GPU keeps nothing of an
+        // eye no frame draws. Destroy before removing, so no destroyed view lingers in the list
+        while (this.views.length > count) {
+            const removed = this.views.pop()!;
+            removed.destroy();
+        }
         // the eyes' matrices are refreshed at render time, after this hook
         if (eyes) (cam as Camera & { updateViewTransforms(): void }).updateViewTransforms();
         this.followModel(set);
@@ -1777,16 +1824,12 @@ class StochasticSplatRenderer {
         return { width, height, warped };
     }
 
-    // whether the view's occlusion grid can come from its previous frame (see frame())
-    private canCull(view: SplatView, width: number, height: number, isOrtho: boolean, isQuery: boolean) {
-        return (
-            (!isQuery || this.allowQueryCull) &&
-            view.prevValid &&
-            view.prevWidth === width &&
-            view.prevHeight === height &&
-            !this.nodesRemoved &&
-            view.prevOrtho === isOrtho
-        );
+    // whether the view's occlusion grid can come from its previous frame (see frame()). The
+    // identity check is the single gate: a different size, projection type, renderer session,
+    // eye count or history format has run invalidateFrame() and cleared prevValid; nodesRemoved
+    // covers the world-state change that can hide what is now behind a removed splat
+    private canCull(view: SplatView, isQuery: boolean) {
+        return (!isQuery || this.allowQueryCull) && view.prevValid && !this.nodesRemoved;
     }
 
     // The warp a view renders through this frame (variant warp), as the key of its table and the
@@ -1906,13 +1949,35 @@ class StochasticSplatRenderer {
         const half = taaHistory === 'half' || (taaHistory === 'auto' && eye);
         if (view.taaHalf !== half) view.setTaaHalf(half);
 
+        // The single "previous frame still valid" gate. Any change of target size, projection
+        // type, renderer session, eye count or history format makes the frame identity differ
+        // from the one the view's history, previous-frame matrices, occlusion grid and projected
+        // cache were built for, so they are invalidated together and this frame rebuilds them.
+        // Camera motion and resident-set changes keep the identity: the history survives and is
+        // only shortened by the moving/changed weight rules below.
+        const identity: FrameIdentity = {
+            width,
+            height,
+            orthographic: isOrtho,
+            rendererEnabled: this.enabled,
+            stereo: eye,
+            historyHalf: half
+        };
+        if (!sameFrameIdentity(view.frameIdentity, identity)) {
+            view.invalidateFrame();
+        }
+        // whether this frame's accumulation may read the previous history at all. Captured here,
+        // before the pass below marks the history it is about to write as valid, so an
+        // invalidating frame (a resize, a stereo/mono change, a format switch) accumulates from
+        // its own sample instead of folding in a history built for a different frame identity
+        const trustHistory = view.taaHistoryValid;
+        view.frameIdentity = identity;
+
         if (taaOn) {
             if (view.taaWidth !== width || view.taaHeight !== height) {
                 this.resizeHistory(view, width, height);
                 view.taaWidth = width;
                 view.taaHeight = height;
-                view.taaHistoryValid = false;
-                view.restFrames = 0;
             }
             if (moved || changed) view.restFrames = 0;
             else view.restFrames++;
@@ -1931,10 +1996,7 @@ class StochasticSplatRenderer {
 
         const cullMode = this.variant.cull;
         // a shared projection culls only against both eyes' previous frames
-        const culling =
-            frame.cullWanted &&
-            this.canCull(view, width, height, isOrtho, isQuery) &&
-            (!eye1 || this.canCull(eye1.view, width, height, isOrtho, isQuery));
+        const culling = frame.cullWanted && this.canCull(view, isQuery) && (!eye1 || this.canCull(eye1.view, isQuery));
         if (index === 0) this.culling = culling;
         if (culling && projects) {
             this.reduceDepth(view, width, height);
@@ -2161,7 +2223,7 @@ class StochasticSplatRenderer {
             // so the new content shows within taaMoveMax frames rather than 1 / taaMax a frame
             bind(taa, 'taaParams', [
                 moved || changed ? this.variant.taaMoveMax : this.variant.taaMax,
-                view.taaHistoryValid ? 1 : 0,
+                trustHistory ? 1 : 0,
                 moved ? 1 : 0,
                 view.restFrames
             ]);
@@ -2228,7 +2290,10 @@ class StochasticSplatRenderer {
 
         // this frame becomes the previous one, unless it is a capture
         if (isQuery) {
-            // the capture drew elsewhere; the on-screen depth texture is no longer this frame's
+            // the capture drew elsewhere, so its depth cannot back the next frame's occlusion
+            // cull. The TAA history is a separate flag (taaHistoryValid / trustHistory): a
+            // same-size capture with allowQueryTaa keeps accumulating it, and the frame identity
+            // deliberately stays so the next on-screen frame matches and only loses the cull grid
             view.prevValid = false;
             return;
         }
@@ -2250,11 +2315,9 @@ class StochasticSplatRenderer {
         view.prevViewport = [width, height];
         view.prevFocal = focal;
         view.prevFlip = view.target.flipY ? -1 : 1;
-        view.prevWidth = width;
-        view.prevHeight = height;
         view.prevVersion = set.version;
-        view.prevOrtho = isOrtho;
         view.prevValid = true;
+        // frameIdentity already holds this frame's identity, so the next frame's gate can match
     }
 
     private resizeHistory(view: SplatView, width: number, height: number) {
