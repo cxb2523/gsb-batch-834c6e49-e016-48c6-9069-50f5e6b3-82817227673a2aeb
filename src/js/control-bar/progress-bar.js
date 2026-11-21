@@ -11,6 +11,10 @@ class ProgressBar {
     this.resizeTimer = null;
     this.initiallyPaused = false;
     this.playPauseAnimation = null;
+    // Whether a document-level drag (mousedown/touchstart) is in progress
+    this.scrubbing = false;
+    // Set only when this module paused the media, so resume is always paired
+    this.pausedByScrub = false;
 
     this.listeners();
   }
@@ -40,6 +44,13 @@ class ProgressBar {
   start = (event) => {
     const { player } = this;
 
+    // Ignore repeated starts until the previous drag ends
+    if (this.scrubbing) {
+      return;
+    }
+
+    this.scrubbing = true;
+
     // hide animations
     if (this.playPauseAnimation === null) {
       this.playPauseAnimation = player.config.layoutControls.playPauseAnimation;
@@ -49,11 +60,19 @@ class ProgressBar {
     this.positionX = getEventOffsetX(player.controls.progressContainer, event);
 
     this.initiallyPaused = player.paused;
+    this.pausedByScrub = false;
     if (!this.initiallyPaused) {
       this.timer = setTimeout(() => {
+        if (!this.scrubbing || this.pausedByScrub) {
+          return;
+        }
+
+        this.pausedByScrub = true;
         player.pause();
       }, 300);
     }
+
+    player.preview?.current?.scrubStart?.();
 
     on.call(player, document, 'mousemove touchmove', this.move);
     on.call(player, document, 'mouseup touchend mouseleave', this.end);
@@ -65,7 +84,7 @@ class ProgressBar {
 
     toggleClass(player.wrapper, 'fluid_seeking', true);
 
-    player.preview.current.move(event);
+    player.preview?.current?.move?.(event);
 
     this.positionX = getEventOffsetX(progressContainer, event);
 
@@ -90,9 +109,16 @@ class ProgressBar {
     const { player } = this;
     const { progressContainer, scrubberProgress } = player.controls;
 
+    // A single drag must end exactly once even if several end events fire
+    if (!this.scrubbing) {
+      return;
+    }
+
+    this.scrubbing = false;
+
     toggleClass(player.wrapper, 'fluid_seeking', false);
 
-    player.preview.current.hide(event);
+    player.preview?.current?.scrubEnd?.();
 
     // back to normal size
     for (const node of progressContainer.childNodes) {
@@ -108,26 +134,58 @@ class ProgressBar {
 
     this.update(true);
 
+    // Resume only when this drag paused the media (or its pause is still
+    // pending), keeping every pause/resume pair balanced
     if (!this.initiallyPaused) {
       clearTimeout(this.timer);
+      this.timer = null;
 
-      player.play();
+      if (this.pausedByScrub || !player.paused) {
+        player.play();
+      }
 
+      this.pausedByScrub = false;
       player.controlBar.toggleMobile(false);
     }
 
     // restore animations
     this.restoreAnimationTimer = setTimeout(() => {
-      if (this.playPauseAnimation === null) {
-        return;
-      }
-
-      player.config.layoutControls.playPauseAnimation = this.playPauseAnimation;
-      this.playPauseAnimation = null;
+      this.restorePlayPauseAnimation();
     }, 200);
 
     off.call(player, document, 'mousemove touchmove', this.move);
     off.call(player, document, 'mouseup touchend mouseleave', this.end);
+  };
+
+  // Tear down an in-progress drag without resuming playback. Used when the
+  // media source changes, the source list is cleared or the player is destroyed.
+  cancelScrub = () => {
+    if (!this.scrubbing && this.timer === null && this.restoreAnimationTimer === null) {
+      return;
+    }
+
+    this.scrubbing = false;
+
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.pausedByScrub = false;
+
+    off.call(this.player, document, 'mousemove touchmove', this.move);
+    off.call(this.player, document, 'mouseup touchend mouseleave', this.end);
+
+    this.restorePlayPauseAnimation();
+  };
+
+  restorePlayPauseAnimation = () => {
+    clearTimeout(this.restoreAnimationTimer);
+    this.restoreAnimationTimer = null;
+
+    if (this.playPauseAnimation === null) {
+      return;
+    }
+
+    this.player.config.layoutControls.playPauseAnimation = this.playPauseAnimation;
+    this.playPauseAnimation = null;
   };
 
   hover = (event) => {
@@ -182,17 +240,9 @@ class ProgressBar {
   };
 
   destroy = () => {
-    clearTimeout(this.timer);
-    clearTimeout(this.restoreAnimationTimer);
+    this.cancelScrub();
     clearTimeout(this.resizeTimer);
-
-    if (this.playPauseAnimation !== null) {
-      this.player.config.layoutControls.playPauseAnimation = this.playPauseAnimation;
-      this.playPauseAnimation = null;
-    }
-
-    off.call(this.player, document, 'mousemove touchmove', this.move);
-    off.call(this.player, document, 'mouseup touchend mouseleave', this.end);
+    this.resizeTimer = null;
   };
 }
 

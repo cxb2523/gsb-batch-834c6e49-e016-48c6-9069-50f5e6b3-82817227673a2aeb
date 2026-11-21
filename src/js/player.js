@@ -438,6 +438,9 @@ class CVP {
       this.isSwitchingSource = false;
       this.autoPlay.applied = false;
       this.quality.reset();
+      // Empty source list: cancel pending thumbnail requests and scrub timers
+      this.progressBar?.cancelScrub();
+      this.preview?.rebind?.(null);
       this.progressBar.update();
       this.listeners.time();
       this.listeners.duration();
@@ -568,6 +571,10 @@ class CVP {
     this.pendingStreamPlay = pendingStreamPlay;
 
     this.streaming.detach();
+
+    // Bind thumbnail data and cancel any in-progress scrub to the new source
+    this.progressBar?.cancelScrub();
+    this.preview?.rebind?.(source.src);
 
     if (isHLS(src, source.type) || isDASH(src, source.type)) {
       this.streaming.init();
@@ -908,7 +915,7 @@ class CVP {
       this.mobileControls,
       this.playPause,
       this.progressBar,
-      this.preview?.current,
+      this.preview,
       this.autoPlay,
       this.menu,
       this.subtitles,

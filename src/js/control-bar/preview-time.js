@@ -13,6 +13,11 @@ class PreviewTime {
 
   move = (event) => {
     const progress = this.player.controls.progressContainer;
+
+    if (is.nullOrUndefined(this.preview)) {
+      return;
+    }
+
     const width = progress.clientWidth;
     let offsetX = getEventOffsetX(progress, event);
 
@@ -52,6 +57,10 @@ class PreviewTime {
   };
 
   hide = () => {
+    if (is.nullOrUndefined(this.preview)) {
+      return;
+    }
+
     this.preview.style.visibility = 'hidden';
   };
 
@@ -79,6 +88,20 @@ class PreviewTime {
 
     // hide thumbnails
     on.call(player, player.controls.progressContainer, 'mouseleave touchend', this.hide);
+  };
+
+  scrubStart = () => {};
+
+  scrubEnd = () => {
+    this.hide();
+  };
+
+  destroy = () => {
+    if (is.element(this.preview)) {
+      this.preview.remove();
+    }
+
+    this.preview = null;
   };
 }
 
