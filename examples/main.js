@@ -176,6 +176,15 @@ function pumpStreaming() {
   if (!STREAM) return;
   streamPending.push(...updateStreaming(assets));
 }
+// let the panel show a failed load instead of an unhandled rejection; the asset keeps its
+// resident state and the next frame retries (see loadError in the runtime)
+const settleStreaming = async () => {
+  const p = streamPending; streamPending = [];
+  if (!p.length) return;
+  const results = await Promise.allSettled(p);
+  const bad = results.find((r) => r.status === 'rejected');
+  if (bad) { const e = bad.reason; msg(`streaming: ${e && e.message || e} (kept what is resident, retrying)`); for (const a of assets) if (a.loadError) a.loadError = null; }
+};
 const residentMB = () => assets.reduce((x, a) => x + a.residentBytes, 0) / 1048576, fullMB = () => assets.reduce((x, a) => x + a.fullBytes, 0) / 1048576;
 // ---- occlusion (?occ=1): render into a target with a depth texture, reduce depth to a 64x36
 // farthest-depth map, read it back asynchronously and use it for instance culling a few frames later.
@@ -361,7 +370,7 @@ window.demo.trace = async ({ frames = 300, mode = 'clod', count = 96, errorPx = 
   for (let i = 0; i < frames; i++) {
     setPose(...tourPose(i / (frames - 1)));
     const t0 = performance.now(); step(); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); ms.push(performance.now() - t0);
-    if (STREAM && streamPending.length) { await Promise.all(streamPending); streamPending = []; step(); }
+    if (STREAM && streamPending.length) { await settleStreaming(); step(); }
     for (const b of batches) { const u = b.asset._used || (b.asset._used = new Uint8Array(b.asset.meta.clusters)); for (let n = 0; n < b._multiDrawCount; n++) u[b.indirect[n * 2 + 1] & 0xffffff] = 1; }
     tris.push(Math.round(sel.tris)); eff.push(sel.threshold); selMs.push(sel.ms);
     if (i % 50 === 49) await sleep(5);

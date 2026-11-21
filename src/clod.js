@@ -54,10 +54,23 @@ function finishHierarchy(a) {
   a.productIds = new Uint32Array(a.productOff[G]);
   const fill = a.productOff.slice(0, G);
   for (let c = 0; c < C; c++) { const s = a.clusterU[c * 4 + 2]; if (s >= 0) a.productIds[fill[s]++] = c; }
+  // the group that consumes each cluster. A source group's clusters can be split over several
+  // consuming groups, so budget accounting must not assume one product group.
+  a.dstGroup = new Int32Array(C).fill(-1);
+  for (let g = 0; g < G; g++) for (let k = a.memberOff[g]; k < a.memberOff[g + 1]; k++) a.dstGroup[a.memberIds[k]] = g;
   // a group can be refined only when ALL its member clusters are resident (Nanite: the group is the streaming unit)
   a.minMemberLevel = new Uint8Array(G).fill(255);
   for (let g = 0; g < G; g++) for (let k = a.memberOff[g]; k < a.memberOff[g + 1]; k++) { const l = a.clusterU[a.memberIds[k] * 4 + 3]; if (l < a.minMemberLevel[g]) a.minMemberLevel[g] = l; }
+  // Residency is an explicit state, not an implicit convention: clusters are stored finest-first in
+  // level order, so "the geometry loaded down to level L" (loadedLevel = L) makes every cluster with
+  // level >= L resident. A group is resident when every one of its members is resident, i.e. when its
+  // finest member level is >= loadedLevel. Selection never draws or counts a non-resident group;
+  // it draws the coarse layer its source group produced and asks for minMemberLevel instead.
   a.loadedLevel = 0; a.wantLevel = 255; a.residentBytes = 0; a.fullBytes = 0; a.batches = [];
+  a.loading = null; a.loadError = null; a.requests = 0;
+  a.isResident = (level) => level >= a.loadedLevel;
+  a.groupResident = (g) => a.minMemberLevel[g] >= a.loadedLevel;
+  a.needLevel = (level) => { if (level < a.wantLevel) a.wantLevel = level; };
 }
 
 // Streaming loader. The hierarchy (errors, spheres, group membership) is always resident; geometry is
@@ -70,14 +83,16 @@ export async function loadClodStream(base, name, options = {}) {
   const meta = await (await get(base + '/' + name + '.json')).json();
   const url = base + '/' + name + '.bin';
   const T = { Float32Array, Int8Array, Uint32Array, Int32Array };
+  const a = { meta, name, stream: true };
   const range = async (k, from, to) => { // elements [from, to) of section k
     const s = meta.sections[k], C = T[s.type], b = C.BYTES_PER_ELEMENT;
     if (delayMs) await new Promise((res) => setTimeout(res, delayMs));
     const r = await get(url, { headers: { Range: 'bytes=' + (s.offset + from * b) + '-' + (s.offset + to * b - 1) } });
+    a.rangeRequests++;
     if (r.status !== 206) throw new Error(url + ': the server ignored the HTTP Range request, which streaming needs');
     return new C(await r.arrayBuffer());
   };
-  const a = { meta, name, stream: true };
+  a.rangeRequests = 0;
   let hBytes = 0;
   for (const k of ['clusterF', 'clusterU', 'groupF', 'memberOff', 'memberIds']) { const s = meta.sections[k]; a[k] = await range(k, 0, s.bytes / T[s.type].BYTES_PER_ELEMENT); hBytes += s.bytes; }
   finishHierarchy(a);
@@ -89,31 +104,57 @@ export async function loadClodStream(base, name, options = {}) {
   a.pos = new Float32Array(0); a.nrm = new Int8Array(0); a.uv = new Float32Array(0); a.idx = new Uint32Array(0);
   let vEnd = 0, iEnd = 0;
   const grow = (old, add) => { const n = new old.constructor(old.length + add.length); n.set(old); n.set(add, old.length); return n; };
-  a.loading = null; a.requests = 0;
-  // fetch geometry down to `level` and swap in a bigger geometry
+  // geometryVersion increments on every successful swap. Draw lists are index ranges into a prefix that
+  // only grows, so a list emitted for an older (smaller) geometry stays valid against the new buffer:
+  // no range can point past the end because the prefix bytes are identical.
+  a.geometryVersion = 0;
+  // fetch geometry down to `level` and swap in a bigger geometry. Only one request per asset is in
+  // flight: every caller (every batch and instance of the same asset in the same frame) gets the same
+  // promise, and a later call for a finer level chains onto it instead of starting a second fetch.
   a.loadTo = (level) => {
-    if (a.loading) return a.loading;
     const r = LR.find((l) => l.level === level) || LR[LR.length - 1];
     if (r.vertexEnd <= vEnd && r.indexEnd <= iEnd) { a.loadedLevel = Math.min(a.loadedLevel, r.level); return Promise.resolve(); }
+    if (a.loading) {
+      // merge into the in-flight request, then continue to the requested level if it asks for more
+      return a.loading.then(() => a.loadTo(level));
+    }
+    a.loadError = null;
     a.loading = (async () => {
-      const [p, n, u, i] = await Promise.all([range('positions', vEnd * 3, r.vertexEnd * 3), range('normals', vEnd * 4, r.vertexEnd * 4), range('uvs', vEnd * 2, r.vertexEnd * 2), range('indices', iEnd, r.indexEnd)]);
-      a.requests += 4;
-      a.pos = grow(a.pos, p); a.nrm = grow(a.nrm, n); a.uv = grow(a.uv, u); a.idx = grow(a.idx, i);
-      vEnd = r.vertexEnd; iEnd = r.indexEnd;
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(a.pos, 3));
-      geo.setAttribute('normal', new THREE.BufferAttribute(a.nrm, 4, true));
-      geo.setAttribute('uv', new THREE.BufferAttribute(a.uv, 2));
-      geo.setIndex(new THREE.BufferAttribute(a.idx, 1));
-      geo.boundingSphere = a.sphere;
-      const old = a.geometry; a.geometry = geo;
-      for (const b of a.batches) b.geometry = geo;
-      if (old) old.dispose();
-      a.loadedLevel = r.level; a.residentBytes = r.bytes; a.loading = null;
+      try {
+        const [p, n, u, i] = await Promise.all([range('positions', vEnd * 3, r.vertexEnd * 3), range('normals', vEnd * 4, r.vertexEnd * 4), range('uvs', vEnd * 2, r.vertexEnd * 2), range('indices', iEnd, r.indexEnd)]);
+        a.requests += 4;
+        a.pos = grow(a.pos, p); a.nrm = grow(a.nrm, n); a.uv = grow(a.uv, u); a.idx = grow(a.idx, i);
+        vEnd = r.vertexEnd; iEnd = r.indexEnd;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(a.pos, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(a.nrm, 4, true));
+        geo.setAttribute('uv', new THREE.BufferAttribute(a.uv, 2));
+        geo.setIndex(new THREE.BufferAttribute(a.idx, 1));
+        geo.boundingSphere = a.sphere;
+        // Attach first, release afterwards: every batch points at the new buffers before the old
+        // geometry (and therefore its GPU buffers) may be disposed. Draw lists are index ranges into
+        // a prefix that only grows and whose bytes never change, so the list emitted this frame is
+        // still valid against the new, longer buffers.
+        const old = a.geometry; a.geometry = geo;
+        for (const b of a.batches) b.geometry = geo;
+        a.geometryVersion++;
+        if (old) old.dispose();
+        a.loadedLevel = r.level; a.residentBytes = r.bytes;
+      } catch (e) {
+        // a failed load leaves everything that was already resident untouched: geometry, prefix
+        // offsets and loadedLevel are only advanced after every range has arrived. `loading` is
+        // cleared in finally so a later updateStreaming retries instead of waiting on a rejected promise.
+        a.loadError = e;
+        throw e;
+      } finally {
+        a.loading = null;
+      }
     })();
     return a.loading;
   };
-  // root "page": as many top levels as fit in rootBytes, but always every cluster of the virtual root group
+  // root "page": as many top levels as fit in rootBytes, but always every cluster of the virtual root
+  // group. When rootBytes cannot even hold the root layer, the root layer is loaded anyway: an asset
+  // must always be drawable at its coarsest level.
   let rootLevel = LR[0].level;
   for (const l of LR) if (l.bytes <= rootBytes) rootLevel = l.level;
   rootLevel = Math.min(rootLevel, a.minMemberLevel[0]);
@@ -126,13 +167,20 @@ export async function loadClodStream(base, name, options = {}) {
 /**
  * Call once per frame after ClodSelector.select() for assets from loadClodStream: starts a fetch for
  * every asset whose last selection wanted finer levels than are loaded. Returns the pending promises.
+ * Requests are merged per asset: several batches/instances asking for the same asset in one frame
+ * produce one load, and a request that arrives while a load is already in flight is left queued
+ * (wantLevel is kept) instead of starting a second fetch.
  */
 export function updateStreaming(assets) {
   const pending = [];
   for (const a of assets) {
     if (!a.stream) continue;
-    if (a.wantLevel < a.loadedLevel && !a.loading) pending.push(a.loadTo(a.wantLevel));
-    a.wantLevel = 255;
+    if (a.wantLevel < a.loadedLevel) {
+      // several batches/instances of the same asset share this object, so a frame's demand is
+      // already merged in wantLevel. Starting a load does not clear it: if the load fails the
+      // demand survives to the next frame, and once it succeeds loadedLevel <= wantLevel clears it.
+      if (!a.loading) pending.push(a.loadTo(a.wantLevel));
+    } else a.wantLevel = 255;
   }
   return pending;
 }
@@ -302,7 +350,6 @@ export class ClodSelector {
 
   _selectThreshold(b, t) {
     const a = b.asset, gF = a.groupF, cF = a.clusterF, cU = a.clusterU, mOff = a.memberOff, mIds = a.memberIds;
-    const minLv = a.minMemberLevel, loaded = a.loadedLevel; let want = a.wantLevel;
     const dstack = this._dstack || (this._dstack = new Int32Array(8192));
     const K = this.K, cull = this.frustumCull, stamp = b.stamp, stack = this._stack || (this._stack = new Int32Array(8192));
     let n = b._n, tris = 0, visited = 0;
@@ -320,8 +367,8 @@ export class ClodSelector {
             const o = s * 5, dx = gF[o] - cx, dy = gF[o + 1] - cy, dz = gF[o + 2] - cz;
             const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - gF[o + 3];
             if (d <= 1e-6 || gF[o + 4] * K > t * d) { // source group still too coarse: refine
-              if (minLv[s] < loaded) { // finer data not resident: draw this cluster as a leaf and ask for more
-                if (minLv[s] < want) want = minLv[s];
+              if (!a.groupResident(s)) { // finer data not resident: draw this cluster as a leaf and ask for more
+                a.needLevel(a.minMemberLevel[s]);
                 if (stamp[s] !== sid && !a.loading) {
                   stamp[s] = sid; let dp = 0; dstack[dp++] = s;
                   while (dp > 0) {
@@ -332,7 +379,7 @@ export class ClodSelector {
                       if (!(d2 <= 1e-6 || gF[o2 + 4] * K > t * d2)) continue;
                       stamp[s2] = sid;
                       if (cull) { let vis = true; const x = gF[o2], y = gF[o2 + 1], z = gF[o2 + 2], r = gF[o2 + 3]; for (let q = po; q < po + 24; q += 4) if (pl[q] * x + pl[q + 1] * y + pl[q + 2] * z + pl[q + 3] < -r) { vis = false; break; } if (!vis) continue; }
-                      if (minLv[s2] < want) want = minLv[s2];
+                      if (!a.groupResident(s2)) a.needLevel(a.minMemberLevel[s2]);
                       dstack[dp++] = s2;
                     }
                   }
@@ -357,7 +404,7 @@ export class ClodSelector {
         }
       }
     }
-    b._n = n; this.stats.tris += tris / 3; this.stats.visited += visited; a.wantLevel = want;
+    b._n = n; this.stats.tris += tris / 3; this.stats.visited += visited;
   }
 
   // ---- budget mode: refine the globally worst group first until the triangle budget is spent
@@ -392,7 +439,10 @@ export class ClodSelector {
     for (let q = i * 24, e = q + 24; q < e; q += 4) if (pl[q] * x + pl[q + 1] * y + pl[q + 2] * z + pl[q + 3] < -r) return false;
     return true;
   }
-  // mark (instance, group) refined: its member clusters enter the cut, their source groups become candidates
+  // mark (instance, group) refined: its member clusters enter the cut, their source groups become
+  // candidates. Only a resident group may be refined: a group whose members are not all loaded is
+  // NOT descended into. Its parent keeps drawing the coarse layer it produced, and the group's
+  // minimum member level is recorded so the next updateStreaming can make it resident.
   _refine(bi, i, g, floorPx) {
     const b = this.batches[bi], a = b.asset, G = a.meta.groups, cU = a.clusterU, gF = a.groupF, frame = this.frame;
     b.refined[i * G + g] = frame;
@@ -402,9 +452,15 @@ export class ClodSelector {
     const cx = b.camL[i * 3], cy = b.camL[i * 3 + 1], cz = b.camL[i * 3 + 2];
     for (let k = a.memberOff[g], e = a.memberOff[g + 1]; k < e; k++) {
       const c = a.memberIds[k], s = cU[c * 4 + 2];
+      // a member whose source group is already refined is not part of the cut (its finer
+      // replacement is), so it must not be added to the budget's triangle count either.
+      if (s >= 0 && b.refined[i * G + s] === frame) continue;
       if (this._vis(b, i, a.clusterF, c * 4)) add += cU[c * 4 + 1];
       if (s >= 0 && b.pushed[i * G + s] !== frame) {
         b.pushed[i * G + s] = frame;
+        // "not loaded" is a first-class, fall-back-able state: the coarse layer stays, and we ask
+        // for the finest level that group needs instead of pretending it can be refined.
+        if (!a.groupResident(s)) { a.needLevel(a.minMemberLevel[s]); continue; }
         if (!this._vis(b, i, gF, s * 5)) continue;
         const o = s * 5, dx = gF[o] - cx, dy = gF[o + 1] - cy, dz = gF[o + 2] - cz;
         const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - gF[o + 3];
@@ -416,7 +472,9 @@ export class ClodSelector {
   }
   _selectBudget(floorPx, budget) {
     const frame = this.frame; this.hN = 0; this.rN = 0;
-    let count = 0, lastKey = Infinity;
+    // `count` is the triangle count of the cut as it will actually be drawn. Non-resident groups
+    // never enter it, so a skipped group cannot eat budget it does not spend.
+    let count = 0, skippedErr = 0;
     this.batches.forEach((b, bi) => {
       const G = b.asset.meta.groups;
       if (!b.refined) { b.refined = new Int32Array(b.count * G); b.pushed = new Int32Array(b.count * G); }
@@ -424,16 +482,23 @@ export class ClodSelector {
     });
     const top = [0, 0, 0];
     while (this.hN > 0 && count < budget) {
-      lastKey = this._pop(top);
-      const b = this.batches[top[0]], a = b.asset, i = top[1], g = top[2];
-      if (a.minMemberLevel[g] < a.loadedLevel && a.minMemberLevel[g] < a.wantLevel) a.wantLevel = a.minMemberLevel[g]; // wanted but not resident
-      // the clusters this group produced are all in the cut right now; they leave it
+      const key = this._pop(top);
+      const b = this.batches[top[0]], a = b.asset, i = top[1], g = top[2], G = a.meta.groups;
+      if (!a.groupResident(g)) { a.needLevel(a.minMemberLevel[g]); if (key > skippedErr) skippedErr = key; continue; } // safety: never refine a non-resident group
+      // the clusters this group produced and that are in the cut right now leave it. A product only
+      // contributes if the group consuming it was refined, otherwise it was never drawn.
       let rem = 0;
-      for (let k = a.productOff[g], e = a.productOff[g + 1]; k < e; k++) { const c = a.productIds[k]; if (this._vis(b, i, a.clusterF, c * 4)) rem += a.clusterU[c * 4 + 1]; }
+      for (let k = a.productOff[g], e = a.productOff[g + 1]; k < e; k++) {
+        const c = a.productIds[k], dg = a.dstGroup[c];
+        if (dg < 0 || b.refined[i * G + dg] !== frame) continue;
+        if (this._vis(b, i, a.clusterF, c * 4)) rem += a.clusterU[c * 4 + 1];
+      }
       count += this._refine(top[0], i, g, floorPx) - rem / 3;
     }
-    // effective pixel error = the worst candidate that was left unrefined
-    this.stats.threshold = this.hN > 0 ? this.hKey[0] : floorPx;
+    // effective pixel error = the worst group that stayed coarse: either a candidate the budget
+    // could not afford, or one that is still waiting for geometry (not resident).
+    const heapErr = this.hN > 0 ? this.hKey[0] : 0;
+    this.stats.threshold = Math.max(heapErr, skippedErr) || floorPx;
     this.stats.visited = this.rN;
     // emit: members of refined groups whose own source group is not refined
     let tris = 0;
@@ -443,7 +508,7 @@ export class ClodSelector {
       if (minLv[g] < loaded) continue; // members not resident: the group above draws its product instead
       for (let k = a.memberOff[g], e = a.memberOff[g + 1]; k < e; k++) {
         const c = a.memberIds[k], s = cU[c * 4 + 2];
-        if (s >= 0 && b.refined[i * G + s] === frame && minLv[s] >= loaded) continue;
+        if (s >= 0 && b.refined[i * G + s] === frame) continue;
         if (!this._vis(b, i, a.clusterF, c * 4)) continue;
         let n = b._n; if (n >= b.cap) b._alloc(b.cap * 2);
         b._multiDrawStarts[n] = cU[c * 4] * 4; b._multiDrawCounts[n] = cU[c * 4 + 1];

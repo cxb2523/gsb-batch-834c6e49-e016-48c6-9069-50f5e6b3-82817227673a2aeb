@@ -34,6 +34,16 @@ export interface ClodAsset {
   fullBytes: number;
   /** Streaming assets only. */
   stream?: true;
+  /** True when every cluster at `level` is resident (level >= loadedLevel). */
+  isResident?(level: number): boolean;
+  /** True when all member clusters of group `g` are resident, so the group may be refined. */
+  groupResident?(g: number): boolean;
+  /** Record that selection wanted `level`; the next updateStreaming loads down to it. */
+  needLevel?(level: number): void;
+  /** Bumped on every successful geometry swap. */
+  geometryVersion?: number;
+  /** Last load failure, if any. Cleared when a retry starts. */
+  loadError?: unknown;
   loadTo?(level: number): Promise<void>;
   loading?: Promise<void> | null;
   [key: string]: unknown;
@@ -57,6 +67,10 @@ export interface ClodSelectOptions {
   /** Triangle budget for all batches of this selector; 0 or undefined = threshold mode. */
   budget?: number;
 }
+/**
+ * Result of one selection. `tris` always equals the triangle count written to the draw lists: in
+ * budget mode a group that is not resident is skipped and contributes nothing to it.
+ */
 export interface ClodStats { tris: number; clusters: number; visited: number; ms: number; threshold: number; occluded?: number }
 export interface HzbSnapshot { data: Float32Array; w: number; h: number; vp: Float32Array; near: number; far: number; px: number; py: number }
 

@@ -105,7 +105,7 @@ renderer.setAnimationLoop(() => {
 });
 ```
 
-`errorPx` is the allowed geometric error in pixels. `budget` is a triangle count for the whole selector; when it is above zero the selector refines worst-first until the budget is spent, and `errorPx` becomes the floor below which it stops refining. Something like `{ errorPx: 0.5, budget: 300000 }` gives a fixed cost per frame.
+`errorPx` is the allowed geometric error in pixels. `budget` is a triangle count for the whole selector; when it is above zero the selector refines worst-first until the budget is spent, and `errorPx` becomes the floor below which it stops refining. Something like `{ errorPx: 0.5, budget: 300000 }` gives a fixed cost per frame. With streaming, a group whose members are not resident is never refined, so it never enters the triangle count: the coarse layer stays in the cut and its triangles are counted instead. A skipped group therefore cannot use up budget it does not draw, and `select()` reports the same triangle count it wrote to the draw lists.
 
 The data folder can be served by anything. Streaming additionally needs a host that honours HTTP Range requests.
 
@@ -143,10 +143,16 @@ Controls: drag to look, WASD and Q/E to fly, shift to go faster. The panel switc
 Fetches `<base>/<name>.json` and `<base>/<name>.bin` whole. The asset holds `meta` (the JSON), `geometry` (a `BufferGeometry` with every level in it; do not draw it directly), `sphere` (bounding sphere in model space) and the hierarchy arrays.
 
 **`loadClodStream(base, name, { rootBytes = 96 * 1024, delayMs = 0 })`** → `Promise<asset>`
-Loads the hierarchy and the coarsest levels that fit in `rootBytes`, and fetches finer levels later with Range requests. Use with `updateStreaming`. Useful fields: `loadedLevel` (0 means everything is loaded), `residentBytes`, `fullBytes`. Streaming assets cannot be used with `DiscreteLodSet`.
+Loads the hierarchy and the coarsest levels that fit in `rootBytes`, and fetches finer levels later with Range requests. Use with `updateStreaming`. Useful fields: `loadedLevel` (0 means everything is loaded), `residentBytes`, `fullBytes`, `loadError`, `geometryVersion`. Streaming assets cannot be used with `DiscreteLodSet`.
+
+Residency is an explicit state. Clusters are stored coarsest first, so "loaded down to level L" (`loadedLevel = L`) makes every cluster with level ≥ L resident. Two helpers expose it: `asset.isResident(level)` and `asset.groupResident(g)` (true only when every member cluster of group `g` is resident). Those members are the streaming unit: a group is never drawn or refined half-loaded.
+
+A group that is not resident is a normal, fall-back-able state during selection, not an error. Selection draws the coarse layer that the group's *source* group produced, records the finest level it needs with `asset.needLevel(level)`, and keeps walking the hierarchy so one request fetches everything needed. That is why a partially loaded asset always draws a complete, crack-free cut: never a partial group, never a non-resident cluster, and no cluster twice.
 
 **`updateStreaming(assets)`** → `Promise[]`
-Call once per frame after `select()`. Starts a fetch for each streaming asset whose last selection wanted finer levels than it has.
+Call once per frame after `select()`. Starts a fetch for each streaming asset whose last selection wanted finer levels than it has. Requests are merged per asset: any number of batches, instances or `updateStreaming` calls for the same asset in the same frame produce one load with four Range requests (position, normal, uv, index). Only one load per asset is ever in flight; a demand recorded while a load is running is kept and served by a later frame. If the host answers a Range request with 200 instead of 206 the returned promise rejects, the already-resident geometry and `loadedLevel` stay as they were, and the next frame retries.
+
+When a load completes, the growing vertex and index buffers are wrapped in a new `BufferGeometry`, every batch of the asset is pointed at it, and only then is the old geometry disposed. Draw lists carry index ranges into a prefix whose bytes never change, so a list written before the swap stays valid against the longer buffers afterwards.
 
 **`loadClodMaterial(base, asset, params?)`** → `MeshStandardMaterial`
 Convenience: wires up the base colour, normal and occlusion/roughness/metal textures and the material factors that the preprocessor copied out of the GLB. `params` overrides anything.
@@ -234,7 +240,17 @@ If you can run native code, the C++ original is the better builder.
 npm test
 ```
 
-builds a procedural model into a temporary folder and runs the crack test on it. The demo page exposes `window.demo.bench()`, `trace()` and `capture()` for timing runs; with `?auto=<name>` it runs a whole suite and saves `out/bench/<name>.json`, which `node examples/bench-table.mjs` prints.
+builds a procedural model into a temporary folder and runs the crack test on it, then `test/streaming.mjs`, which serves a built asset from a local HTTP server with Range support and checks the streaming contract without a browser: progressive load converges without duplicate clusters, `rootBytes` too small for anything but the root layer still draws that whole layer, one frame's many batches and `updateStreaming` calls produce one load, a host that answers 200 instead of 206 rejects without damaging resident state and the next frame recovers, the old geometry is disposed only after every batch points at the new one, and budget mode does not charge budget for skipped groups.
+
+To watch the same checks on a real WebGL2 renderer, start the verification server and open the page it prints:
+
+```bash
+node examples/prepare.mjs && node examples/verify-server.mjs
+```
+
+Then open `http://127.0.0.1:5292/`. It loads one asset in streaming mode, draws 12 instances, and prints PASS/FAIL for the same acceptance list, with the live cut in the background (coloured by cluster, drag to orbit). The server can be told to ignore Range requests at runtime, which is how the 200-instead-of-206 case is exercised. A headless run can read `window.verify.result` over CDP.
+
+The demo page exposes `window.demo.bench()`, `trace()` and `capture()` for timing runs; with `?auto=<name>` it runs a whole suite and saves `out/bench/<name>.json`, which `node examples/bench-table.mjs` prints.
 
 ## Credits and sources
 
