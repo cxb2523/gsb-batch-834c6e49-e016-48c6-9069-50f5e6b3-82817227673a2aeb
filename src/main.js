@@ -1,6 +1,11 @@
 import * as THREE from "three";
 import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
-import { connectRadioToServer, receiveCommand } from "./radio.js";
+import {
+  connectDurationsToServer,
+  connectRadioToServer,
+  connectSkipToServer,
+  receiveCommand,
+} from "./radio.js";
 
 // ---- Asset config (change here to use other files) ----
 const TOWN = {
@@ -1111,6 +1116,10 @@ elName.addEventListener("click", () => {
 const others = new Map(); // id -> { mesh, tex, cfg, target, dir, step, name }
 let myId = null;
 let ws = null;
+// radio messages that arrived before the server's snapshot on this connection
+let awaitingRadioSnapshot = false;
+let radioSnapshotFallback = 0;
+const pendingRadio = [];
 
 function setFrameTex(tex, cfg, d, step) {
   const img = tex.image;
@@ -1192,16 +1201,42 @@ function updateCount() {
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws/${ROOM}`);
-  ws.onopen = () =>
+  ws.onopen = () => {
+    // A reconnect is a fresh baseline: hold radio broadcasts until the server's
+    // snapshot has re-anchored the room state, so an order from before the drop
+    // can never slip in after it (the snapshot is always sent right after "you").
+    awaitingRadioSnapshot = true;
+    pendingRadio.length = 0;
+    // if an older server never sends a snapshot, don't block the radio forever
+    clearTimeout(radioSnapshotFallback);
+    radioSnapshotFallback = setTimeout(() => {
+      awaitingRadioSnapshot = false;
+      // no snapshot came: the buffered broadcasts are the newest thing we have
+      pendingRadio.splice(0).forEach(receiveCommand);
+    }, 3000);
     ws.send(JSON.stringify({ t: "hello", name: NAME, gender: GENDER }));
+  };
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "you") myId = m.id;
+    else if (m.t === "radio") {
+      const snapshot = m.command?.snapshot === true;
+      if (awaitingRadioSnapshot && !snapshot) {
+        // ordered stream: this was made before the snapshot, so it is older
+        pendingRadio.push(m.command);
+        return;
+      }
+      if (snapshot) {
+        awaitingRadioSnapshot = false;
+        clearTimeout(radioSnapshotFallback);
+        pendingRadio.length = 0; // superseded by the snapshot
+        receiveCommand(m.command);
+      } else receiveCommand(m.command);
+    }
     else if (m.t === "state") m.players.forEach(createOther);
     else if (m.t === "joined") createOther(m.player);
     else if (m.t === "left") removeOther(m.id);
     else if (m.t === "chat") receiveChat(m.id, m.name, m.text);
-    else if (m.t === "radio") receiveCommand(m.command);
     else if (m.t === "error") addToHistory("system", m.msg);
     else if (m.t === "name") {
       const o = others.get(m.id);
@@ -1242,6 +1277,14 @@ if (MULTIPLAYER) {
     let password = "";
     try { password = localStorage.getItem("admin-password") || ""; } catch {}
     if (ws?.readyState === 1) ws.send(JSON.stringify({ t: "radio", idx, password }));
+  });
+  // track lengths this tab learned: they let late joiners replay the timeline
+  connectDurationsToServer((durations) => {
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ t: "durations", durations }));
+  });
+  // a track this tab can't play is skipped for the whole room, not just here
+  connectSkipToServer((id) => {
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ t: "skip", id }));
   });
 }
 

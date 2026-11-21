@@ -3,10 +3,20 @@
 //   client -> server: { t: "hello", name, gender } | { t: "pos", x, z, dir, step }
 //                     { t: "chat", text } | { t: "name", name } | { t: "gender", gender }
 //                     { t: "radio", idx, password }   (admin)
+//                     { t: "durations", durations }   (a player's learned track lengths)
+//                     { t: "skip", id }               (a player could not play a track)
 //   server -> client: { t: "you", id } | { t: "state", players: [...] }
 //                     { t: "joined", player } | { t: "left", id } | { t: "pos", ... }
 //                     { t: "chat", id, name, text, at } | { t: "name", id, name }
 //                     { t: "gender", id, gender } | { t: "radio", command } | { t: "error", msg }
+//
+// The radio command is the room's state, and it must be enough for a client that
+// joins (or reconnects) later to compute the same track and second as everyone:
+//   { v, idx, at, rev, playlist, durations }
+// `at` is the instant the track started, `rev` orders newer over older, and
+// `durations` is the room's learned table of real track lengths. The snapshot
+// sent right after connecting carries `snapshot: true` and always wins on the
+// client, so a stale local cache can never override the room.
 //
 // Security (the client is public, so nothing coming from it is trusted):
 //  - max message size, per-connection rate limit, max players per room
@@ -15,6 +25,19 @@
 //  - allowed origins (ALLOWED_ORIGINS) so other sites can't use this server
 //  - per IP: few connections, shared chat budget, admin lockout, progressive mute for spam
 //  - all text is stripped of control characters and truncated; numbers finite and clamped
+//  - durations and playlist ids from the client are checked against the room's own
+//    playlist and clamped, never taken as-is
+
+import {
+  DEFAULT_START,
+  PLAYLIST as PLAYLIST_SOURCE,
+  buildCommand,
+  mergeDurations,
+  normalizeCommand,
+  sanitizeDurations,
+  sanitizePlaylist,
+  sanitizeSkipped,
+} from "../src/radio-model.js";
 
 const MAX_PLAYERS = 100;
 // v1 has a single room; any other name is refused so nobody can spin up extra rooms (and extra cost)
@@ -33,6 +56,8 @@ const REPEAT_WINDOW_MS = 30_000; // ...inside this window counts as spam
 const RATES = { pos: [30, 20], chat: [8, 1], other: [10, 1] };
 
 const DIRS = ["down", "up", "left", "right"];
+const PLAYLIST = sanitizePlaylist(PLAYLIST_SOURCE);
+const BASE_COMMAND = normalizeCommand({ idx: 0, at: DEFAULT_START, rev: 0, playlist: PLAYLIST }) || null;
 const cleanText = (s, max) =>
   String(s ?? "")
     .replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/g, "")
@@ -76,10 +101,20 @@ export class Room {
     this.state.acceptWebSocket(server);
     server.serializeAttachment({ id, name: "trainer", gender: "male", x: 0, z: 0, dir: "down", step: 0, ip });
     server.send(JSON.stringify({ t: "you", id }));
-    const radio = await this.state.storage.get("radio");
-    if (radio) server.send(JSON.stringify({ t: "radio", command: radio }));
+    // The room's radio state, marked as a snapshot: on the client it replaces any
+    // cached command unconditionally, newest or not. This is what makes a
+    // reconnect resume from the room and not from a stale local copy.
+    server.send(JSON.stringify({ t: "radio", command: { ...(await this.radio()), snapshot: true } }));
     server.send(JSON.stringify({ t: "state", players: this.players().filter((p) => p.id !== id) }));
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // The stored command, or the default clock (same anchor every client uses when
+  // it has no command). Always a valid command object with its duration table.
+  async radio() {
+    const stored = normalizeCommand(await this.state.storage.get("radio"), PLAYLIST);
+    if (stored) return stored;
+    return normalizeCommand(BASE_COMMAND, PLAYLIST) || BASE_COMMAND;
   }
 
   // only each player's public fields (never the IP)
@@ -159,7 +194,57 @@ export class Room {
         return;
       }
       await this.state.storage.delete(lockKey);
-      const command = { idx: Math.max(0, Math.min(999, m.idx | 0)), at: Date.now() };
+      const prev = await this.radio();
+      const command = buildCommand({
+        prev,
+        idx: Math.max(0, Math.min(999, m.idx | 0)),
+        at: Date.now(),
+        playlist: PLAYLIST,
+      });
+      if (!command) return;
+      await this.state.storage.put("radio", command);
+      this.broadcast({ t: "radio", command });
+    } else if (m.t === "durations") {
+      // A player learned real track lengths. Never trusted as-is: only ids of the
+      // room's playlist, clamped seconds; the first report for an id wins, so a
+      // later (or hostile) client cannot retime the room or churn broadcasts.
+      // The table is stored with the command so late joiners replay the timeline.
+      const report = sanitizeDurations(m.durations, PLAYLIST);
+      if (!Object.keys(report).length) return;
+      const current = await this.radio();
+      const fresh = {};
+      for (const [id, value] of Object.entries(report)) {
+        if (!(id in (current.durations || {}))) fresh[id] = value;
+      }
+      if (!Object.keys(fresh).length) return;
+      const merged = mergeDurations(current.durations, fresh);
+      // same track start (`idx`, `at`); only the revision and the duration table
+      // grow, so clients retime without resetting the little TV
+      const command = normalizeCommand(
+        { ...current, rev: (Number(current.rev) || 0) + 1, durations: merged },
+        PLAYLIST,
+      );
+      if (!command) return;
+      await this.state.storage.put("radio", command);
+      this.broadcast({ t: "radio", command });
+    } else if (m.t === "skip") {
+      // A player found a track unplayable (embed off / removed video). Only the
+      // room's own ids count, a repeat changes nothing, and an admin action
+      // clears the list (it is the undo). Everyone then walks past the same
+      // track, so the timeline does not fork per tab.
+      const [id] = sanitizeSkipped([m.id], PLAYLIST);
+      if (!id) return;
+      const current = await this.radio();
+      if ((current.skipped || []).includes(id)) return;
+      const command = normalizeCommand(
+        {
+          ...current,
+          rev: (Number(current.rev) || 0) + 1,
+          skipped: [...(current.skipped || []), id],
+        },
+        PLAYLIST,
+      );
+      if (!command) return;
       await this.state.storage.put("radio", command);
       this.broadcast({ t: "radio", command });
     } else if (m.t === "chat") {

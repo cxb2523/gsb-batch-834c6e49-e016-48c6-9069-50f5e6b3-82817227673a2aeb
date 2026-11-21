@@ -6,6 +6,7 @@
     "dev": "vite",
     "dev:server": "wrangler dev --port 8787",
     "build": "vite build",
+    "test": "node --test",
     "deploy": "vite build && wrangler deploy",
     "deploy-your-own": "bash scripts/deploy-your-own.sh",
     "render-docs": "bash scripts/render-docs.sh"

@@ -11,12 +11,17 @@
 - Anti-flood per IP: at most 3 connections, chat budget shared across tabs, admin locked for 15 min after 5 wrong passwords (counted per IP, survives reconnects).
 - Browser icon: the town's lamp post (`public/favicon.svg`).
 - Progressive mute for chat spam (rate exceeded, or the same text 4+ times in a row): warning, then 15 s, 1 min, 5 min, 30 min.
+- `npm test` (Node's built-in runner): local checks for the radio timeline and the player state machine, with made-up durations and commands — normal switches, late joiners, late durations, error skips, ended videos, single-track seeks and reconnect precedence.
 
 ### Changed
 - Room limit raised from 40 to 100 players.
 - A single room, `lobby`: `?room=` is gone and the server refuses other room names, so nobody can open extra rooms to run up the bill.
 
 ### Fixed
+- **Radio stays in sync across a switch, a late join and a reconnect.** The room command now carries the playlist, the real track durations and the room's unplayable list, so every client computes the same track and second instead of counting an hour per unknown track; the server's snapshot replaces a stale local command on reconnect, so the room always wins.
+- **Restarting a one-track playlist seeks** instead of being mistaken for "already playing that song".
+- **Switching tracks clears the old cover and title** (and their timers), so the previous cover can't sit on top of the new video and the title can't label it.
+- **Every recovery path converges:** admin switch, video ended, a duration arriving late and an embed error all resolve through the same function, so everyone lands on the same track and second. A track one tab can't play is reported and skipped for the whole room.
 - Chat history scrolls to older messages; new messages only pull you down if you were already at the bottom.
 - Long words without spaces now wrap in the chat bubble and history.
 

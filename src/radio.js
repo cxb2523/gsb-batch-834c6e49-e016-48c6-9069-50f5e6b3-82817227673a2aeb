@@ -1,22 +1,38 @@
 // Room radio: the SYSTEM controls the track and position; pausing is local only.
-// Everyone hears the same part: the position is computed from the clock, starting
-// at a fixed date, looping through the playlist. With multiplayer, the room's
-// Durable Object becomes the source of that "start".
+//
+// Everyone hears the same second because radio-core.js resolves it from one
+// shared state: the room command ("track idx started at `at`") plus the real
+// duration table kept by the server. This file is the browser side of that:
+// the YouTube player, the little TV's cover and title, mute, and the pipes to
+// the room server. Every desync event (admin switch, ENDED, a duration arriving
+// late, an embed error, a reconnect) funnels through the same core resolver.
 
-export const PLAYLIST = [
-  "x6ujm9B-vAc",
-  // add more YouTube IDs here
-];
+import {
+  PLAYLIST,
+  normalizeCommand,
+  sanitizePlaylist,
+} from "./radio-model.js";
+import { createRadioCore } from "./radio-core.js";
 
-const START = Date.UTC(2026, 0, 1); // radio's time zero
-const durations = {}; // id -> seconds (learned as each video loads)
+export { PLAYLIST };
 
+const CACHE_KEY = "radio-command";
+const CACHE_MAX_AGE_MS = 24 * 60 * 60_000; // older than a day is no better than the default clock
+
+const playlist = sanitizePlaylist(PLAYLIST);
+
+const TOUCH = matchMedia("(pointer: coarse)").matches;
+
+let core = null;
 let player = null;
-let playingIdx = -1;
 let paused = false;
-// mute is per person and remembered; the radio keeps playing (and in sync) underneath
 let muted = false;
 try { muted = localStorage.getItem("muted") === "1"; } catch {}
+
+let syncTimer = 0;
+let coverTimer = 0;
+let coverEl = null;
+let titleEl = null;
 
 function loadApi() {
   return new Promise((ok) => {
@@ -28,111 +44,223 @@ function loadApi() {
   });
 }
 
-// Admin command: "video idx started at time t". While it exists it drives
-// the clock; after that video ends, the playlist continues from it.
-let command = null;
-try { command = JSON.parse(localStorage.getItem("radio-command") || "null"); } catch {}
-
-function nowByCommand() {
-  let idx = command.idx;
-  let t = (Date.now() - command.at) / 1000;
-  // walk the playlist while time is past the video's duration
-  for (let n = 0; n < 500; n++) {
-    const d = durations[PLAYLIST[idx]] || 3600;
-    if (t < d) return { idx, sec: Math.max(0, t) };
-    t -= d;
-    idx = (idx + 1) % PLAYLIST.length;
+// ---- the room command cache ------------------------------------------------
+// A cached command is a bootstrap for the first instant only: the server sends
+// its own snapshot on connect and that always wins, so a stale local command
+// can never override the room.
+function readCache() {
+  try {
+    const cmd = normalizeCommand(JSON.parse(localStorage.getItem(CACHE_KEY) || "null"), playlist);
+    if (!cmd || Date.now() - cmd.at > CACHE_MAX_AGE_MS) return null;
+    return cmd;
+  } catch {
+    return null;
   }
-  return { idx: 0, sec: 0 };
 }
 
-// With a server: the command goes to the room's Durable Object, which checks the
-// admin password and sends it to everyone (including back here).
+function writeCache(cmd) {
+  try {
+    if (cmd) localStorage.setItem(CACHE_KEY, JSON.stringify(cmd));
+    else localStorage.removeItem(CACHE_KEY);
+  } catch {}
+}
+
+// ---- the little TV: cover + title ------------------------------------------
+// The cover hides YouTube's pause/play overlay and logo while the video isn't
+// playing. It belongs to exactly one video: every switch clears the pending
+// timer and points it at the new thumbnail, so an old cover can never sit on
+// top of the new video and the title never keeps the old track's text.
+function setTitle(text) {
+  if (titleEl) titleEl.textContent = text || "—";
+}
+
+function updateCover(playing, videoId) {
+  if (!coverEl) return;
+  clearTimeout(coverTimer);
+  coverTimer = 0;
+  if (playing) {
+    // YouTube shows its pause button and channel badge for a few seconds after
+    // playback starts, so the cover only lifts once that has faded
+    coverTimer = setTimeout(() => { coverEl.hidden = true; }, 4500);
+    return;
+  }
+  coverEl.src = videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : "";
+  coverEl.hidden = !videoId;
+}
+
+// A YouTube player adapter for the core. Everything is read fresh from the
+// iframe, because its state lags behind loadVideoById/seekTo calls.
+function makeAdapter() {
+  return {
+    getVideoId() {
+      try { return player?.getVideoData?.()?.video_id || ""; } catch { return ""; }
+    },
+    getCurrentTime() {
+      try { return player?.getCurrentTime?.() || 0; } catch { return 0; }
+    },
+    getState() {
+      try { return player?.getPlayerState?.() ?? -1; } catch { return -1; }
+    },
+    load(videoId, seconds) {
+      player?.loadVideoById?.({ videoId, startSeconds: seconds });
+    },
+    seek(seconds) {
+      player?.seekTo?.(seconds, true);
+    },
+    play() {
+      player?.playVideo?.();
+    },
+    pause() {
+      player?.pauseVideo?.();
+    },
+  };
+}
+
+// With a server: the command goes to the room's Durable Object, which checks
+// the admin password, stamps the command and sends it to everyone.
 let sendToServer = null;
 export function connectRadioToServer(fn) {
   sendToServer = fn;
 }
-// called when the server sends the room's current command
+
+// Durations we learned locally go to the room so late joiners can replay the
+// same timeline. The server validates and clamps them.
+let sendDurations = null;
+export function connectDurationsToServer(fn) {
+  sendDurations = fn;
+}
+
+// A track this tab could not play is reported so every tab walks past it.
+let sendSkip = null;
+export function connectSkipToServer(fn) {
+  sendSkip = fn;
+}
+
+// Called when the server sends the room's current command (or a duration update
+// for the same command). `snapshot` marks the copy sent right after connecting:
+// it always wins, so a stale local cache can never override the room.
+// Messages can arrive before the player starts (the radio begins on "enter the
+// room"), so the last one is kept and replayed by startRadio().
+let beforeStart = null;
+let beforeStartDurations = null;
+let beforeStartSkipped = null;
 export function receiveCommand(c) {
-  command = c && Number.isFinite(c.idx) ? { idx: c.idx % PLAYLIST.length, at: c.at } : null;
-  playingIdx = -1;
-  sync();
-}
-
-function applyCommand(idx) {
-  idx = (idx + PLAYLIST.length) % PLAYLIST.length;
-  if (sendToServer) return sendToServer(idx); // wait for the server to confirm
-  command = { idx, at: Date.now() };
-  try { localStorage.setItem("radio-command", JSON.stringify(command)); } catch {}
-  playingIdx = -1; // force reloading the video at the new point
-  sync();
-}
-
-// Admin controls (local when offline; go to the room server in multiplayer)
-export const admin = {
-  restart: () => applyCommand(Math.max(0, playingIdx)),
-  next: () => applyCommand(playingIdx + 1),
-  previous: () => applyCommand(playingIdx - 1),
-};
-
-// Which video and which second, right now. A video with unknown duration counts
-// as 1h until it loads (then it's recomputed).
-function nowOnRadio() {
-  if (command) return nowByCommand();
-  const total = PLAYLIST.reduce((s, id) => s + (durations[id] || 3600), 0);
-  let t = ((Date.now() - START) / 1000) % total;
-  for (let i = 0; i < PLAYLIST.length; i++) {
-    const d = durations[PLAYLIST[i]] || 3600;
-    if (t < d) return { idx: i, sec: t };
-    t -= d;
-  }
-  return { idx: 0, sec: 0 };
-}
-
-function sync() {
-  if (paused || !player?.getPlayerState) return;
-  const { idx, sec } = nowOnRadio();
-  if (idx !== playingIdx) {
-    const sameVideo = PLAYLIST[idx] === player.getVideoData?.()?.video_id;
-    playingIdx = idx;
-    // restart with a 1-video playlist: same id, just seek back
-    if (sameVideo) player.seekTo(sec, true);
-    else player.loadVideoById({ videoId: PLAYLIST[idx], startSeconds: sec });
+  if (!c || typeof c !== "object") return;
+  // A command always carries its start time; anything else is an update to the
+  // current command.
+  const isCommand = c.at != null && Number.isFinite(Number(c.at));
+  if (!core) {
+    if (isCommand) beforeStart = c;
+    else if (c.durations) beforeStartDurations = { ...(beforeStartDurations || {}), ...c.durations };
+    else if (c.skipped) beforeStartSkipped = [...new Set([...(beforeStartSkipped || []), ...c.skipped])];
     return;
   }
-  // correct drift (ads, slow connection) of more than 3s
-  const current = player.getCurrentTime?.() || 0;
-  if (Math.abs(current - sec) > 3 && player.getPlayerState() === YT.PlayerState.PLAYING) player.seekTo(sec, true);
-  if (player.getPlayerState() !== YT.PlayerState.PLAYING && player.getPlayerState() !== YT.PlayerState.BUFFERING) player.playVideo();
+  if (isCommand) {
+    const normalized = normalizeCommand(c, playlist);
+    if (!normalized) return;
+    core.setCommand(normalized, { snapshot: c.snapshot === true });
+    writeCache(core.snapshot().command);
+    return;
+  }
+  // a duration-only update for the current command
+  if (c.durations) {
+    core.applyDurations(c.durations);
+    writeCache(core.snapshot().command);
+    return;
+  }
+  // a skip-list update for the current command
+  if (c.skipped) {
+    core.applySkipped(c.skipped);
+    writeCache(core.snapshot().command);
+  }
 }
 
-const TOUCH = matchMedia("(pointer: coarse)").matches;
+// Admin controls (local when offline; go to the room server in multiplayer).
+const currentIdx = () => {
+  const s = core?.snapshot();
+  if (!s) return 0;
+  // the track being heard now: what the player is on, else the resolved one
+  // (admin may press restart while the first load is still in flight)
+  if (s.playingIdx >= 0) return s.playingIdx;
+  return s.resolved?.idx ?? 0;
+};
+function applyCommand(idx) {
+  const list = core?.snapshot().playlist?.length ? core.snapshot().playlist : sanitizePlaylist(playlist);
+  idx = ((Math.floor(idx) % list.length) + list.length) % list.length;
+  if (sendToServer) return sendToServer(idx); // wait for the server to confirm
+  if (!core) return;
+  const next = core.admin(idx);
+  if (next) writeCache(core.snapshot().command);
+}
+export const admin = {
+  restart: () => applyCommand(currentIdx()),
+  next: () => applyCommand(currentIdx() + 1),
+  previous: () => applyCommand(currentIdx() - 1),
+};
 
 export async function startRadio({ elPlayer, elTitle }) {
   await loadApi();
-  const { idx, sec } = nowOnRadio();
-  playingIdx = idx;
+  titleEl = elTitle;
+
+  const initial = readCache();
+  core = createRadioCore({
+    playlist,
+    command: initial,
+    onTitle: setTitle,
+    onCover: ({ playing, videoId }) => updateCover(playing, videoId),
+    onDurations: (table) => {
+      if (sendDurations) {
+        try { sendDurations(table); } catch {}
+      }
+    },
+    onSkip: (id) => {
+      if (sendSkip) {
+        try { sendSkip(id); } catch {}
+      }
+    },
+  });
+
+  // a command that arrived while the player didn't exist yet is the room's
+  // latest word: apply it as a snapshot before choosing the first frame
+  if (beforeStart) {
+    core.setCommand(beforeStart, { snapshot: true });
+    beforeStart = null;
+  }
+  if (beforeStartDurations) {
+    core.applyDurations(beforeStartDurations);
+    beforeStartDurations = null;
+  }
+  if (beforeStartSkipped) {
+    core.applySkipped(beforeStartSkipped);
+    beforeStartSkipped = null;
+  }
+  // the first frame: the (possibly just replaced) command decides the video and
+  // a best-guess second; the core seeks to the exact one on its first sync after
+  // ready, so a late joiner is never more than that first seek away
+  const boot = core.snapshot();
+  const bootVideo = boot.resolved?.videoId || boot.playingVideoId || playlist[0];
+  const bootSeconds = boot.resolved?.blocked ? 0 : Math.floor(boot.resolved?.sec || 0);
+
+  const host = document.getElementById(elPlayer);
   // cover with the video's thumbnail whenever it isn't playing, so YouTube's big
   // pause/play overlay and logo never show in the little TV
-  const cover = Object.assign(document.createElement("img"), { className: "tv-cover", alt: "" });
-  document.getElementById(elPlayer).parentElement.append(cover);
-  // YouTube shows its pause button and channel badge for a few seconds after playback
-  // starts, so the cover only lifts once that has faded
-  let coverTimer = 0;
-  const setCover = (playing) => {
-    clearTimeout(coverTimer);
-    if (playing) coverTimer = setTimeout(() => (cover.hidden = true), 4500);
-    else {
-      cover.src = `https://i.ytimg.com/vi/${PLAYLIST[Math.max(0, playingIdx)]}/hqdefault.jpg`;
-      cover.hidden = false;
-    }
-  };
-  setCover(false);
+  coverEl = Object.assign(document.createElement("img"), { className: "tv-cover", alt: "" });
+  host.parentElement.append(coverEl);
+  updateCover(false, bootVideo);
+
   player = new YT.Player(elPlayer, {
     width: 176,
     height: 99,
-    videoId: PLAYLIST[idx],
-    playerVars: { autoplay: 1, controls: 0, disablekb: 1, modestbranding: 1, rel: 0, playsinline: 1, start: Math.floor(sec) },
+    videoId: bootVideo,
+    playerVars: {
+      autoplay: 1,
+      controls: 0,
+      disablekb: 1,
+      modestbranding: 1,
+      rel: 0,
+      playsinline: 1,
+      start: bootSeconds, // the backstop for the first moments of playback
+    },
     events: {
       onReady: (e) => {
         e.target.setVolume(70);
@@ -151,33 +279,31 @@ export async function startRadio({ elPlayer, elTitle }) {
         if (muted) e.target.mute();
         if (paused) e.target.pauseVideo();
         else e.target.playVideo();
+        core.ready();
       },
       onStateChange: (e) => {
-        const p = e.target;
-        setCover(e.data === YT.PlayerState.PLAYING);
-        if (paused && e.data === YT.PlayerState.PLAYING) {
-          p.pauseVideo();
-          return;
-        }
-        if (e.data === YT.PlayerState.PLAYING) {
-          const id = PLAYLIST[playingIdx];
-          const d = p.getDuration();
-          if (d && durations[id] !== d) {
-            durations[id] = d;
-            sync(); // now with the real duration, recompute the point
-          }
-          elTitle.textContent = p.getVideoData()?.title || "—";
-        }
-        if (e.data === YT.PlayerState.ENDED) sync();
+        core.stateChange({
+          state: e.data,
+          videoId: e.target.getVideoData?.()?.video_id,
+          title: e.target.getVideoData?.()?.title,
+          duration: e.target.getDuration?.(),
+        });
+        writeCache(core.snapshot().command); // a learned duration is worth keeping
       },
       onError: () => {
-        // video unavailable / not embeddable: skip to the next
-        durations[PLAYLIST[playingIdx]] = 1;
-        sync();
+        // unavailable / embedding disabled: skip it here and resolve again, so
+        // this tab walks to the same next track as everyone else
+        core.error(e.target.getVideoData?.()?.video_id);
       },
     },
   });
-  setInterval(sync, 5000);
+  core.attach(makeAdapter());
+  clearInterval(syncTimer);
+  syncTimer = setInterval(() => {
+    core.tick();
+    writeCache(core.snapshot().command);
+  }, 5000);
+  writeCache(boot.command);
 }
 
 export const isMuted = () => muted;
@@ -194,10 +320,14 @@ export function setMuted(m) {
 
 export function pauseRadio() {
   paused = true;
-  player?.pauseVideo?.();
+  core?.pause();
+  writeCache(core?.snapshot().command);
 }
 
 export function resumeRadio() {
   paused = false;
-  sync();
+  core?.resume();
 }
+
+// Deterministic hook for the local checks (no YouTube in Node).
+export const __radioInternals = { getCore: () => core };

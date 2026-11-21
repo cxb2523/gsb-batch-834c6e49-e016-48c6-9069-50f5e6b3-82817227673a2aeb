@@ -41,7 +41,7 @@ Open the URL, pick a trainer and press **enter the room**: the click is what let
 
 - There is one room, `lobby`, for everyone (the server refuses any other name).
 - Admin (restart or skip the song for everyone): open once with `?admin=<ADMIN_PASSWORD>`.
-- Change the song list in [`src/radio.js`](src/radio.js) (`LISTA`, YouTube video ids).
+- Change the song list in [`src/radio-model.js`](src/radio-model.js) (`PLAYLIST`, YouTube video ids).
 
 ## Architecture
 
@@ -51,12 +51,12 @@ Open the URL, pick a trainer and press **enter the room**: the click is what let
 |---|---|---|
 | Hosting | One **Worker** serves the Vite build as static assets and routes `/ws/<room>`; no other server | [ADR 001](docs/adr/001-one-durable-object-per-room.md) |
 | Rooms | One **Durable Object per room**, WebSocket Hibernation API; each player's state lives in its own socket (`serializeAttachment`) | [ADR 001](docs/adr/001-one-durable-object-per-room.md) |
-| Music | YouTube player with no controls; position = clock time since a fixed start, or since the last admin command kept in the object's storage | [ADR 002](docs/adr/002-radio-synced-by-the-clock.md) |
+| Music | YouTube player with no controls; position = clock time since the room's radio command (or a fixed start), walked through the playlist with real track durations kept by the room object | [ADR 002](docs/adr/002-radio-synced-by-the-clock.md) |
 | Rendering | three.js: sprites as lit planes in a 3D scene, real shadows from each lamp, **every sprite pixel takes the depth of the feet** | [ADR 003](docs/adr/003-sprites-take-the-depth-of-the-feet.md) |
 | Assets | The repo and live site include the **Twinleaf FBX town, its textures and both trainer sheets** from `public/assets/`; code-generated fallbacks remain for load failures | [ADR 005](docs/adr/005-version-and-deploy-game-assets.md) |
 | Admin | Secret `ADMIN_PASSWORD`, checked in the room object in constant time, few tries per connection | [SECURITY.md](SECURITY.md) |
 
-**Limits of this design.** There is a single room (`lobby`), and a room is one object, so it holds a few dozen players (capped at 100); growing past that would mean opening more rooms, not a bigger one. Positions are relayed, not simulated on the server, so a modified client can teleport; nothing in the lobby is worth cheating for. The YouTube player can't be hidden or fully controlled (ads, embeds disabled by the owner): those videos are skipped.
+**Limits of this design.** There is a single room (`lobby`), and a room is one object, so it holds a few dozen players (capped at 100); growing past that would mean opening more rooms, not a bigger one. Positions are relayed, not simulated on the server, so a modified client can teleport; nothing in the lobby is worth cheating for. The YouTube embed can't be fully controlled (ads, embeds disabled by the owner): a track a player can't play is reported and skipped for the whole room.
 
 The full design, with the protocol and the sync rules, is in the [v1 spec](docs/spec/v1.md).
 
@@ -67,9 +67,12 @@ index.html          HUD: room box, radio, chat, entry screen (glass over the sce
 src/
   main.js           scene, lights, water, asset loading and code-generated fallbacks,
                     collision, chat bubbles, name tags, multiplayer client
-  radio.js          YouTube player synced by the clock or by the room's radio command
+  radio-model.js    the radio timeline (command, durations, resolver): shared by the browser and the Worker
+  radio-core.js     drives one player from that timeline; every recovery path reuses the same resolver
+  radio.js          the YouTube player, the little TV's cover/title, mute, and the pipes to the room server
 public/assets/      Twinleaf FBX model, textures and male/female trainer sheets
 worker/index.js     Worker (static assets + /ws routing) and the Room Durable Object
+test/               local checks: `npm test` (node --test), fake players and made-up durations
 scripts/            deploy-your-own, README image rendering
 docs/               PRD, spec, ADRs, README images and real gameplay screenshot
 ```
