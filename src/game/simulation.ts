@@ -75,7 +75,7 @@ export class Simulation {
  private makeActors(defense=false):Actor[]{const teammates=defense?2:this.teammateBots,enemies=defense?10:this.enemyBots;return Array.from({length:1+teammates+enemies},(_,id)=>{const blueCount=1+teammates,team=id<blueCount?'blue':'red',faction=id<blueCount?'ct':'t',slot=team==='blue'?id:id-blueCount;const p=(team==='blue'?BLUE_SPAWNS:RED_SPAWNS)[slot];const weapon='rifle';const actor={id,name:id===0?'你':`${team==='blue'?'队友':'对手'} ${team==='blue'?slot:slot+1}`,team,faction,player:id===0,x:p.x,z:p.z,y:p.y??0,groundY:p.y??0,yaw:p.yaw??(team==='blue'?0:Math.PI),pitch:0,health:100,armor:0,money:STARTING_MONEY,crouched:false,moving:false,weapon,inventory:['rifle','pistol','knife'],guns:Object.fromEntries(WEAPON_KINDS.map(kind=>[kind,this.gun(kind)])) as Record<WeaponKind,Gun>,grenades:0,throwTime:-10,kills:0,deaths:0,shotTime:-10,hurtTime:-10,spread:0,hasBomb:false,defuseKit:false} as Actor;return actor;});}
  refreshMap(){if(this.state.phase!=='menu')return;this.state.mode=modeForMap(this.preferredMode);this.state.rescue=undefined;this.state.roundReason=undefined;this.state.sites=[];this.state.actors=this.makeActors();this.state.player=this.state.actors[0];this.state.spectating=null;this.state.grenades=[];this.state.pickups=allowsPickups(this.state.mode)?createMapPickups():[];for(const a of this.state.actors)this.equipRestricted(a);this.teamReports.clear();}
  start(mode:GameMode=modeForMap(this.state.mode)){this.supplyAt=20;this.state.mode=mode;this.state.race=undefined;this.state.defense=undefined;this.state.sites=this.state.mode==='demolition'?(getActiveMap().bombSites??OBJECTIVE_SITES):[];this.state.blueScore=0;this.state.redScore=0;this.state.round=1;this.state.totalKills=0;this.state.totalDeaths=0;this.state.feed=[];this.state.time=0;this.events=[];this.resetRound();}
- resetRound(allBots=false){this.queuedStab=null;this.interactionActors.clear();this.hostageActors.clear();this.state.roundReason=undefined;this.touchAssist.reset();this.meleePending.clear();this.pickupInteractHeld=false;this.nextPickupId=1000;this.teamReports.clear();this.footTimer=0;this.botFootTimers.forEach((_,id)=>{this.botFootTimers[id]=.07+id*.063;});const s=this.state;const previous=s.actors;const stats=s.actors.map(a=>({kills:a.kills,deaths:a.deaths,money:a.money}));s.actors=this.makeActors(s.mode==='defense');s.grenades=[];s.pickups=createMapPickups();s.actors.forEach((a,i)=>{if(s.round>1)Object.assign(a,stats[i]);resetEconomy(a,a.money);a.spawnedAt=s.time;a.respawnAt=0;a.spawnProtectionUntil=0;});const carrier=s.actors.find(a=>a.faction==='t');if(carrier&&s.mode==='demolition')carrier.hasBomb=true;s.player=s.actors[0];s.spectating=null;s.phase='playing';s.roundTime=isTeamDeathmatch(s.mode)?0:s.mode==='hostageRescue'?RESCUE_ROUND_SECONDS:s.mode==='demolition'?DEMOLITION_ROUND_SECONDS:105;s.paused=false;s.winner=null;s.hitMarker=0;s.bomb={status:'carried',carrierId:carrier?.id??3,x:0,z:0,site:null,y:0,timer:BOMB_SECONDS,progress:0,defuserId:null,planterId:null,plantProgress:0,plantSite:null};s.rescue=s.mode==='hostageRescue'?{hostages:(getActiveMap().hostageSpawns??[]).map(h=>({...h})),zones:(getActiveMap().rescueZones??[]).map(z=>({...z})),rescued:0,total:getActiveMap().hostageSpawns?.length??0}:undefined;this.brains=s.actors.map(a=>this.newBrain(a));this.events.push({type:'round'});this.setupOfflineMode(previous,allBots);for(const a of s.actors)resetWeaponSwitch(a);}
+ resetRound(allBots=false){this.clearRoundTransients();this.hostageActors.clear();this.state.roundReason=undefined;this.touchAssist.reset();this.nextPickupId=1000;this.footTimer=0;this.botFootTimers.forEach((_,id)=>{this.botFootTimers[id]=.07+id*.063;});const s=this.state;const previous=s.actors;const stats=s.actors.map(a=>({kills:a.kills,deaths:a.deaths,money:a.money}));s.actors=this.makeActors(s.mode==='defense');s.grenades=[];s.pickups=createMapPickups();s.actors.forEach((a,i)=>{if(s.round>1)Object.assign(a,stats[i]);resetEconomy(a,a.money);a.spawnedAt=s.time;a.respawnAt=0;a.spawnProtectionUntil=0;});const carrier=s.actors.find(a=>a.faction==='t');if(carrier&&s.mode==='demolition')carrier.hasBomb=true;s.player=s.actors[0];s.spectating=null;s.phase='playing';s.roundTime=isTeamDeathmatch(s.mode)?0:s.mode==='hostageRescue'?RESCUE_ROUND_SECONDS:s.mode==='demolition'?DEMOLITION_ROUND_SECONDS:105;s.paused=false;s.winner=null;s.hitMarker=0;s.bomb={status:'carried',carrierId:carrier?.id??3,x:0,z:0,site:null,y:0,timer:BOMB_SECONDS,progress:0,defuserId:null,planterId:null,plantProgress:0,plantSite:null};s.rescue=s.mode==='hostageRescue'?{hostages:(getActiveMap().hostageSpawns??[]).map(h=>({...h})),zones:(getActiveMap().rescueZones??[]).map(z=>({...z})),rescued:0,total:getActiveMap().hostageSpawns?.length??0}:undefined;this.brains=s.actors.map(a=>this.newBrain(a));this.events.push({type:'round'});this.setupOfflineMode(previous,allBots);for(const a of s.actors)resetWeaponSwitch(a);}
  private setupOfflineMode(previous:readonly Actor[],allBots=false){
   const s=this.state;
   if(s.mode==='bounty'){
@@ -106,7 +106,7 @@ export class Simulation {
   const s=this.state;if(!s.race||s.race.winnerId!==null||a.weapon!==RACE_LADDER[a.raceStage??0])return;
   a.raceKills=(a.raceKills??0)+1;
   if(a.weapon==='knife'){
-   s.race.winnerId=a.id;s.phase='matchEnd';s.winner=a.player?'blue':'red';s.actors.forEach(v=>v.moving=false);this.meleePending.clear();this.events.push({type:'round'});return;
+   s.race.winnerId=a.id;s.phase='matchEnd';s.winner=a.player?'blue':'red';s.actors.forEach(v=>v.moving=false);this.clearRoundTransients();this.events.push({type:'round'});return;
   }
   if(a.raceKills>=RACE_KILLS_PER_STAGE){
    a.raceStage=(a.raceStage??0)+1;a.raceKills=0;this.equipRaceStage(a);
@@ -150,7 +150,7 @@ export class Simulation {
   s.phase='playing';s.pickups=[];s.grenades=[];this.events.push({type:'round'});return true;
  }
  private finishDefense(won:boolean,reason:string){
-  const s=this.state;s.defense!.reason=reason;s.winner=won?'blue':'red';s.phase='matchEnd';s.actors.forEach(a=>a.moving=false);this.meleePending.clear();this.events.push({type:'round'});
+  const s=this.state;s.defense!.reason=reason;s.winner=won?'blue':'red';s.phase='matchEnd';s.actors.forEach(a=>a.moving=false);this.clearRoundTransients();this.events.push({type:'round'});
  }
  private updateDefense(dt:number){
   const s=this.state,d=s.defense;if(!d||s.phase!=='playing')return;
@@ -170,16 +170,27 @@ export class Simulation {
  }
  purchase(item:Parameters<typeof buyItem>[1],actor=this.state.player):boolean{return purchaseWindow(this.state,actor,item).allowed&&buyItem(actor,item,this.events);}
  selectMode(mode:PlayableMode){if(this.state.phase!=='menu')return false;this.preferredMode=mode;this.state.mode=modeForMap(mode);this.state.race=undefined;this.state.defense=undefined;this.refreshMap();return true;}
- menu(){this.queuedStab=null;this.state.phase='menu';this.state.paused=false;this.state.race=undefined;this.state.defense=undefined;this.refreshMap();this.events=[];}
+ menu(){this.clearRoundTransients();this.state.phase='menu';this.state.paused=false;this.state.race=undefined;this.state.defense=undefined;this.refreshMap();this.events=[];}
+ /**
+  * Round lifecycle boundary: every transient interaction must die with the
+  * round so nothing (held E state, partial plant/defuse progress, a pending
+  * knife contact, radio reports) can carry into the next round or back to the
+  * menu. The bomb outcome itself (defused/exploded) is retained for scoring.
+  */
+ private clearRoundTransients(){
+  this.queuedStab=null;this.interactionActors.clear();this.meleePending.clear();
+  this.pickupInteractHeld=false;this.teamReports.clear();
+  const b=this.state.bomb;
+  b.planterId=null;b.plantProgress=0;b.plantSite=null;b.defuserId=null;b.progress=0;
+ }
  setPaused(paused:boolean){if(paused)this.queuedStab=null;if(this.state.phase!=='menu'&&this.state.phase!=='matchEnd')this.state.paused=paused;}
  reload(a:Actor){if(!weaponReady(a))return false;if(a.weapon==='knife'||!allowsWeapon(this.state.mode,a.weapon))return false;const g=a.guns[a.weapon],w=WEAPONS[a.weapon];if(hasUnlimitedReserve(this.state.mode))g.reserve=w.reserve;if(!a.inventory.includes(a.weapon)||a.health<=0||g.reloadLeft>0||g.ammo===w.magazine||g.reserve<=0)return false;g.reloadLeft=w.reload*(this.state.mode==='defense'&&a.player?1-(this.state.defense?.upgrades.reload??0)*.1:1);this.events.push({type:'reload',actorId:a.id,weapon:a.weapon,shells:a.weapon==='shotgun'?Math.min(g.reserve,w.magazine-g.ammo):undefined});return true;}
- private finishRound(winner:Team|'draw',reason=''){const s=this.state;if(s.phase==='roundEnd'||s.phase==='matchEnd')return;s.roundReason=reason;s.winner=winner;if(winner==='blue')s.blueScore++;if(winner==='red')s.redScore++;s.actors.forEach(a=>{const won=(winner==='blue'&&a.team==='blue')||(winner==='red'&&a.team==='red');if(s.mode!=='bounty'){const amount=roundReward(a,won,Math.max(0,s.round-1));this.events.push({type:'roundReward',actorId:a.id,amount});}a.moving=false;});s.phase=s.blueScore>=3||s.redScore>=3?'matchEnd':'roundEnd';s.roundTime=4;this.events.push({type:'round'});}
+ private finishRound(winner:Team|'draw',reason=''){const s=this.state;if(s.phase==='roundEnd'||s.phase==='matchEnd')return;s.roundReason=reason;s.winner=winner;if(winner==='blue')s.blueScore++;if(winner==='red')s.redScore++;this.clearRoundTransients();s.actors.forEach(a=>{const won=(winner==='blue'&&a.team==='blue')||(winner==='red'&&a.team==='red');if(s.mode!=='bounty'){const amount=roundReward(a,won,Math.max(0,s.round-1));this.events.push({type:'roundReward',actorId:a.id,amount});}a.moving=false;});s.phase=s.blueScore>=3||s.redScore>=3?'matchEnd':'roundEnd';s.roundTime=4;this.events.push({type:'round'});}
  private checkBounty(){
   const s=this.state;if(s.phase!=='playing')return;
   const blue=s.actors.some(a=>a.team==='blue'&&a.health>0),red=s.actors.some(a=>a.team==='red'&&a.health>0);
   if(blue&&red)return;
   this.finishRound(blue?'blue':red?'red':'draw',blue?'红方已被全歼':red?'蓝方已被全歼':'双方同时全灭，本回合平局');
-  this.queuedStab=null;this.meleePending.clear();
  }
  private checkRound(){
   const s=this.state,blue=s.actors.filter(a=>a.team==='blue'&&a.health>0),red=s.actors.filter(a=>a.team==='red'&&a.health>0);
