@@ -64,3 +64,22 @@ And use `image_id = self.create_image()` use the image_id to update the image.
 
 </sub>
 
+### Tests & demos
+
+The repository ships self-contained tests that generate their own short videos
+with PyAV (no binary fixtures). They cover switching files while playing,
+rapid consecutive seeks, resizing while paused, replaying after `<<Ended>>`
+and widget destruction:
+
+```shell
+python tests/test_tkvideoplayer.py
+```
+
+To watch the event sequence (`<<Loaded>>`, `<<Duration>>`, `<<SecondChanged>>`,
+`<<Ended>>`) and the `video_info()` changes live while the player switches
+files, seeks and replays:
+
+```shell
+python examples/event_sequence_demo.py
+```
+
