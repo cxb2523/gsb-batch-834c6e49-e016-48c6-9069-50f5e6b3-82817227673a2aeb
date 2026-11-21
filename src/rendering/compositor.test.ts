@@ -78,4 +78,51 @@ describe('Partial repaint boundaries', () => {
     compositor.markDirtyRect('main', { x: -100, y: -100, width: 10, height: 10 })
     expect(compositor.isDirty('main')).toBe(false)
   })
+
+  it('unions aligned damage and stays idempotent across repeated marking at fractional DPR', () => {
+    vi.stubGlobal('OffscreenCanvas', TestOffscreenCanvas)
+    const canvas = document.createElement('canvas')
+    ;(canvas as any).getContext = vi.fn(() => screenContext())
+    const compositor = new Compositor(canvas)
+    compositor.resize(100, 100, 1.5)
+    const first = { x: 3.2, y: 3.2, width: 4, height: 4 }
+    const second = { x: 10.1, y: 9.8, width: 3, height: 3 }
+    compositor.markDirtyRect('main', first)
+    compositor.markDirtyRect('main', second)
+
+    const alignedFirst = compositor.getPaintRect(first)
+    const alignedSecond = compositor.getPaintRect(second)
+    const union = compositor.getPaintRect({
+      x: Math.min(alignedFirst.x, alignedSecond.x),
+      y: Math.min(alignedFirst.y, alignedSecond.y),
+      width: Math.max(alignedFirst.x + alignedFirst.width, alignedSecond.x + alignedSecond.width)
+        - Math.min(alignedFirst.x, alignedSecond.x),
+      height: Math.max(alignedFirst.y + alignedFirst.height, alignedSecond.y + alignedSecond.height)
+        - Math.min(alignedFirst.y, alignedSecond.y),
+    })
+    // The stored damage is aligned, so re-marking the same rect changes nothing.
+    compositor.markDirtyRect('main', union)
+    expect(compositor.getPaintRect(union)).toEqual(union)
+  })
+
+  it('takes registration order into effect immediately and forgets damage on removal', () => {
+    vi.stubGlobal('OffscreenCanvas', TestOffscreenCanvas)
+    const canvas = document.createElement('canvas')
+    ;(canvas as any).getContext = vi.fn(() => screenContext())
+    const compositor = new Compositor(canvas)
+    compositor.registerLayer('inserted', 2)
+    expect(compositor.getLayerOrder()).toEqual(['background', 'main', 'inserted', 'transient', 'overlay', 'tooltip'])
+    compositor.markDirtyRect('inserted', { x: 1, y: 1, width: 2, height: 2 })
+    expect(compositor.isDirty('inserted')).toBe(true)
+    compositor.unregisterLayer('inserted')
+    expect(compositor.getLayerOrder()).toEqual(['background', 'main', 'transient', 'overlay', 'tooltip'])
+    expect(compositor.isDirty('inserted')).toBe(false)
+    // Damage raised after removal cannot resurrect a dangling dirty entry.
+    compositor.markDirty('inserted')
+    compositor.markDirtyRect('inserted', { x: 1, y: 1, width: 2, height: 2 })
+    expect(compositor.isDirty('inserted')).toBe(false)
+    // A later composite has no knowledge of the removed layer or its damage.
+    compositor.composite()
+    expect(compositor.isDirty('inserted')).toBe(false)
+  })
 })

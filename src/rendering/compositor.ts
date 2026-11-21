@@ -93,11 +93,15 @@ export class Compositor {
 
   // 标记整层脏
   markDirty(layer: LayerName): void {
+    // Damage for an unregistered layer can never be composited or consumed;
+    // ignoring it keeps dirtyRects keyed exclusively to live layers.
+    if (!this.layers.has(layer)) return
     this.dirtyRects.set(layer, null)
   }
 
   // 标记局部脏矩形
   markDirtyRect(layer: LayerName, rect: DirtyRect): void {
+    if (!this.layers.has(layer)) return
     rect = this.getPaintRect(rect)
     if (rect.width <= 0 || rect.height <= 0) return
     const existing = this.dirtyRects.get(layer)

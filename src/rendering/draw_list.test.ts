@@ -112,6 +112,38 @@ describe('DrawList state and cache protection', () => {
     expect(ctx.lineWidth).toBe(4)
   })
 
+  it('resyncs textAlign, textBaseline and lineWidth after external canvas changes', () => {
+    const { ctx } = createContext()
+    const a = new DrawList(new PaintContext(ctx))
+    const b = new DrawList(new PaintContext(ctx))
+    const red = rgba(255, 0, 0)
+    const blue = rgba(0, 0, 255)
+
+    // Establish a's cached text and stroke state.
+    a.fillText('A', 0, 0, red, 12, 'Arial', 'left', 'middle')
+    a.line(0, 0, 10, 0, red, 2)
+    expect(ctx.textAlign).toBe('left')
+    expect(ctx.textBaseline).toBe('middle')
+    expect(ctx.lineWidth).toBe(2)
+
+    // Another DrawList (or a raw painter) changes every shared state property.
+    b.fillText('B', 0, 0, blue, 14, 'Georgia', 'right', 'top')
+    b.line(0, 2, 10, 2, blue, 5)
+    expect(ctx.font).toBe('14px Georgia')
+    expect(ctx.textAlign).toBe('right')
+    expect(ctx.textBaseline).toBe('top')
+    expect(ctx.lineWidth).toBe(5)
+
+    // a must detect the tampering and restore its own font, alignment and width.
+    a.fillText('C', 0, 0, red, 12, 'Arial', 'left', 'middle')
+    expect(ctx.font).toBe('12px Arial')
+    expect(ctx.textAlign).toBe('left')
+    expect(ctx.textBaseline).toBe('middle')
+    a.line(0, 4, 10, 4, red, 2)
+    expect(ctx.strokeStyle).toBe('rgba(255,0,0,1)')
+    expect(ctx.lineWidth).toBe(2)
+  })
+
   it('caches simple drawing state and avoids save/restore for hot primitives', () => {
     const { ctx, fillStyleSets, fontSets } = createContext(1)
     const dl = new DrawList(new PaintContext(ctx))
