@@ -61,8 +61,10 @@ export class Gapless5 {
     loop: any;
     singleMode: any;
     exclusive: any;
-    queuedTrack: string | number;
-    fadingTrack: number;
+    /** @type {string | number | null} */
+    queuedTrack: string | number | null;
+    /** @type {number | null} */
+    fadingTrack: number | null;
     volume: any;
     crossfade: any;
     crossfadeShape: any;
@@ -273,6 +275,24 @@ export class Gapless5 {
     stop: () => void;
     isPlaying: () => boolean;
     canShuffle: () => boolean;
+    /**
+     * @returns {Gapless5Source|null} - the source currently fading out, if any
+     */
+    getFadingSource: () => Gapless5Source | null;
+    /**
+     * Cancels any in-flight crossfade and clears fadingTrack without touching
+     * playback. Used when navigation/pause/stop supersedes a fade.
+     */
+    clearFadingTrack: () => void;
+    /**
+     * Mark a source as fading out after a crossfade switch. Takes ownership of
+     * stopping it once the crossfade has elapsed; any previously scheduled fade
+     * is cancelled first so only one fade can ever be pending.
+     *
+     * @param {number} playlistIndex - play-order index of the fading track
+     * @param {Gapless5Source} source - the actual source being faded out
+     */
+    beginFadingTrack: (playlistIndex: number, source: Gapless5Source) => void;
     startingTrack: string | number;
 }
 export namespace LogLevel {
@@ -319,6 +339,7 @@ declare class Gapless5FileList {
         source: Gapless5Source;
     };
     getPlaylistIndex: (index: any) => any;
+    playlistIndexOf: (source: any) => any;
     loadableTracks: () => Set<any>;
     updateLoading: () => void;
     add: (index: any, audioPath: any) => void;
