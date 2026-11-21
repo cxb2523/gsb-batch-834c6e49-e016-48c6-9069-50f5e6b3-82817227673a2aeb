@@ -25,8 +25,9 @@ const WALK = {
 }
 const swayAt = (c: number[], phase: number) => c[0] + c[1] * Math.cos(phase) + c[2] * Math.sin(phase) + c[3] * Math.cos(2 * phase) + c[4] * Math.sin(2 * phase)
 const SWING_SECONDS = 0.42
-// the share of a swing at which the blade lands
+// the hit window of a swing, as shares of it: from STRIKE_AT to STRIKE_END the blade is across and can land
 const STRIKE_AT = 0.3
+const STRIKE_END = 0.7
 // how far the hands hang back when the player rises or falls: sprite pixels for a metre a second, and the most
 const HANG = { rate: 1.3, most: 9 }
 const SPARK_COUNT = 14
@@ -248,6 +249,8 @@ export function buildViewModel({ hearts: heartCount }: { hearts: number }) {
   let inset = 0
   let swordDrop = 0
   let swing = -1
+  // serial of the swing under way: a creature one swing has struck is not struck by it again
+  let swung = 0
 
   return {
     scene,
@@ -276,11 +279,13 @@ export function buildViewModel({ hearts: heartCount }: { hearts: number }) {
     swing() {
       if (swing >= 0) return false
       swing = 0
+      swung++
       return true
     },
     /**
      * bob: walk cycle phase, stride: 0..1 walk speed, turn: yaw speed in rad/s, rise: metres a second upward,
-     * health: hearts left. Returns struck: true in the frame the blade of a swing lands.
+     * health: hearts left. Returns struck: true in the frame the hit window opens, striking: true while the
+     * swing is in its hit window, swingId: the serial of the swing under way.
      */
     update({ dt, time, bob, stride, turn, rise, health }: { dt: number; time: number; bob: number; stride: number; turn: number; rise: number; health: number }) {
       sparks.update(dt, time)
@@ -301,7 +306,9 @@ export function buildViewModel({ hearts: heartCount }: { hearts: number }) {
 
       const before = swing
       if (swing >= 0) swing += dt / SWING_SECONDS
+      // the window is crossed, not touched at an instant: a frame that steps over any part of it is striking
       const struck = before >= 0 && before < STRIKE_AT && swing >= STRIKE_AT
+      const striking = before >= 0 && before <= STRIKE_END && swing >= STRIKE_AT
       if (swing > 1) swing = -1
       const slash = swing < 0 ? 0 : Math.sin(Math.PI * swing)
       const restX = width / scale - inset - (SWORD.size[0] - SWORD.margin[0]) + SWORD.pivot[0]
@@ -312,7 +319,7 @@ export function buildViewModel({ hearts: heartCount }: { hearts: number }) {
         0,
       )
       sword.rotation.z = slash * 1.2
-      return { struck }
+      return { struck, striking, swingId: swung }
     },
   }
 }

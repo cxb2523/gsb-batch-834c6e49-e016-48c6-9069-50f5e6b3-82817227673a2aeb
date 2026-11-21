@@ -227,6 +227,8 @@ const player = {
 
 // the share of the screen's pixels that are drawn: falls when frames are slow, see keepPace
 let sharpness = 1
+// how dark the picture is, 0..1: it goes dark when the player is struck down and clears when the player rises
+let dark = 0
 
 function resize() {
   const short = Math.min(innerWidth, innerHeight)
@@ -374,9 +376,10 @@ function hurt(damage: number) {
   player.vx = player.vz = 0
 }
 
-/** the player starts again at the forest, whole, and so do the creatures */
+/** the player starts again at the forest, whole, the red of the blow and the dark of the fall gone, and so do the creatures */
 function rise() {
-  Object.assign(player, world.start, { vx: 0, vz: 0, stride: 0, grounded: true, vy: 0, dip: 0, health: MAX_HEALTH, calm: 0, down: -1 })
+  Object.assign(player, world.start, { vx: 0, vz: 0, stride: 0, grounded: true, vy: 0, dip: 0, health: MAX_HEALTH, calm: 0, down: -1, blow: 0 })
+  dark = 0
   mobs.reset()
 }
 
@@ -466,9 +469,6 @@ function render(time: number) {
   if (player.down < 0) renderer.render(hands.scene, hands.camera)
 }
 
-// how dark the picture is, 0..1: it goes dark when the player is struck down and clears when the player rises
-let dark = 0
-
 const handsUpdate = (dt: number, time: number) =>
   hands.update({ dt, time, bob: player.bob, stride: player.stride, turn: turnSpeed, rise: player.grounded ? 0 : player.vy, health: player.health })
 
@@ -477,9 +477,10 @@ function advance(dt: number, time: number) {
   audio.update({ x: player.x, z: player.z, yaw: player.yaw, gust: gustAt({ x: player.x, z: player.z, time }) })
   const { damage, events } = mobs.update({ dt, time, prey: prey() })
   if (damage > 0 && player.down < 0 && player.calm > GRACE_SECONDS) hurt(damage)
-  const { struck } = handsUpdate(dt, time)
-  if (struck && player.down < 0) {
-    const cries = mobs.strike({ x: player.x, z: player.z, yaw: player.yaw, ...SWORD })
+  const { striking, swingId } = handsUpdate(dt, time)
+  // while the blade is across, what is in the arc is struck: one swing settles on a creature once
+  if (striking && player.down < 0) {
+    const cries = mobs.strike({ x: player.x, z: player.z, yaw: player.yaw, swing: swingId, ...SWORD })
     if (cries.some((cry) => cry.type === 'hurt' || cry.type === 'death')) audio.play({ sound: 'hit' })
     events.push(...cries)
   }

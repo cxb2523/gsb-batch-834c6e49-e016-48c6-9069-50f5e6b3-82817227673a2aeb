@@ -40,7 +40,8 @@ One frame (`advance` in `main.ts`):
 
 ```
 step(dt) ──▶ mobs.update() ──▶ hearts their blows take ──▶ hurt()      (not within GRACE_SECONDS of the last blow)
-         ──▶ hands.update() ─▶ struck: the blade lands ──▶ mobs.strike() ──▶ flash, knock back, flecks, death
+         ──▶ hands.update() ─▶ striking: the hit window ──▶ mobs.strike() ──▶ flash, knock back, flecks, death
+                              (one swing settles on a creature once, by the swing's serial)
          ──▶ MobEvent[] from both ──▶ audio.play()        (MOB_SOUNDS maps what a creature did to a sound)
          ──▶ render()
 ```

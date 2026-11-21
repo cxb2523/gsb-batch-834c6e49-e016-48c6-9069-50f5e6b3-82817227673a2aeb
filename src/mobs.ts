@@ -309,6 +309,8 @@ interface Mob {
   walk: number
   pace: number
   flash: number
+  /** serial of the swing that last struck it: one swing settles on a creature once */
+  struckBy: number
   root: THREE.Group
   body: THREE.Group
   armLeft: THREE.Group
@@ -493,6 +495,7 @@ export function buildMobs({ scene, colliders, walkable }: { scene: THREE.Scene; 
         walk: rand() * Math.PI * 2,
         pace: 0,
         flash: 0,
+        struckBy: -1,
         root: new THREE.Group(),
         body: limb(model.body),
         armLeft: limb(model.armLeft),
@@ -612,19 +615,21 @@ export function buildMobs({ scene, colliders, walkable }: { scene: THREE.Scene; 
       return { damage, events }
     },
     /**
-     * The sword comes down: every creature within reach and inside the arc before the eye is struck.
-     * Returns what is heard: a cry for each one struck, and the snarls of those it calls.
+     * The sword's hit window is open: every creature within reach and inside the arc before the eye is
+     * struck, but a creature this swing has struck already is passed over. Returns what is heard: a cry
+     * for each one struck, and the snarls of those it calls.
      */
-    strike({ x, z, yaw, reach, arc, damage }: { x: number; z: number; yaw: number; reach: number; arc: number; damage: number }) {
+    strike({ x, z, yaw, reach, arc, damage, swing }: { x: number; z: number; yaw: number; reach: number; arc: number; damage: number; swing: number }) {
       const events: MobEvent[] = []
       for (const mob of mobs) {
-        if (mob.stance === 'dead') continue
+        if (mob.stance === 'dead' || mob.struckBy === swing) continue
         const dx = mob.x - x
         const dz = mob.z - z
         const d = Math.hypot(dx, dz) || 1
         if (d > reach + mob.kind.radius) continue
         // the player looks along (-sin yaw, -cos yaw)
         if (Math.abs(turnBetween(yaw, Math.atan2(-dx, -dz))) > arc) continue
+        mob.struckBy = swing
         mob.health -= damage
         mob.flash = 1
         mob.pushX = ((dx / d) * KNOCK_SPEED) / mob.kind.scale
