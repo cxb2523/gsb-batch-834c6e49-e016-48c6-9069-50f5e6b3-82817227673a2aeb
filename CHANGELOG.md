@@ -2,6 +2,14 @@
 
 All notable changes to bind-manager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/) (in 0.x, a minor version may change behaviour).
 
+## [Unreleased]
+
+### Fixed
+
+- **Controller Test mapping edits are isolated per controller.** An in-memory mapping edit is now keyed by the pad index and the controller identity, not by the model alone. Two controllers of the same model in different slots keep their own edits, and a pad reconnecting into the same slot gets that slot's edit back.
+- **Capture teardown calls its callback once.** `cancelCapture()`, a second `startCapture()`, `stop()` and a disconnect each end capture with a single `null` to the pending callback, even when the callback re-enters the runtime. An input still held when a capture ends (or a disconnect arrives) is latched like after gameplay suppression, so the frame after capture fires no `held` without its `pressed` until the input is released and pressed anew.
+- **Suppression clears every known pad.** `setGameplaySuppressed(true)` releases every pressed code and sends the final analog 0 for every live analog value of every pad the runtime holds state for, including a pad known only through pressed/analog state.
+
 ## [0.2.0] - 2026-11-19
 
 The first release after 0.1.0. The UI and the built-in tools were rebuilt, the gamepad support grew from three families to eight, and many input bugs were fixed. The public API only gained exports: none were removed. Several behaviours a host can notice did change, though, so read the upgrade notes first. The full list is in the README, section [Upgrading from 0.1.0](README.md#upgrading-from-010).

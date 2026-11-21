@@ -8,7 +8,12 @@
  *   analogThreshold (default 0.50) — minimum value to trigger a digital pressed/held/released
  *
  * Capture mode: startCapture(callback) → next meaningful input → callback(code) + haptic.
- * Cancel with cancelCapture() or pressing nothing (escaped from modal via Escape key).
+ * cancelCapture(), a new startCapture(), stop() and a disconnect each end it
+ * with exactly one null; held inputs are latched so they stay silent until
+ * released and pressed anew.
+ *
+ * In-memory mapping edits belong to a pad slot and controller model together,
+ * so two pads of the same model keep their own edits.
  *
  * Custom DOM events dispatched to window for UI re-renders:
  *   'bm-gamepad-connected'    { detail: Gamepad }
@@ -167,6 +172,19 @@ function deepClone(value) {
 }
 
 /**
+ * Key of an in-memory mapping edit: a pad slot plus the controller model
+ * identity. Two pads of the same model in different slots keep their own
+ * edits, and a slot gets its edit back when the same model reconnects there.
+ * @param {{ index?: number, id?: string } | null | undefined} gamepad
+ * @returns {string | null}
+ */
+function gamepadEditKey(gamepad) {
+  const identityKey = getGamepadIdentityKey(gamepad?.id ?? null);
+  if (!identityKey || !Number.isInteger(gamepad?.index)) return null;
+  return `${gamepad.index}\u0000${identityKey}`;
+}
+
+/**
  * Mapping that reproduces the standard layout of a pad: every logical button
  * and axis direction the pad has, mapped to its own raw button or axis.
  * @param {{ buttons?: ArrayLike<unknown>, axes?: ArrayLike<unknown> } | null} gamepad
@@ -228,7 +246,7 @@ export class GamepadRuntime {
     this._resolvedProfileByGamepadIndex = new Map();
     /** @type {Map<string, { type: 'profile', key: string } | { type: 'family', family: string }>} */
     this._profileOverrides = loadProfileOverrides(options.profileOverrides);
-    /** @type {Map<string, any>} */
+    /** @type {Map<string, any>} edit key (pad index + identity key) → edited definition */
     this._profileDefinitionOverrides = new Map();
     /** @type {WeakMap<object, CompiledControllerMapping>} compiled mapping per definition object */
     this._compiledProfileCache = new WeakMap();
@@ -265,11 +283,7 @@ export class GamepadRuntime {
       cancelAnimationFrame(this._rafId);
       this._rafId = null;
     }
-    if (this._captureCallback) {
-      const cb = this._captureCallback;
-      this._captureCallback = null;
-      cb(null);
-    }
+    this._finishCapture(null);
   }
 
   /**
@@ -286,10 +300,30 @@ export class GamepadRuntime {
     suppressed = !!suppressed;
     if (suppressed === this._gameplaySuppressed) return;
     this._gameplaySuppressed = suppressed;
-    for (const gamepadIndex of [...this._curState.keys()]) {
+    for (const gamepadIndex of this._knownGamepadIndices()) {
+      // Latch first: releasing clears the pressed/analog records the latch is
+      // built from. On the way in, a pad with no polled frame entry (only
+      // pressed or analog state) is latched from that state; on the way out
+      // everything was released, so the polled frame decides.
+      this._latchActiveInputs(gamepadIndex, { useFallback: suppressed });
       if (suppressed) this._releaseActiveInputs(gamepadIndex);
-      this._latchActiveInputs(gamepadIndex);
     }
+  }
+
+  /**
+   * Every pad index the runtime holds input state for: polled frames, pressed
+   * codes, live analog values or latches.
+   * @returns {number[]}
+   * @private
+   */
+  _knownGamepadIndices() {
+    const indices = new Set([
+      ...this._curState.keys(),
+      ...this._pressedCodes.keys(),
+      ...this._analogActive.keys(),
+      ...this._latched.keys(),
+    ]);
+    return [...indices];
   }
 
   /**
@@ -299,23 +333,52 @@ export class GamepadRuntime {
    * @param {(code: string | null) => void} callback
    */
   startCapture(callback) {
-    if (this._captureCallback) {
-      const old = this._captureCallback;
-      this._captureCallback = null;
-      old(null);
-    }
+    // Install the new capture before telling the old callback it was replaced:
+    // a callback that re-enters startCapture() then replaces the newer one
+    // instead of leaving it dangling.
+    const previous = this._detachCapture();
     this._captureCallback = callback;
+    previous?.(null);
   }
 
   /**
    * Cancel an in-progress capture, calling the pending callback with null.
    */
   cancelCapture() {
-    if (this._captureCallback) {
-      const cb = this._captureCallback;
-      this._captureCallback = null;
-      cb(null);
+    this._detachCapture()?.(null);
+  }
+
+  /**
+   * Clear capture mode without invoking the callback, and latch every input
+   * held right now so the frame after capture ends cannot fire a 'held'
+   * without its 'pressed' (the input stays silent until released and pressed
+   * anew). Returns the callback that was pending, if any.
+   * @returns {((code: string | null) => void) | null}
+   * @private
+   */
+  _detachCapture() {
+    const callback = this._captureCallback;
+    if (!callback) return null;
+    this._captureCallback = null;
+    for (const gamepadIndex of this._knownGamepadIndices()) {
+      this._latchActiveInputs(gamepadIndex, { onlyUnpressed: true });
     }
+    return callback;
+  }
+
+  /**
+   * End capture mode with a result, calling the pending callback exactly once.
+   * @param {string | null} result - the captured code, or null when cancelled
+   * @param {Gamepad | null} [hapticGamepad=null] - pad to pulse on a capture
+   * @returns {boolean} true when a capture was pending
+   * @private
+   */
+  _finishCapture(result, hapticGamepad = null) {
+    const callback = this._detachCapture();
+    if (!callback) return false;
+    if (hapticGamepad) this._triggerHaptic(hapticGamepad);
+    callback(result);
+    return true;
   }
 
   /**
@@ -527,8 +590,8 @@ export class GamepadRuntime {
   setProfileMappingEntry(gamepadIndex = 0, code, entry, options = {}) {
     if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') return false;
     const gp = [...navigator.getGamepads()].find(g => g && g.index === gamepadIndex);
-    const identityKey = getGamepadIdentityKey(gp?.id ?? null);
-    if (!gp || !identityKey || typeof code !== 'string' || !code.trim()) return false;
+    const editKey = gamepadEditKey(gp);
+    if (!gp || !editKey || typeof code !== 'string' || !code.trim()) return false;
 
     const resolved = this._getResolvedProfileForGamepad(gp);
     const editable = this._createEditableDefinition(gp, resolved);
@@ -566,11 +629,12 @@ export class GamepadRuntime {
 
     editable.capturedAt = new Date().toISOString();
     // A mapping back to its base is no edit: drop it, the source returns to
-    // exact / family / generic.
+    // exact / family / generic. Only this pad slot's edit is dropped; another
+    // pad of the same model keeps its own.
     if (this._sameMapping(editable.mapping, baseMapping)) {
-      for (const key of getGamepadIdentityKeys(gp.id)) this._profileDefinitionOverrides.delete(key);
+      this._profileDefinitionOverrides.delete(editKey);
     } else {
-      this._profileDefinitionOverrides.set(identityKey, editable);
+      this._profileDefinitionOverrides.set(editKey, editable);
     }
     this._resolvedProfileByGamepadIndex.delete(gp.index);
     this._emitProfileChange(gp);
@@ -597,9 +661,9 @@ export class GamepadRuntime {
   resetProfileMapping(gamepadIndex = 0) {
     if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') return false;
     const gp = [...navigator.getGamepads()].find(g => g && g.index === gamepadIndex);
-    if (!gp) return false;
-    let deleted = false;
-    for (const key of getGamepadIdentityKeys(gp.id)) deleted = this._profileDefinitionOverrides.delete(key) || deleted;
+    const editKey = gamepadEditKey(gp);
+    if (!gp || !editKey) return false;
+    const deleted = this._profileDefinitionOverrides.delete(editKey);
     if (!deleted) return false;
     this._resolvedProfileByGamepadIndex.delete(gp.index);
     this._emitProfileChange(gp);
@@ -659,11 +723,8 @@ export class GamepadRuntime {
     this._pressedCodes.delete(e.gamepad.index);
     this._analogActive.delete(e.gamepad.index);
     this._resolvedProfileByGamepadIndex.delete(e.gamepad.index);
-    if (this._captureCallback) {
-      const cb = this._captureCallback;
-      this._captureCallback = null;
-      cb(null);
-    }
+    // The pad the capture was waiting on is gone: end it with null (once).
+    this._finishCapture(null);
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('bm-gamepad-disconnected', { detail: e.gamepad }));
     }
@@ -697,14 +758,13 @@ export class GamepadRuntime {
       if (!hasPrev) return;
       const detected = this._detectCapture(gamepad, prev, cur);
       if (detected != null) {
-        const cb = this._captureCallback;
-        this._captureCallback = null;
-        this._triggerHaptic(gamepad);
-        // The captured input is still held: keep it silent (no gameplay events,
-        // no re-capture) until it is released.
+        // The captured input is still held. Latch it explicitly (it may have
+        // reached the game before the capture began, so _detachCapture's
+        // only-unpressed rule could skip it) before the callback can re-enter
+        // the runtime: no gameplay event or re-capture until it is released.
         if (!this._latched.has(gamepad.index)) this._latched.set(gamepad.index, new Set());
         this._latched.get(gamepad.index).add(detected);
-        cb(detected);
+        this._finishCapture(detected, gamepad);
       }
       return; // Never fire action events during capture
     }
@@ -833,18 +893,43 @@ export class GamepadRuntime {
   }
 
   /**
-   * Latch every input active on this gamepad, so it fires nothing until it
-   * has been released.
+   * Latch active inputs of this gamepad, so they fire nothing until released.
+   * The active set comes from the last polled frame; with `useFallback` and no
+   * frame entry (only pressed or live analog state known) it is taken from that
+   * state.
+   * With `onlyUnpressed`, inputs whose `pressed` already reached the game (an
+   * action still held when a capture starts) are left alone: their `released`
+   * must still arrive, or the action would stick.
+   * @param {number} gamepadIndex
+   * @param {{ onlyUnpressed?: boolean, useFallback?: boolean }} [options]
    * @private
    */
-  _latchActiveInputs(gamepadIndex) {
+  _latchActiveInputs(gamepadIndex, { onlyUnpressed = false, useFallback = false } = {}) {
     const state = this._curState.get(gamepadIndex);
-    if (!state) return;
-    const codes = this._activeCodes(state);
-    if (codes.length === 0) return;
+    const codes = state
+      ? this._activeCodes(state)
+      : (useFallback ? this._activeCodesFallback(gamepadIndex) : []);
+    const pressed = onlyUnpressed ? this._pressedCodes.get(gamepadIndex) : null;
+    const latch = codes.filter((code) => !pressed?.has(code));
+    if (latch.length === 0) return;
     if (!this._latched.has(gamepadIndex)) this._latched.set(gamepadIndex, new Set());
     const latched = this._latched.get(gamepadIndex);
-    for (const code of codes) latched.add(code);
+    for (const code of latch) latched.add(code);
+  }
+
+  /**
+   * Active codes from pressed/analog state alone, for a pad without a polled
+   * frame entry.
+   * @param {number} gamepadIndex
+   * @returns {string[]}
+   * @private
+   */
+  _activeCodesFallback(gamepadIndex) {
+    const codes = new Set(this._pressedCodes.get(gamepadIndex) ?? []);
+    for (const [axisIndex, value] of this._analogActive.get(gamepadIndex) ?? []) {
+      codes.add(`GP_A${axisIndex}${value < 0 ? 'N' : 'P'}`);
+    }
+    return [...codes];
   }
 
   /**
@@ -959,8 +1044,10 @@ export class GamepadRuntime {
     const resolved = resolveGamepadProfile(gamepad, {
       override: this._getOverrideForGamepadId(gamepad.id),
     });
-    const identityKey = getGamepadIdentityKey(gamepad.id);
-    const editedDefinition = identityKey ? this._profileDefinitionOverrides.get(identityKey) : null;
+    // Edits are per pad slot + model: a second pad of the same model in another
+    // slot resolves without this slot's edits, and a reconnected pad at the
+    // same slot keeps them.
+    const editedDefinition = this._profileDefinitionOverrides.get(gamepadEditKey(gamepad));
     if (!editedDefinition) return resolved;
     return {
       ...resolved,
@@ -999,15 +1086,15 @@ export class GamepadRuntime {
   }
 
   _createEditableDefinition(gamepad, resolvedProfile) {
-    const identityKey = getGamepadIdentityKey(gamepad?.id ?? null);
-    const existing = identityKey ? this._profileDefinitionOverrides.get(identityKey) : null;
+    const editKey = gamepadEditKey(gamepad);
+    const existing = editKey ? this._profileDefinitionOverrides.get(editKey) : null;
     if (existing) return deepClone(existing);
 
     const base = deepClone(resolvedProfile?.definition) || {};
     const { vendorId, productId, name } = parseGamepadId(gamepad?.id ?? null);
 
     return {
-      key: base.key ?? (vendorId && productId ? `${vendorId}-${productId}` : identityKey ?? 'custom-profile'),
+      key: base.key ?? (vendorId && productId ? `${vendorId}-${productId}` : getGamepadIdentityKey(gamepad?.id ?? null) ?? 'custom-profile'),
       vendorId: base.vendorId ?? vendorId,
       productId: base.productId ?? productId,
       // The device name without the browser's mapping tag; sourceId keeps the raw id.

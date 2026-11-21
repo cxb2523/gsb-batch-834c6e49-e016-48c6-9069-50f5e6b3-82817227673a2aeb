@@ -200,7 +200,7 @@ The current resolution order is:
 4. Detected family such as `xbox` or `dualshock4`.
 5. Generic fallback.
 
-In-memory mapping edits replace the result (`source: 'memory-edit'`). The result also carries `displayName`, `vendorId`, `productId` and `labelVariant`.
+In-memory mapping edits replace the result (`source: 'memory-edit'`). An edit belongs to one pad slot and controller model (`pad index + identity key`), so two pads of the same model in different slots resolve independently and a pad reconnecting into a slot gets that slot's edit back. The result also carries `displayName`, `vendorId`, `productId` and `labelVariant`.
 
 This file is the bridge between raw browser `Gamepad.id` strings, generated controller profiles, family label maps, and the UI labels users see.
 
@@ -234,6 +234,8 @@ Important runtime rules:
 - Analog events are emitted independently of digital threshold crossings for actions that opt in. An action bound to one half of an axis (`GP_A0N` or `GP_A0P`) gets only that half (the signed value clamped to `[-1, 0]` or `[0, 1]`, with `code` naming the half), an action bound to both halves the full value; each action gets exactly one analog 0 when its value returns to 0 (the axis back in the deadband, or the stick on the other half).
 - `held` fires on every polled frame while a code stays pressed.
 - Suppressing gameplay (`setGameplaySuppressed(true)`, the modal opening) and a disconnect fire `released` for every code that fired `pressed` and a final analog 0 to every analog action whose value (its half of the axis, or the whole axis) was non-zero. Inputs still active when gameplay resumes, and a code just captured, are latched: they fire nothing until released and pressed anew.
+- Capture ends with exactly one callback: the next meaningful input, `cancelCapture()`, a new `startCapture()` (the old callback gets `null`) or a disconnect. Inputs still held at that moment are latched like after gameplay suppression, so no `held` arrives without its `pressed`.
+- In-memory mapping edits are keyed by pad index and controller identity: two pads of the same model keep separate edits, and a reconnect into the same index restores that index's edit. Edits are never persisted.
 - `playerIndex` filtering is respected before dispatching to an action.
 - Capture mode consumes the next meaningful input and prevents normal action dispatch.
 - Custom DOM events are emitted so the UI can react to controller connect, disconnect, and profile changes.

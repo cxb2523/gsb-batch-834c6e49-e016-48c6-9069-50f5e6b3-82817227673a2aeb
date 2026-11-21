@@ -393,7 +393,7 @@ Important behaviors:
 - supports capture mode with haptic feedback
 - dispatches custom window events when controllers connect, disconnect, or change profile
 - applies exact controller mapping definitions when available
-- allows temporary in-memory edits to the active profile definition (per controller model, kept across reconnects, never persisted; remove restores the base entry, reset drops all edits)
+- allows temporary in-memory edits to the active profile definition (per pad slot + controller model, kept across reconnects, never persisted; remove restores the base entry, reset drops all edits)
 - exposes the dispatch thresholds and the logical state of a pad (`getThresholds()`, `getLogicalState()`) for the Controller Test
 
 #### `/src/input/controller_definitions`
@@ -581,7 +581,7 @@ A pad with no family match resolves to the `generic` family (`Btn 0`, …).
 
 ### Built-in profile edits are in memory
 
-`GamepadRuntime` can edit mapping entries in the active profile definition in memory. That affects label resolution and logical mapping during the current session, but it is separate from the normal binding persistence model. Edits apply to every pad of the same model, survive a reconnect, start from the pad's standard layout when it has no exact profile, and are gone on reload. `removeGamepadProfileMappingEntry()` restores a code's base entry; `resetGamepadProfileMapping()` drops all edits.
+`GamepadRuntime` can edit mapping entries in the active profile definition in memory. That affects label resolution and logical mapping during the current session, but it is separate from the normal binding persistence model. Edits are isolated per pad slot and controller model, survive a reconnect into the same slot, start from the pad's standard layout when it has no exact profile, and are gone on reload. `removeGamepadProfileMappingEntry()` restores a code's base entry; `resetGamepadProfileMapping()` drops all edits.
 
 ## Recommended reading order
 
