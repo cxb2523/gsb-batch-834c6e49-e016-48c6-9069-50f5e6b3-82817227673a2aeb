@@ -29,6 +29,7 @@ window.player = {
   _audioWatchdogTimer: null,
   _deviceChangeTimers: [],
   _recoveryTimestamps: [],
+  _sessionEpId: null,
 
   initDeviceWatchers: function () {
     if (player._watchersBound) return;
@@ -136,7 +137,21 @@ window.player = {
       return player._rebindPromise;
     }
 
+    // Every delayed step is guarded against a playback-session switch: once
+    // player.play() runs for a new episode, the old element must not be
+    // touched anymore (no setSinkId, no micro-seek).
+    var seq = player._playSeq;
+    var isCurrentSession = function () {
+      return (
+        seq === player._playSeq &&
+        typeof document !== "undefined" &&
+        !!document.getElementById("video-screen") &&
+        targetVideo.isConnected !== false
+      );
+    };
+
     var doMicroSeek = function () {
+      if (!isCurrentSession()) return;
       if (microSeek !== false && targetVideo.readyState >= 1) {
         try {
           var curT = targetVideo.currentTime;
@@ -153,12 +168,18 @@ window.player = {
       return Promise.resolve();
     }
 
+    var setSink = function (sinkId) {
+      if (!isCurrentSession()) return Promise.resolve();
+      return targetVideo.setSinkId(sinkId).catch(function () {});
+    };
+
     // In Chromium Blink, calling setSinkId("") when sinkId is already "" is a no-op.
     // Cycling through a concrete sinkId (e.g. "default") and back to "" forces
     // AudioRendererMixerManager to tear down any dead PulseAudio/PipeWire stream
     // and bind a fresh stream to PipeWire's current default output sink.
-    player._rebindPromise = Promise.resolve()
+    var rebindPromise = (player._rebindPromise = Promise.resolve()
       .then(function () {
+        if (!isCurrentSession()) return [];
         if (
           typeof navigator !== "undefined" &&
           navigator.mediaDevices &&
@@ -171,6 +192,7 @@ window.player = {
         return [];
       })
       .then(function (devices) {
+        if (!isCurrentSession()) return;
         var curSink = targetVideo.sinkId || "";
         var alt = null;
         if (Array.isArray(devices)) {
@@ -193,25 +215,29 @@ window.player = {
         var chain = Promise.resolve();
         if (alt) {
           chain = chain.then(function () {
-            return targetVideo.setSinkId(alt).catch(function () {});
+            return setSink(alt);
           });
         }
         return chain.then(function () {
-          return targetVideo.setSinkId("").catch(function () {});
+          return setSink("");
         });
       })
       .then(function () {
         player._audioDeviceChanged = false;
-        player._rebindPromise = null;
+        if (player._rebindPromise === rebindPromise) {
+          player._rebindPromise = null;
+        }
         doMicroSeek();
       })
       .catch(function () {
         player._audioDeviceChanged = false;
-        player._rebindPromise = null;
+        if (player._rebindPromise === rebindPromise) {
+          player._rebindPromise = null;
+        }
         doMicroSeek();
-      });
+      }));
 
-    return player._rebindPromise;
+    return rebindPromise;
   },
 
   _triggerStreamRecovery: function (reason, keepPaused) {
@@ -407,6 +433,23 @@ window.player = {
   },
 
   deleteSession: function (callback) {
+    callback = callback || {};
+    // Whatever happens (refresh error, network error, HTTP 4xx/5xx), the local
+    // DRM state must be released: drmLock may never stay stuck on a dead
+    // session, and callers must always get a terminal callback so the next
+    // episode is never blocked by a failed DELETE.
+    var finish = function (err) {
+      player.drmLock = false;
+      if (err) {
+        console.warn(
+          "DRM session delete failed; local session refs released anyway:",
+          err
+        );
+        callback.error && callback.error(err);
+      } else {
+        callback.success && callback.success();
+      }
+    };
     session.refresh({
       success: function (storage) {
         var headers = new Headers();
@@ -420,16 +463,26 @@ window.player = {
             keepalive: true,
           }
         )
-          .then(function () {
-            player.drmLock = false;
-            callback.success && callback.success();
+          .then(function (resp) {
+            if (resp && resp.ok === false) {
+              finish(
+                new Error(
+                  "DELETE /v1/token/" +
+                    callback.data.id +
+                    " responded HTTP " +
+                    resp.status
+                )
+              );
+              return;
+            }
+            finish();
           })
           .catch(function (error) {
-            callback.error && callback.error(error);
+            finish(error);
           });
       },
       error: function (error) {
-        callback.error && callback.error(error);
+        finish(error);
       },
     });
   },
@@ -438,6 +491,18 @@ window.player = {
     player.initDeviceWatchers();
     player._clearAudioWatchdog();
     var seq = ++player._playSeq;
+    // A new episode starts a new playback session: the stream-recovery rate
+    // limit is scoped to the session, so the first recovery of a new episode
+    // is never suppressed by recoveries that the previous episode used up.
+    var sessionEpId = drm && drm.id;
+    if (sessionEpId !== player._sessionEpId) {
+      player._sessionEpId = sessionEpId;
+      player._recoveryTimestamps = [];
+    }
+    // A rebind still in flight belongs to the previous session. Its guarded
+    // steps are no-ops now, and it must not block rebinds of the new session
+    // (its completion handler only clears _rebindPromise by identity).
+    player._rebindPromise = null;
     player._pausedAt = noplay ? Date.now() : 0;
     player._systemResumed = false;
     player._audioDeviceChanged = false;

@@ -1594,21 +1594,43 @@ window.video = {
 
   releasePendingSession: function () {
     var pending = video._pendingSessionRelease;
-    if (!pending) return;
+    if (!pending) return Promise.resolve();
     video._pendingSessionRelease = null;
     if (
-      pending.id &&
-      pending.token &&
-      typeof player !== "undefined" &&
-      typeof player.deleteSession === "function"
+      !pending.id ||
+      !pending.token ||
+      typeof player === "undefined" ||
+      typeof player.deleteSession !== "function"
     ) {
-      player.deleteSession({
-        data: {
-          id: pending.id,
-          token: pending.token,
-        },
-      });
+      return Promise.resolve();
     }
+    // Release the previous episode's DRM session (DELETE old token) before the
+    // next stream is requested. The returned promise NEVER rejects and always
+    // settles: a failed or hung DELETE is logged inside player.deleteSession
+    // and must not block the new episode from reaching a playable state.
+    return new Promise(function (resolve) {
+      var settled = false;
+      var finish = function () {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      // Safety cap: a hung DELETE must never stall episode switching.
+      var timer = setTimeout(finish, 2500);
+      try {
+        player.deleteSession({
+          data: {
+            id: pending.id,
+            token: pending.token,
+          },
+          success: finish,
+          error: finish,
+        });
+      } catch (e) {
+        finish();
+      }
+    });
   },
 
   onPlaybackStarted: function (playSeq) {
@@ -1698,12 +1720,25 @@ window.video = {
         player.plugin = null;
       }
     }
-    video.releasePendingSession();
+    // Ordering guarantee: the previous episode's DRM session is released
+    // (DELETE old token) before the new stream is requested. The promise
+    // always settles (failures are logged, never blocking), so the new
+    // episode can still fall back to a playable state on DELETE errors.
+    var sessionRelease = video.releasePendingSession();
     if (video.episodesDrawer && video.episodesDrawer.open) {
       video.renderEpisodesDrawer();
     }
     video.syncQualityUI();
     video.updateMediaSession();
+    sessionRelease.then(function () {
+      if (reqId !== video._playReqId || !document.getElementById(video.id)) {
+        return;
+      }
+      video._requestStream(item, reqId, noplay, forceSubtitle);
+    });
+  },
+
+  _requestStream: function (item, reqId, noplay, forceSubtitle) {
     service.video_v2({
       data: {
         id: item.id,

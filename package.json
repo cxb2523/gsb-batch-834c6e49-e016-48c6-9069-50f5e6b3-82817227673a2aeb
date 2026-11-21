@@ -4,6 +4,9 @@
   "description": "Unofficial Ubuntu/Linux Desktop Client for Crunchyroll with Modernist Glassmorphic UI, Custom Lists, Auto-Skip HUD, Mouse/Trackpad & Smart Auto-PiP",
   "homepage": "https://github.com/pulkitmundra/crunchyroll-ubuntu-desktop",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\""
+  },
   "author": "Pulkit Mundra <https://pulkit-mundra-portfolio.vercel.app>",
   "license": "ISC",
   "bugs": {
