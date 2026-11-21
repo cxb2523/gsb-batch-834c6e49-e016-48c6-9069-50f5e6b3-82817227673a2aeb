@@ -8,6 +8,7 @@ import { Quaternion, Vector3 } from 'three'
 
 import { GrantSolver } from '../physics/grant-solver'
 import { MMDIKSolver } from '../physics/mmd-ik-solver'
+import { MMD_FRAME_RATE } from './build-animation'
 
 export interface MMDUpdateOptions {
   grant?: boolean
@@ -56,7 +57,9 @@ const getActiveActions = (mixer: AnimationMixer): readonly AnimationAction[] => 
 }
 
 const getPropertyFrameIndex = (propertyTrack: MMDPropertyTrackData, actionTime: number) => {
-  const frameNumber = actionTime * 30
+  // `actionTime` is in seconds of the (possibly retimed) clip, while the
+  // property track is stored in VMD frames.
+  const frameNumber = actionTime * MMD_FRAME_RATE
   let low = 0
   let high = propertyTrack.frameNumbers.length
   while (low < high) {

@@ -63,6 +63,20 @@ Animations passed to `add` are created and played by the manager. The mixer and
 actions remain internal, so callers only need to register objects and call
 `update()`.
 
+Passing `duration` to the constructor makes the manager loop every registered
+asset on one shared timeline. Each clip is cloned and retimed, including the IK
+property track stored in its `userData`, so IK switches stay aligned with the
+skeletal keys inside a loop. When the loop wraps, the camera properties a clip
+does not animate are restored to their state at registration, and the audio
+restarts once per loop at `delayTime` (folded into the loop when the delay is
+not shorter than it). Audio the manager started is stopped on `remove` and
+`dispose`. Without `duration`, clips keep their own duration and the audio
+plays on its own timeline once.
+
+```ts
+const manager = new MMDAnimationManager({ duration: clip.duration })
+```
+
 ## Physics plugins
 
 Physics is provided by separate packages. Register one plugin before loading

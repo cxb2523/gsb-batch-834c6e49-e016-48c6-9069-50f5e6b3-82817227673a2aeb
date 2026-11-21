@@ -12,11 +12,20 @@ import {
   VectorKeyframeTrack,
 } from 'three'
 
+/** Frames per second used by VMD and by the IK property track. */
+export const MMD_FRAME_RATE = 30
+
 export interface MMDAnimationUserData {
   propertyTrack?: MMDPropertyTrackData
 }
 
 export interface MMDPropertyTrackData {
+  /**
+   * Key frame numbers, in VMD frames (see {@link MMD_FRAME_RATE}).
+   *
+   * The IK property track is not a Three.js keyframe track, so retiming the
+   * owning clip must scale these numbers too (see {@link retimeAnimationClip}).
+   */
   frameNumbers: number[]
   ikBoneNames: string[]
   /** State arrays are indexed as [ikBoneIndex][frameIndex]. */
@@ -593,3 +602,34 @@ export const buildAnimation = (vmd: VmdObject, mesh: SkinnedMesh) =>
 /** @param vmd - parsed VMD data */
 export const buildCameraAnimation = (vmd: VmdObject) =>
   new AnimationBuilder().buildCameraAnimation(vmd)
+
+/**
+ * Clones a clip and retimes it to a new duration.
+ *
+ * The IK property track lives in `clip.userData` rather than in `clip.tracks`,
+ * so Three.js cannot retime it through the clip duration alone. Its frame
+ * numbers are scaled by the same factor as the clip, which keeps every IK
+ * switch at the same position of the loop as the skeletal keys around it.
+ *
+ * The source clip is left untouched.
+ *
+ * @param clip - clip to retime
+ * @param duration - duration of the returned clip, in seconds
+ */
+export const retimeAnimationClip = (clip: AnimationClip, duration: number): AnimationClip => {
+  const sourceDuration = clip.duration
+  const retimed = clip.clone()
+  retimed.duration = duration
+
+  const propertyTrack = (retimed.userData as MMDAnimationUserData).propertyTrack
+  if (propertyTrack != null && sourceDuration > 0) {
+    const scale = duration / sourceDuration
+    if (scale !== 1) {
+      propertyTrack.frameNumbers = propertyTrack.frameNumbers.map(
+        frameNumber => frameNumber * scale,
+      )
+    }
+  }
+
+  return retimed
+}

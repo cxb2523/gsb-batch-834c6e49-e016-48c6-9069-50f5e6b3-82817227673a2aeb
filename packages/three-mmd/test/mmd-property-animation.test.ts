@@ -15,7 +15,7 @@ import {
 } from 'three'
 import { describe, expect, it, vi } from 'vitest'
 
-import { buildAnimation } from '../src/utils/build-animation'
+import { buildAnimation, retimeAnimationClip } from '../src/utils/build-animation'
 import { MMD } from '../src/utils/mmd'
 import { MMDAnimationManager } from '../src/utils/mmd-animation-manager'
 
@@ -142,6 +142,36 @@ describe('mmd property animation', () => {
     })
     expect(clip.duration).toBeCloseTo(31 / 30)
     expect((clip.clone().userData as MMDAnimationUserData).propertyTrack).toEqual(propertyTrack)
+  })
+
+  it('retimes the property track together with the clip and leaves the source alone', () => {
+    const clip = buildAnimation(createVmd([
+      { frameNumber: 0, ikStates: [['ik', true]], visible: true },
+      { frameNumber: 30, ikStates: [['ik', false]], visible: true },
+    ]), mesh)
+    const sourceDuration = clip.duration
+    const sourceFrames = [...(clip.userData as MMDAnimationUserData).propertyTrack!.frameNumbers]
+
+    const retimed = retimeAnimationClip(clip, sourceDuration * 2)
+
+    expect(retimed).not.toBe(clip)
+    expect(retimed.duration).toBeCloseTo(sourceDuration * 2)
+    expect(retimed.tracks.map(track => track.name)).toEqual(clip.tracks.map(track => track.name))
+    expect((retimed.userData as MMDAnimationUserData).propertyTrack!.frameNumbers)
+      .toEqual(sourceFrames.map(frameNumber => frameNumber * 2))
+
+    // Nothing leaked back into the clip the caller passed in.
+    expect(clip.duration).toBeCloseTo(sourceDuration)
+    expect((clip.userData as MMDAnimationUserData).propertyTrack!.frameNumbers).toEqual(sourceFrames)
+  })
+
+  it('does not retime a clip without a property track', () => {
+    const clip = new AnimationClip('plain', 1, [])
+
+    const retimed = retimeAnimationClip(clip, 3)
+
+    expect(retimed.duration).toBe(3)
+    expect(retimed.userData).toEqual({})
   })
 
   it('keeps a frame-zero property-only clip playable', () => {

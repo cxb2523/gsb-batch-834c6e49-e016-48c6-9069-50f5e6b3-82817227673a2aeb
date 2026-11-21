@@ -19,8 +19,10 @@ export { applyVPD, type ApplyVPDOptions } from './utils/apply-vpd'
 export {
   buildAnimation,
   buildCameraAnimation,
+  MMD_FRAME_RATE,
   type MMDAnimationUserData,
   type MMDPropertyTrackData,
+  retimeAnimationClip,
 } from './utils/build-animation'
 export { MMD, type MMDUpdateOptions } from './utils/mmd'
 export {
