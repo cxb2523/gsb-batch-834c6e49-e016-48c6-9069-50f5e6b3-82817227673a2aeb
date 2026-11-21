@@ -48,6 +48,37 @@ type ExternalEventCallbackProps = { c: number, t: number };
 export type ExternalEventCallback = ( props: ExternalEventCallbackProps ) => void;
 
 /**
+ * Describes the currently active glide on an AudioParam. As the Web Audio API has no
+ * facility to query the value of an AudioParam at a future time, we track the range
+ * in which a pending glide ramp is active so repeated automation triggers (e.g. an
+ * event being retriggered while it is still gliding) can be chained correctly
+ * instead of stacking duplicate cancel/anchor/ramp sequences.
+ */
+type ParameterGlideState = {
+    startTime: number;
+    startValue: number;
+    endTime: number;
+    target: number;
+};
+
+let parameterGlideStates = new WeakMap<AudioParam, ParameterGlideState>();
+
+// automation of the filter LFO type alters the instruments model (the LFO type describes the
+// oscillator type to use for modulation). Keep track of the original value so a reset can
+// restore the instrument to its configured (and persisted) state.
+
+let filterLfoTypeSnapshots = new Map<number, OscillatorType | "off">();
+
+/**
+ * discard the snapshots of the pre-automation filter LFO types. Should be invoked whenever
+ * the instrument models are (re)applied onto the audio modules, as a subsequent reset() will
+ * restore the value described by the (new) model instead.
+ */
+export const clearFilterLfoSnapshots = (): void => {
+    filterLfoTypeSnapshots.clear();
+};
+
+/**
  * apply a module parameter change defined inside an audioEvent during playback
  */
 export const applyModuleParamChange = ( audioContext: BaseAudioContext, audioEvent: EffluxAudioEvent,
@@ -106,6 +137,9 @@ export const applyModuleParamChange = ( audioContext: BaseAudioContext, audioEve
             break;
 
         case FILTER_LFO_ENABLED:
+            if ( !filterLfoTypeSnapshots.has( instrument.index )) {
+                filterLfoTypeSnapshots.set( instrument.index, instrument.filter.lfoType );
+            }
             instrument.filter.lfoType = rangeToIndex( filterTypes, value ) as OscillatorType;
             applyRouting( modules, output );
             break;
@@ -409,14 +443,143 @@ function applyExternalEvent( audioContext: BaseAudioContext, event: EffluxAudioE
 function scheduleParameterChange( param: AudioParam, value: number, startTimeInSeconds: number,
     durationInSeconds: number, doGlide?: boolean, data?: any ): void {
 
-    if ( !doGlide || ( data && !data.gliding )) {
+    if ( !doGlide ) {
+        // instant change : discard all pending automation and current glide state
+        parameterGlideStates.delete( param );
+        if ( data ) {
+            data.gliding = false;
+        }
         param.cancelScheduledValues( startTimeInSeconds );
-        param.setValueAtTime(( doGlide ) ? param.value : value, startTimeInSeconds );
+        param.setValueAtTime( value, startTimeInSeconds );
+        return;
     }
-    if ( doGlide ) {
+
+    // gliding change. When a glide is already pending on this parameter (e.g. the automated
+    // event is retriggered before its previous glide has resolved, or an event with a repeated
+    // automation was enqueued) we chain the new glide from the value the previous glide will
+    // have at the requested start time. This prevents stacking of duplicate cancel/anchor/ramp
+    // sequences, which would otherwise cut the previous ramp short and reset the progression.
+
+    const pending = parameterGlideStates.get( param );
+
+    if ( pending && startTimeInSeconds >= pending.startTime ) {
+
+        if ( startTimeInSeconds < pending.endTime ) {
+
+            // the previous glide is still in flight : interpolate the value it will have reached
+            // at the requested start time, so the new glide continues seamlessly
+
+            const progress = ( startTimeInSeconds - pending.startTime ) / ( pending.endTime - pending.startTime );
+            const currentValue = pending.startValue + (( pending.target - pending.startValue ) * progress );
+
+            param.cancelScheduledValues( startTimeInSeconds );
+            param.setValueAtTime( currentValue, startTimeInSeconds );
+            param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
+            parameterGlideStates.set( param, {
+                startTime  : startTimeInSeconds,
+                startValue : currentValue,
+                endTime    : startTimeInSeconds + durationInSeconds,
+                target     : value
+            });
+            if ( data ) {
+                data.gliding = true;
+            }
+            return;
+        }
+
+        // the previous glide has fully resolved (and the AudioParam's value now equals its target).
+
+        param.cancelScheduledValues( startTimeInSeconds );
+        param.setValueAtTime( pending.target, startTimeInSeconds );
         param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
+        parameterGlideStates.set( param, {
+            startTime  : startTimeInSeconds,
+            startValue : pending.target,
+            endTime    : startTimeInSeconds + durationInSeconds,
+            target     : value
+        });
         if ( data ) {
             data.gliding = true;
         }
+        return;
+    }
+
+    // no glide pending : start a new glide from the current value
+
+    param.cancelScheduledValues( startTimeInSeconds );
+    param.setValueAtTime( param.value, startTimeInSeconds );
+    param.linearRampToValueAtTime( value, startTimeInSeconds + durationInSeconds );
+
+    parameterGlideStates.set( param, {
+        startTime  : startTimeInSeconds,
+        startValue : param.value,
+        endTime    : startTimeInSeconds + durationInSeconds,
+        target     : value
+    });
+    if ( data ) {
+        data.gliding = true;
     }
 }
+
+/**
+ * Restore all module parameters that can be altered through automation onto the values
+ * described by the instruments model. The modules enabled states and their routing are
+ * restored through ModuleFactory#applyConfiguration, ensuring the instruments processing
+ * chain is left in a clean state for the next playback session.
+ *
+ * @param {BaseAudioContext} audioContext
+ * @param {InstrumentModules} modules the audio modules for the instrument
+ * @param {Instrument} instrument the model describing the desired state
+ * @param {AudioNode} output the master bus to connect the module routing onto
+ * @param {Function} applyConfiguration ModuleFactory#applyConfiguration used to restore
+ *        enabled states, parameter values and routing for the module chain
+ */
+export const resetParameterAutomation = (
+    audioContext: BaseAudioContext,
+    instrumentIndex: number,
+    modules: InstrumentModules,
+    instrument: Instrument,
+    output: AudioNode,
+    applyConfiguration: ( type: string, modules: InstrumentModules, props: any, output: AudioNode ) => void
+): void => {
+    const { eq, filter, panner } = modules;
+    const { currentTime } = audioContext;
+
+    // discard all pending automation (and glide tracking) on every automatable AudioParam
+    // before applying the model values. Note these values are set by applyConfiguration()
+    // below, which routes through the exact same code path as the model-driven UI updates.
+
+    const params = [
+        eq.lowGain.gain, eq.midGain.gain, eq.highGain.gain,
+        filter.filter.frequency, filter.filter.Q, filter.lfo.frequency, filter.lfoAmp.gain,
+    ];
+    if ( panner ) {
+        params.push( panner.pan );
+    }
+    params.forEach(( param: AudioParam ): void => {
+        param.cancelScheduledValues( currentTime );
+        parameterGlideStates.delete( param );
+    });
+
+    // restore the filter LFO type altered by automation (the ModuleFactory only
+    // configures the LFO type when the model describes an enabled LFO)
+
+    const lfoSnapshot = filterLfoTypeSnapshots.get( instrumentIndex );
+    if ( typeof lfoSnapshot !== "undefined" ) {
+        instrument.filter.lfoType = lfoSnapshot;
+        filterLfoTypeSnapshots.delete( instrumentIndex );
+    }
+
+    // panning is not part of the module chain configuration, restore it directly
+
+    if ( panner ) {
+        panner.pan.value = typeof instrument.panning === "number" ? instrument.panning : 0;
+    }
+
+    // restore module values, enabled states and routing via the ModuleFactory
+
+    applyConfiguration( "eq",        modules, instrument.eq,        output );
+    applyConfiguration( "filter",    modules, instrument.filter,    output );
+    applyConfiguration( "delay",     modules, instrument.delay,     output );
+    applyConfiguration( "overdrive", modules, instrument.overdrive, output );
+};

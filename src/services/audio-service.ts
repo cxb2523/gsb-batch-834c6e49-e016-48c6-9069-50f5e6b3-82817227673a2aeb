@@ -27,7 +27,7 @@ import OscillatorTypes from "@/definitions/oscillator-types";
 import ModuleFactory from "@/model/factories/module-factory";
 import { ACTION_NOTE_ON } from "@/model/types/audio-event";
 import { applyRouting } from "./audio/module-router";
-import { applyModuleParamChange, getCurrentValueForParam } from "./audio/module-automation";
+import { applyModuleParamChange, getCurrentValueForParam, resetParameterAutomation, clearFilterLfoSnapshots } from "./audio/module-automation";
 import type { ExternalEventCallback } from "./audio/module-automation";
 import type OutputRecorder from "./audio/output-recorder";
 import type WaveTables from "./audio/wave-tables";
@@ -70,6 +70,7 @@ let recordOutput = false;
 let outputRecorderRef: typeof OutputRecorder;
 let recorder: OutputRecorder;
 let instrumentModulesList: InstrumentModules[]; // holds all modules for each instantiated instrument
+let appliedSong: EffluxSong | undefined; // the song whose instrument models are currently applied onto the modules
 let playingEventVoices: Record<number, EventVoiceList>[]; // [instrumentIndex][eventId][eventVoiceIndex]
 let pool: {
     NOISE: AudioBuffer,
@@ -137,15 +138,44 @@ export const prepareEnvironment = ( audioContextInstance: BaseAudioContext,
 /**
  * halts all playing audio, flushes events and
  * resets unique event id counter when requested (e.g. when loading new song)
+ *
+ * all module parameters that can be altered through automation are restored onto the values
+ * described by the currently applied instruments model, ensuring a subsequent playback session
+ * doesn't inherit values from an interrupted (gliding) automation
  */
 export const reset = ( resetEventCounter = false ): void => {
     playingEventVoices.forEach(( eventList, instrumentIndex ) => {
+        const modules = instrumentModulesList[ instrumentIndex ];
         processVoiceLists( Object.values( eventList ) as EventVoiceList[], ( voice: EventVoice, oscillatorIndex: number ) => {
-            returnVoiceNodesToPoolOnPlaybackEnd( instrumentModulesList[ instrumentIndex ], oscillatorIndex, voice, instrumentIndex );
+            // when halting playback, skip the release phase : ensure the voice doesn't linger
+            // in the pool and its nodes are returned immediately (see disposeVoice()).
             stopOscillation( voice.generator, audioContext.currentTime );
+            disposeVoice( modules, oscillatorIndex, voice );
         });
         playingEventVoices[ instrumentIndex ] = {};
     });
+
+    // restore all modules that could have been altered by automation
+
+    const song = appliedSong ?? state?.song?.activeSong;
+    if ( song ) {
+        const hasSoloChannel = song.instruments.find(( instrument: Instrument ) => !!instrument.solo );
+        song.instruments.forEach(( instrument: Instrument, instrumentIndex: number ): void => {
+            const modules = instrumentModulesList[ instrumentIndex ];
+            if ( !modules ) {
+                return;
+            }
+            // the channels output gain can also be altered, restore it using the model
+            const { muted, solo } = instrument;
+            modules.output.gain.cancelScheduledValues( audioContext.currentTime );
+            modules.output.gain.value = muted || ( hasSoloChannel && !solo ) ? 0 : instrument.volume;
+
+            resetParameterAutomation(
+                audioContext, instrumentIndex, modules, instrument, masterBus,
+                ( type, instrumentModules, props, output ) => ModuleFactory.applyConfiguration( type, instrumentModules, props, output )
+            );
+        });
+    }
     if ( resetEventCounter ) {
         UNIQUE_EVENT_ID = 0;
     }
@@ -158,6 +188,8 @@ export const togglePlayback = ( setPlaying: boolean ): void => {
         recordOutput = !recordOutput;
         AudioService.toggleRecordingState();
     } else {
+        // stopping playback : flush all voices and restore automated module parameters
+        // onto the values described by the currently applied instrument models
         reset();
         if ( recordOutput && recorder ) {
             recorder.stop();
@@ -189,6 +221,11 @@ export const cacheCustomTables = ( instruments: Instrument[]): void => {
  */
 export const applyModules = ( song: EffluxSong, connectAnalysers = false ): void => {
     useAnalysers = connectAnalysers;
+    // store a reference to the currently applied song. This is used by reset() to restore
+    // any module parameters that were altered through automation onto the model values.
+    appliedSong = song;
+    // the model is now the source of truth, discard any snapshots of pre-automation values
+    clearFilterLfoSnapshots();
     // first check if one of the channels is configured to operate solo
     const hasSoloChannel = song.instruments.find( instrument => !!instrument.solo );
     song.instruments.forEach(( instrument, instrumentIndex ) => {
@@ -241,6 +278,12 @@ export const noteOn = ( event: EffluxAudioEvent, instrument: Instrument,
         const frequency = getFrequency( event.note, event.octave );
         const modules   = instrumentModulesList[ instrument.index ];
         const voices    = [] as EventVoiceList;
+
+        // register the playback record before starting any generators. The record is referenced
+        // by the generator's "ended" handlers to verify a voice still belongs to the current
+        // playback session before mutating (or deleting) the record.
+
+        playingEventVoices[ instrument.index ][ event.id ] = voices;
 
         let oscillator: InstrumentOscillator;
 
@@ -339,7 +382,8 @@ export const noteOn = ( event: EffluxAudioEvent, instrument: Instrument,
                 vo: oscillatorVO,
                 gain: oscillatorNode,
                 outputNode: adsrNode,
-                gliding: false
+                gliding: false,
+                released: false
             });
 
             // start playback and attach listener to track playback end
@@ -347,9 +391,10 @@ export const noteOn = ( event: EffluxAudioEvent, instrument: Instrument,
             // AudioBufferSources can finish their playback before the sequencer can request the noteOff)
 
             startOscillation( generatorNode, startTimeInSeconds );
-            returnVoiceNodesToPoolOnPlaybackEnd( modules, oscillatorIndex, voices[ oscillatorIndex ], instrument.index, event.id );
+            returnVoiceNodesToPoolOnPlaybackEnd(
+                modules, oscillatorIndex, voices[ oscillatorIndex ], instrument.index, voices, event.id
+            );
         });
-        playingEventVoices[ instrument.index ][ event.id ] = voices;
     }
     // module parameter change specified ? process it.
 
@@ -387,6 +432,16 @@ export const noteOff = ( event: EffluxAudioEvent, startTimeInSeconds = audioCont
         if ( !voice ) {
             return;
         }
+        // mark the voice as releasing. The generator's "ended" handler will return its
+        // gain nodes to the pool once the release phase has completed. Guard against
+        // repeated noteOff invocations (which would stack release envelopes and
+        // reschedule the stop time).
+
+        if ( voice.released ) {
+            return;
+        }
+        voice.released = true;
+
         // apply release envelopes
         ADSR.applyAmpRelease  ( voice.vo, voice.outputNode, startTimeInSeconds );
         ADSR.applyPitchRelease( voice.vo, voice.generator,  startTimeInSeconds );
@@ -406,6 +461,27 @@ let useAnalysers = false;
 export const connectAnalysers = (): boolean => useAnalysers;
 
 export const getCurrentModuleParamValue = ( instrument: Instrument, param: ModuleParamDef ): number => getCurrentValueForParam( instrumentModulesList[ instrument.index ], instrument, param );
+
+/**
+ * retrieve the internally created audio modules for given instrument index.
+ * primarily useful for testing / debugging the audio processing chain.
+ */
+export const getInstrumentModules = ( instrumentIndex: number ): InstrumentModules => instrumentModulesList?.[ instrumentIndex ];
+
+/**
+ * retrieve the number of available (unused) voices for given instruments oscillator.
+ * primarily useful for testing the voice pool lifecycle.
+ */
+export const getAvailableVoiceCount = ( instrumentIndex: number, oscillatorIndex: number ): number =>
+    instrumentModulesList?.[ instrumentIndex ]?.voices?.[ oscillatorIndex ]?.length ?? 0;
+
+/**
+ * retrieve the currently playing event ids for given instrument. Events can be playing back
+ * while they are in their release phase (their "id" is cleared once playback has fully ended).
+ * primarily useful for testing / debugging the audio processing chain.
+ */
+export const getPlayingEventIds = ( instrumentIndex: number ): number[] =>
+    Object.keys( playingEventVoices[ instrumentIndex ] ?? {}).map( id => parseInt( id, 10 ));
 
 const AudioService =
 {
@@ -567,48 +643,90 @@ function returnUnusedVoiceNodesToPool( instrumentModules: InstrumentModules, osc
     instrumentModules.voices[ oscillatorIndex ].push( voice );
 }
 
-function returnVoiceNodesToPoolOnPlaybackEnd( instrumentModules: InstrumentModules, oscillatorIndex: number,
-    eventVoice: EventVoice, instrumentIndex: number, eventId: number = -1 ): void {
-    eventVoice.generator.onended = (): void => {
-        // OscillatorNodes will automatically disconnect() after stopping
-        // except for PWM which has a custom implementation
+/**
+ * returns the gain nodes for a voice back to the instruments voice pool
+ * and disposes of the generator node. This method is idempotent : invoking
+ * it twice for the same voice is a no-op (which prevents nodes being
+ * returned to the pool more than once, e.g. when a voice is disposed of
+ * synchronously by reset() while its generator's "ended" event is still pending).
+ */
+function disposeVoice( instrumentModules: InstrumentModules, oscillatorIndex: number, eventVoice: EventVoice ): void {
+    if ( !eventVoice || eventVoice.returned ) {
+        return;
+    }
+    eventVoice.returned = true;
+
+    // OscillatorNodes will automatically disconnect() after stopping
+    // except for PWM which has a custom implementation
+
+    try {
         eventVoice.generator.disconnect();
+    } catch ( e ) {
+        // some generator implementations can throw when already disconnected
+    }
+
+    // discard any scheduled envelope changes before recycling the nodes
+
+    eventVoice.outputNode.gain.cancelScheduledValues( audioContext.currentTime );
+    eventVoice.gain.gain.cancelScheduledValues( audioContext.currentTime );
+
+    if ( POOL_GAIN_NODES ) {
+        // return the gain nodes for the instrument voice back to the pool
+        instrumentModules.voices[ oscillatorIndex ].push({
+            oscillatorNode: eventVoice.gain,
+            adsrNode: eventVoice.outputNode
+        });
+        return;
+    }
+
+    // pooling of gain nodes disabled. Technically this increases work for the garbage collector, but this
+    // brings the benefit of a more stable engine as it ensures all scheduled parameters are discarded, providing
+    // a clean reset for the next use (otherwise over time / under CPU stress ADSR changes would not restore properly)
+    // this can be tested by looping a 16th note hi-hat noise (w/ slight release) pattern for a while
+
+    eventVoice.gain.disconnect();
+    eventVoice.outputNode.disconnect();
+
+    instrumentModules.voices[ oscillatorIndex ].push( createVoiceGainStructure( instrumentModules.output ));
+}
+
+/**
+ * attach a listener to the given event voice's generator to track playback end.
+ * When playback ends, the voice is disposed of (returning its gain nodes to the pool)
+ * and the events playback record is cleared.
+ *
+ * @param {InstrumentModules} instrumentModules
+ * @param {number} oscillatorIndex
+ * @param {EventVoice} eventVoice
+ * @param {number} instrumentIndex
+ * @param {EventVoiceList} voiceList the exact list the voice was registered in. This reference
+ *        is used to verify the record still belongs to this voice, preventing a stale callback
+ *        from deleting a newly created record for a retriggered (or recycled) event id.
+ * @param {number} eventId
+ */
+function returnVoiceNodesToPoolOnPlaybackEnd( instrumentModules: InstrumentModules, oscillatorIndex: number,
+    eventVoice: EventVoice, instrumentIndex: number, voiceList: EventVoiceList, eventId: number ): void {
+    eventVoice.generator.onended = (): void => {
+        disposeVoice( instrumentModules, oscillatorIndex, eventVoice );
 
         // delete the associated event from the playback list
         // we delay this until the voices have actually halted playback
         // as otherwise the voices aren't always returned to the pool on Safari/iOS
 
-        if ( eventId !== -1 ) {
-            const voiceList = playingEventVoices[ instrumentIndex ][ eventId ];
-            if ( voiceList ) {
-                voiceList[ oscillatorIndex ] = undefined;
-                if ( voiceList.filter( Boolean ).length === 0 ) {
-                    delete playingEventVoices[ instrumentIndex ][ eventId ];
-                }
-            }
-        }
-
-        eventVoice.gain.gain.cancelScheduledValues( 0 );
-        eventVoice.outputNode.gain.cancelScheduledValues( 0 );
-
-        if ( POOL_GAIN_NODES ) {
-            // return the gain nodes for the instrument voice back to the pool
-            instrumentModules.voices[ oscillatorIndex ].push({
-                oscillatorNode: eventVoice.gain,
-                adsrNode: eventVoice.outputNode
-            });
+        if ( typeof eventId !== "number" || eventId === -1 ) {
             return;
         }
+        // only mutate the record when it is still the exact list this voice was registered in.
+        // the event id can be recycled after a full reset, or the event can have been retriggered,
+        // in which case a new record now exists under the same (or a different) id.
 
-        // pooling of gain nodes disabled. Technically this increases work for the garbage collector, but this
-        // brings the benefit of a more stable engine as it ensures all scheduled parameters are discarded, providing
-        // a clean reset for the next use (otherwise over time / under CPU stress ADSR changes would not restore properly)
-        // this can be tested by looping a 16th note hi-hat noise (w/ slight release) pattern for a while
-        
-        eventVoice.gain.disconnect();
-        eventVoice.outputNode.disconnect();
-
-        instrumentModules.voices[ oscillatorIndex ].push( createVoiceGainStructure( instrumentModules.output ));
+        if ( playingEventVoices[ instrumentIndex ]?.[ eventId ] !== voiceList ) {
+            return;
+        }
+        voiceList[ oscillatorIndex ] = undefined;
+        if ( voiceList.filter( Boolean ).length === 0 ) {
+            delete playingEventVoices[ instrumentIndex ][ eventId ];
+        }
     };
 }
 

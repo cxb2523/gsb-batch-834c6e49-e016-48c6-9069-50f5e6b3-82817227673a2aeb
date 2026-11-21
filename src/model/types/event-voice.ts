@@ -34,7 +34,9 @@ export type EventVoice = {
     outputNode: GainNode;
     frequency: number;
     vo: InstrumentOscillator,
-    gliding: false
+    gliding: boolean,
+    released?: boolean, // whether the voice has entered its release phase
+    returned?: boolean  // whether the voices nodes have been returned to the pool
 };
 
 /**
