@@ -1,0 +1,1621 @@
+import { TextMeasurer } from '../core/text_measurer'
+import { TextInputController } from '../core/text_input_controller'
+import { SingleLineTextInput } from '../core/single_line_text_input'
+import { TextEditSession } from '../core/text_edit_session'
+import { normalizeUtf16ScalarRange } from '../core/text_selection'
+import { PendingPointerGesture } from '../gestures/pending_pointer_gesture'
+import type { GestureArenaMember } from '../gestures/gesture_arena'
+import { paintSingleLineEditableText } from '../rendering/single_line_text_renderer'
+import { FocusManager, type Focusable } from '../core/focus_manager'
+import {
+  type PopupAnchor,
+  type PopupAnchorTarget,
+  GET_POPUP_ANCHOR_RECT,
+  resolvePopupAnchorRect,
+  resolvePopupAnchorTarget,
+} from '../core/popup_anchor'
+import { PopupManager, clampRectToPopupViewport, type PopupContext } from '../core/popup_manager'
+import { PopupPanelShell, type PopupPanelLayout } from '../core/popup_shell'
+import type { BoxConstraints, LayoutContext, Offset, RenderObject } from '../core/render_object'
+import { runCleanupSteps, type DisposeFn } from '../core/disposable'
+import { HitTestResult, isPrimaryPointerButton, type PointerEvent as PopupPointerEvent, type WheelPointerEvent } from '../gestures/hit_test'
+import type { InteractiveRenderObject, PointerEvent } from '../gestures/recognizers'
+import { RenderBox } from '../layout/render_box'
+import { DrawList } from '../rendering/draw_list'
+import { paintSingleLineText } from '../rendering/text_painter'
+import type { PaintContext } from '../rendering/paint_context'
+import { drawPopupPanel } from '../rendering/popup_painter'
+import {
+  blendColor,
+  deriveDropdownStyle,
+  derivePopupStyle,
+  deriveTextInputStyle,
+  deriveTreeStyle,
+  resolveBgColor,
+  resolveTextColor,
+} from '../theme/component_styles'
+import { layoutFormFieldInlineContent, measureFormFieldHeight, pointInFormFieldRect, type FormFieldStatus } from './form_field_shell'
+import { paintTriggerFieldShell } from './trigger_field_shell'
+import { paintIconGlyph } from './icon'
+import { PopupTextInput } from './popup_text_input'
+import { RenderTreeView, type TreeNode } from './tree'
+import {
+  ValueEditorEventEmitter,
+  type ValueEditor,
+  type ValueEditorValueChangeListener,
+} from './value_editor'
+
+type DropTreeLayout = PopupPanelLayout & {
+  searchRect: { x: number; y: number; w: number; h: number } | null
+  treeRect: { x: number; y: number; w: number; h: number }
+}
+
+export interface DropTreeEditQueryContext<T = any> {
+  query: string
+  roots: readonly TreeNode<T>[]
+  selectedValue: string
+}
+
+export interface DropTreeEditExpandOnOpenContext<T = any> {
+  roots: readonly TreeNode<T>[]
+  selectedValue: string
+}
+
+export type DropTreeEditQueryProcessor<T = any> =
+  (context: DropTreeEditQueryContext<T>) => TreeNode<T>[]
+
+export type DropTreeEditQueryTextBuilder<T = any> =
+  (node: TreeNode<T>) => string[]
+
+export type DropTreeEditExpandedKeysResolver<T = any> =
+  (context: DropTreeEditExpandOnOpenContext<T>) => readonly string[]
+
+export interface DropTreeEditDebugState {
+  popupVisible: boolean
+  queryText: string
+  showQueryInField: boolean
+  displayText: string
+  focused: boolean
+  disabled: boolean
+  readonly: boolean
+  value: string
+  filteredCount: number
+  expandedKeys: string[]
+}
+
+export type DropTreeEditValueChangeReason = 'selection' | 'clear'
+
+export interface DropTreePopupDebugState {
+  searchText: string
+  searchable: boolean
+  selectedValue: string
+  filteredCount: number
+  expandedKeys: string[]
+  panelX: number
+  panelY: number
+  panelW: number
+  panelH: number
+  anchorRect: { x: number; y: number; w: number; h: number }
+  treeRect: { x: number; y: number; w: number; h: number }
+}
+
+export interface DropTreePopupOpenOptions<T = any> {
+  anchor: PopupAnchor
+  selectedValue: string
+  searchable: boolean
+  ownerInput?: boolean
+  isCurrent?: () => boolean
+  maxVisibleItems: number
+  initialQuery: string
+  resolveRoots: (query: string) => TreeNode<T>[]
+  onSelect: (node: TreeNode<T>) => boolean | void
+  onSearchTextChange?: (value: string) => void
+  onClose: () => void
+  openExpandedKeys?: readonly string[]
+}
+
+export class DropTreePopup<T = any> extends PopupPanelShell {
+  private readonly _searchInput = new PopupTextInput(() => PopupManager.instance.requestPaint())
+  private _tree: RenderTreeView<T> | null = null
+  private _anchor?: PopupAnchor
+  private _selectedValue = ''
+  private _searchable = false
+  private _maxVisibleItems = 8
+  private _searchText = ''
+  private _resolveRoots?: (query: string) => TreeNode<T>[]
+  private _onSelect?: (node: TreeNode<T>) => boolean | void
+  private _onSearchTextChange?: (value: string) => void
+  private _onClose?: () => void
+  private _expandedKeys = new Set<string>()
+  private _filteredRoots: TreeNode<T>[] = []
+  private _ownerInput = false
+  private _isCurrent?: () => boolean
+  private _session = 0
+  private _revision = 0
+  private _disposed = false
+  private _loadingRoots = false
+
+  get searchText(): string { return this._searchText }
+
+  get selectedValue(): string { return this._selectedValue }
+
+  get expandedKeys(): string[] {
+    return this._tree ? this._tree.expandedKeys : [...this._expandedKeys]
+  }
+
+  set selectedValue(value: string) {
+    const nextValue = String(value ?? '')
+    if (nextValue === this._selectedValue) return
+    this._selectedValue = nextValue
+    if (this._tree) {
+      if (this._ownerInput) this._tree.setNavigationKey(null)
+      this._tree.expandedKeys = this._defaultExpandedKeys()
+      this._tree.selectedKey = nextValue
+    }
+    PopupManager.instance.requestPaint()
+  }
+
+  get filteredRoots(): TreeNode<T>[] {
+    return this._filteredRoots
+  }
+
+  get filteredCount(): number {
+    return this._tree ? countTreeNodes(this._tree.roots) : 0
+  }
+
+  debugState(): DropTreePopupDebugState {
+    const popupContext = PopupManager.instance.context
+    const layout = this._layout(popupContext)
+    const anchorRect = this._anchor
+      ? resolvePopupAnchorRect(this._anchor)
+      : { x: 0, y: 0, w: 240, h: deriveTextInputStyle(popupContext.theme).height }
+    return {
+      searchText: this._searchText,
+      searchable: this._searchable,
+      selectedValue: this._selectedValue,
+      filteredCount: this.filteredCount,
+      expandedKeys: this.expandedKeys,
+      panelX: layout.panelX,
+      panelY: layout.panelY,
+      panelW: layout.panelW,
+      panelH: layout.panelH,
+      anchorRect,
+      treeRect: layout.treeRect,
+    }
+  }
+
+  refresh(): void {
+    try {
+      if (!this._loadRoots()) {
+        if (this.visible && this._isCurrent?.() !== false) {
+          this._filteredRoots = []
+          this._syncTree()
+          PopupManager.instance.requestPaint()
+        }
+        return
+      }
+    } catch (error) {
+      this._filteredRoots = []
+      this._syncTree()
+      PopupManager.instance.requestPaint()
+      throw error
+    }
+    this._syncTree()
+    PopupManager.instance.requestPaint()
+  }
+
+  setQuery(value: string): void {
+    this._searchText = value
+    this.clearNavigation()
+    this.refresh()
+  }
+
+  clearNavigation(): void {
+    if (!this._ownerInput) return
+    this._tree?.setNavigationKey(null)
+    PopupManager.instance.requestPaint()
+  }
+
+  get navigationKey(): string | null { return this._tree?.navigationKey ?? null }
+
+  pruneExpandedKeys(keys: readonly string[]): void {
+    const valid = new Set(keys)
+    this._expandedKeys = new Set([...this._expandedKeys].filter(key => valid.has(key)))
+  }
+
+  private _loadRoots(): boolean {
+    if (!this._resolveRoots || this._disposed || this._isCurrent?.() === false) return false
+    const revision = ++this._revision
+    if (this._loadingRoots) return false
+    this._loadingRoots = true
+    let roots: TreeNode<T>[]
+    try { roots = this._resolveRoots(this._searchText) }
+    finally { this._loadingRoots = false }
+    if (revision !== this._revision || this._disposed || this._isCurrent?.() === false) return false
+    this._filteredRoots = roots
+    return true
+  }
+
+  open(options: DropTreePopupOpenOptions<T>): void {
+    if (this._disposed) return
+    if (this.visible) this.close()
+    const session = ++this._session
+    this._ownerInput = options.ownerInput ?? false
+    this._isCurrent = options.isCurrent
+    this._anchor = options.anchor
+    this._selectedValue = options.selectedValue
+    this._searchable = !this._ownerInput && options.searchable
+    this._maxVisibleItems = options.maxVisibleItems
+    this._resolveRoots = options.resolveRoots
+    this._onSelect = options.onSelect
+    this._onSearchTextChange = options.onSearchTextChange
+    this._onClose = options.onClose
+    this._searchText = options.initialQuery
+    if (options.openExpandedKeys) this._expandedKeys = new Set(options.openExpandedKeys)
+    try {
+      if (!this._loadRoots() || session !== this._session) {
+        this._discardOpening(session)
+        return
+      }
+      this._tree = this._createTree()
+    } catch (error) {
+      this._discardOpening(session)
+      throw error
+    }
+    this.openPopup({ owner: resolvePopupAnchorTarget(options.anchor), ...(this._ownerInput ? { interactionMode: 'nonmodal' as const, closeOnTransient: true } : {}) })
+    if (this._searchable) {
+      this._searchInput.beginSession({
+        value: this._searchText,
+        placeholder: '搜索...',
+        onInput: value => {
+          this._searchText = value
+          this.refresh()
+          if (session !== this._session) return
+          this._onSearchTextChange?.(value)
+          PopupManager.instance.requestPaint()
+        },
+        onCompositionUpdate: () => {
+          PopupManager.instance.requestPaint()
+        },
+        onCompositionEnd: value => {
+          this._searchText = value
+          this.refresh()
+          if (session !== this._session) return
+          this._onSearchTextChange?.(value)
+          PopupManager.instance.requestPaint()
+        },
+        onKeyDown: event => {
+          this._handleNavigationKey(event)
+        },
+      })
+    } else if (this._tree && !this._ownerInput) {
+      FocusManager.instance.setFocus(this._tree)
+    }
+    PopupManager.instance.requestPaint()
+  }
+
+  override close(): void {
+    super.close()
+  }
+
+  override hitTest(point: Offset, popupContext: PopupContext): boolean {
+    if (!this.visible) return false
+    const layout = this.getPanelLayout(popupContext)
+    return point.x >= layout.panelX &&
+      point.x <= layout.panelX + layout.panelW &&
+      point.y >= layout.panelY &&
+      point.y <= layout.panelY + layout.panelH
+  }
+
+  private _discardOpening(session: number): void {
+    if (session !== this._session || this.visible) return
+    this._resolveRoots = undefined
+    this._isCurrent = undefined
+    this._filteredRoots = []
+    this._onSelect = undefined
+    this._onSearchTextChange = undefined
+    this._onClose = undefined
+  }
+
+  onOutsidePointerDown(event: PopupPointerEvent): boolean {
+    if (!this._anchor) return false
+    const rect = resolvePopupAnchorRect(this._anchor)
+    const hitAnchor = event.position.x >= rect.x &&
+      event.position.x <= rect.x + rect.w &&
+      event.position.y >= rect.y &&
+      event.position.y <= rect.y + rect.h
+    if (!hitAnchor) return false
+    this.close()
+    return true
+  }
+
+  onPointerDown(event: PopupPointerEvent, popupContext: PopupContext = PopupManager.instance.context): void {
+    if (!isPrimaryPointerButton(event)) return
+    const layout = this._layout(popupContext)
+    if (layout.searchRect && this._searchInput.hitTest(event.position, layout.searchRect)) {
+      this._searchInput.handlePointerDown(event.position, layout.searchRect, event.clickCount)
+      return
+    }
+    this._tree?.onPointerDown(event)
+    if (this.visible) PopupManager.instance.requestPaint()
+  }
+
+  onPointerMove(event: PopupPointerEvent, popupContext: PopupContext = PopupManager.instance.context): void {
+    const layout = this._layout(popupContext)
+    if (layout.searchRect && this._searchInput.hitTest(event.position, layout.searchRect)) {
+      this._searchInput.handlePointerMove(event.position)
+      return
+    }
+    this._searchInput.handlePointerCancel()
+    this._tree?.onPointerMove(event)
+  }
+
+  onPointerUp(event: PopupPointerEvent, popupContext: PopupContext = PopupManager.instance.context): void {
+    if (!isPrimaryPointerButton(event)) return
+    const layout = this._layout(popupContext)
+    if (layout.searchRect && this._searchInput.hitTest(event.position, layout.searchRect)) {
+      this._searchInput.handlePointerUp()
+      return
+    }
+    this._searchInput.handlePointerUp()
+    this._tree?.onPointerUp(event)
+  }
+
+  onPointerCancel(event: PopupPointerEvent): void {
+    this._searchInput.handlePointerCancel()
+    this._tree?.onPointerCancel(event)
+  }
+
+  onWheel(event: WheelPointerEvent, popupContext: PopupContext = PopupManager.instance.context): boolean {
+    const layout = this._layout(popupContext)
+    const inPanel = event.position.x >= layout.panelX &&
+      event.position.x <= layout.panelX + layout.panelW &&
+      event.position.y >= layout.panelY &&
+      event.position.y <= layout.panelY + layout.panelH
+    if (!inPanel) return false
+    const inTree = event.position.x >= layout.treeRect.x &&
+      event.position.x <= layout.treeRect.x + layout.treeRect.w &&
+      event.position.y >= layout.treeRect.y &&
+      event.position.y <= layout.treeRect.y + layout.treeRect.h
+    if (inTree) this._tree?.onWheel(event)
+    return true
+  }
+
+  onKeyDown(event: KeyboardEvent): boolean {
+    return this._handleNavigationKey(event)
+  }
+
+  focusRoots(): readonly RenderObject[] {
+    return this.visible && this._tree && !this._ownerInput ? [this._tree] : []
+  }
+
+  paint(context: PaintContext): void {
+    if (!this.visible) return
+    const popupContext = PopupManager.instance.context
+    const layout = this._layout(popupContext)
+    this._syncTreeLayout(layout, popupContext)
+    const dl = new DrawList(context)
+    const popup = derivePopupStyle(context.theme)
+    drawPopupPanel(dl, layout.panelX, layout.panelY, layout.panelW, layout.panelH, popup)
+    if (layout.searchRect) {
+      this._searchInput.paint(context, layout.searchRect, context.theme)
+    }
+    if (this._tree) {
+      this._tree.paint(context, { x: this._tree.offset.x, y: this._tree.offset.y })
+      if (this.filteredRoots.length === 0) {
+        dl.pushClip(layout.treeRect.x, layout.treeRect.y, layout.treeRect.w, layout.treeRect.h)
+        dl.fillText(
+          '无匹配节点',
+          layout.treeRect.x + layout.treeRect.w / 2,
+          layout.treeRect.y + layout.treeRect.h / 2,
+          popup.textDisabled,
+          popup.fontSize,
+          popup.fontFamily,
+          'center',
+          'middle',
+        )
+        dl.popClip()
+      }
+    }
+  }
+
+  override onEscape(event: KeyboardEvent): boolean {
+    if (!this.visible) return false
+    event.preventDefault()
+    this.close()
+    return true
+  }
+
+  disposePopup(): void {
+    if (this._disposed) return
+    this._disposed = true
+    this._session += 1
+    this._revision += 1
+    runCleanupSteps([
+      () => this.close(),
+      () => this._teardownTree(),
+      () => this._searchInput.dispose(),
+      () => {
+        this._filteredRoots = []
+        this._resolveRoots = undefined
+        this._isCurrent = undefined
+        this._onSelect = undefined
+        this._onSearchTextChange = undefined
+        this._onClose = undefined
+      },
+    ])
+  }
+
+  protected override getPanelLayout(popupContext: PopupContext): PopupPanelLayout {
+    return this._layout(popupContext)
+  }
+
+  protected override onPopupClose(): void {
+    this._session += 1
+    this._revision += 1
+    const tree = this._tree
+    this._tree = null
+    if (tree && !this._searchText.trim()) this._captureExpandedKeys(tree)
+    this._filteredRoots = []
+    this._resolveRoots = undefined
+    this._isCurrent = undefined
+    this._onSelect = undefined
+    this._onSearchTextChange = undefined
+    const close = this._onClose
+    this._onClose = undefined
+    runCleanupSteps([
+      () => this._searchInput.endSession(),
+      () => tree?.dispose(),
+      () => close?.(),
+    ])
+  }
+
+  private _createTree(): RenderTreeView<T> {
+    const session = this._session
+    const select = (node: TreeNode<T>) => { if (session === this._session) this._select(node) }
+    const tree = new RenderTreeView<T>({
+      roots: this.filteredRoots,
+      focusMode: this._ownerInput ? 'owner' : 'self',
+      defaultExpandedKeys: this._defaultExpandedKeys(),
+      onSelect: select,
+      onActivate: select,
+      onExpand: (_node, _expanded) => {
+        if (session !== this._session) return
+        if (!this._searchText.trim()) this._captureExpandedKeys(tree)
+        PopupManager.instance.requestPaint()
+      },
+    })
+    tree.selectedKey = this._selectedValue
+    return tree
+  }
+
+  private _select(node: TreeNode<T>): void {
+    if (node.selectable === false || !this.visible || this._isCurrent?.() === false) return
+    const session = this._session
+    let accepted: boolean | void = true
+    runCleanupSteps([
+      () => { accepted = this._onSelect?.(node) },
+      () => {
+        if (!this.visible || session !== this._session) return
+        if (accepted === false) PopupManager.instance.requestPaint()
+        else this.close()
+      },
+    ])
+  }
+
+  private _syncTree(): void {
+    if (!this._tree) return
+    const navigation = this._ownerInput ? this._tree.navigationKey : null
+    this._tree.setRoots(this.filteredRoots)
+    this._tree.selectedKey = this._selectedValue
+    this._tree.expandedKeys = this._defaultExpandedKeys()
+    if (this._ownerInput) this._tree.setNavigationKey(navigation)
+  }
+
+  private _handleNavigationKey(event: KeyboardEvent): boolean {
+    if (!this.visible || event.defaultPrevented || event.isComposing || event.keyCode === 229 || this._searchInput.composing) return false
+    if (event.key === 'Tab') {
+      this.close()
+      return false
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      this.close()
+      return true
+    }
+    if (this._ownerInput) {
+      const handled = this._tree?.handleOwnedKeyDown(event) ?? false
+      if (handled || event.key === 'Enter') {
+        event.preventDefault()
+        PopupManager.instance.requestPaint()
+        return true
+      }
+      return false
+    }
+    if (!this._tree) return false
+    if (event.key === 'ArrowDown' ||
+      event.key === 'ArrowUp' ||
+      event.key === 'ArrowLeft' ||
+      event.key === 'ArrowRight' ||
+      event.key === 'Enter') {
+      event.preventDefault()
+      FocusManager.instance.setFocus(this._tree)
+      return this._tree.onKeyDown(event)
+    }
+    return false
+  }
+
+  private _syncTreeLayout(layout: DropTreeLayout, popupContext: PopupContext): void {
+    if (!this._tree) return
+    this._tree.offset = { x: layout.treeRect.x, y: layout.treeRect.y }
+    this._tree.layout({
+      minWidth: layout.treeRect.w,
+      maxWidth: layout.treeRect.w,
+      minHeight: layout.treeRect.h,
+      maxHeight: layout.treeRect.h,
+    }, false, { theme: popupContext.theme })
+  }
+
+  private _layout(popupContext: PopupContext): DropTreeLayout {
+    const popup = derivePopupStyle(popupContext.theme)
+    const input = deriveTextInputStyle(popupContext.theme)
+    const treeStyle = deriveTreeStyle(popupContext.theme)
+    const anchorRect = this._anchor
+      ? resolvePopupAnchorRect(this._anchor)
+      : { x: 0, y: 0, w: 240, h: input.height }
+    const viewportInset = 8
+    const panelW = Math.min(
+      Math.max(260, anchorRect.w),
+      popupContext.viewport.width - viewportInset * 2,
+    )
+    const rowHeight = treeStyle.fontSize + treeStyle.paddingH * 1.5
+    const visibleCount = Math.max(1, Math.min(this._maxVisibleItems, countVisibleTreeNodes(this.filteredRoots, this._tree?.expandedKeys ?? this._defaultExpandedKeys())))
+    const searchRect = this._searchable
+      ? {
+          x: 0,
+          y: 0,
+          w: panelW - popup.padding * 2,
+          h: input.height,
+        }
+      : null
+    const treeH = Math.max(rowHeight + 8, rowHeight * visibleCount)
+    const contentH = treeH + (searchRect ? searchRect.h + popup.padding : 0)
+    const panelH = popup.padding * 2 + contentH
+    const rawX = anchorRect.x
+    const rawY = anchorRect.y + anchorRect.h + 4
+    const panelRect = clampRectToPopupViewport({ x: rawX, y: rawY, width: panelW, height: panelH }, popupContext, viewportInset)
+    const panelX = panelRect.x
+    const panelY = panelRect.y
+    const searchLayout = searchRect
+      ? {
+          x: panelX + popup.padding,
+          y: panelY + popup.padding,
+          w: searchRect.w,
+          h: searchRect.h,
+        }
+      : null
+    const treeY = searchLayout ? searchLayout.y + searchLayout.h + popup.padding : panelY + popup.padding
+    return {
+      panelX,
+      panelY,
+      panelW,
+      panelH,
+      searchRect: searchLayout,
+      treeRect: {
+        x: panelX + popup.padding,
+        y: treeY,
+        w: panelW - popup.padding * 2,
+        h: treeH,
+      },
+    }
+  }
+
+  private _captureExpandedKeys(tree: RenderTreeView<T>): void {
+    this._expandedKeys = new Set(tree.expandedKeys)
+  }
+
+  private _defaultExpandedKeys(): string[] {
+    if (this._searchText.trim()) return collectExpandableNodeKeys(this.filteredRoots)
+    return Array.from(new Set([
+      ...this._expandedKeys,
+      ...collectAncestorKeys(this.filteredRoots, this._selectedValue),
+    ]))
+  }
+
+  private _teardownTree(): void {
+    if (!this._tree) return
+    if (!this._searchText.trim()) this._captureExpandedKeys(this._tree)
+    this._tree.dispose()
+    this._tree = null
+  }
+}
+
+export class RenderDropTreeEdit<T = any>
+  extends RenderBox
+  implements
+    InteractiveRenderObject,
+    Focusable,
+    GestureArenaMember,
+    PopupAnchorTarget,
+    ValueEditor<string, DropTreeEditValueChangeReason, TreeNode<T> | null> {
+  private _roots: TreeNode<T>[]
+  private _value: string
+  placeholder: string
+  onChange?: (value: string, node: TreeNode<T> | null) => void
+  private _searchable: boolean
+  maxVisibleItems: number
+  private _readonly: boolean
+  private _disabled: boolean
+  private _status: FormFieldStatus
+  private _helperText: string
+  private _prefixText: string
+  private _suffixText: string
+  private _clearable: boolean
+  expandAllOnOpen: boolean
+  expandedKeysOnOpen?: readonly string[] | DropTreeEditExpandedKeysResolver<T>
+  queryTextBuilder?: DropTreeEditQueryTextBuilder<T>
+  queryProcessor?: DropTreeEditQueryProcessor<T>
+  private _focusRegistered = false
+
+  private _focused = false
+  private _hovered = false
+  private _popup = new DropTreePopup<T>()
+  private _disposed = false
+  private _textActivationKey = Symbol('drop-tree-text')
+  private readonly _selectionGesture = new PendingPointerGesture()
+  private _dragStart?: Offset
+  private _dragPosition?: Offset
+  private _dragging = false
+  readonly preventsPointerActivationOnAccept = true
+  onDoubleClick?: (position: Offset) => void
+  private readonly _textInput = new TextInputController({ onInvalidate: () => this.markNeedsPaint() })
+  private readonly _singleLineInput = new SingleLineTextInput({
+    controller: this._textInput,
+    getDisplayText: () => this._displayText(),
+    measureText: text => this._measureText(text),
+    getViewportWidth: () => this._triggerLayout().valueRect.w,
+    getTextOrigin: () => ({ x: this._triggerLayout().valueRect.x, y: this.globalOffset.y + 4 }),
+  })
+  private readonly _editSession = new TextEditSession({
+    controller: this._textInput,
+    isActive: () => this._focused && this._textInput.hasSession && !this._disposed,
+    syncSelectionFromComposer: opts => this._textInput.syncSelectionFromComposer(opts),
+    scrollToCursor: () => this._singleLineInput.scrollToCursor(),
+    updateComposerPosition: () => this._singleLineInput.updateComposerPosition(),
+    invalidate: () => this.markNeedsPaint(),
+  })
+  private _popupSession = 0
+  private _queryCancellation = 0
+  private _queryText = ''
+  private _showQueryInField = false
+  private readonly _valueEditorEvents = new ValueEditorEventEmitter<
+    string,
+    DropTreeEditValueChangeReason,
+    TreeNode<T> | null
+  >()
+
+  constructor(options: {
+    roots: TreeNode<T>[]
+    value?: string
+    placeholder?: string
+    onChange?: (value: string, node: TreeNode<T> | null) => void
+    searchable?: boolean
+    maxVisibleItems?: number
+    readonly?: boolean
+    disabled?: boolean
+    status?: FormFieldStatus
+    helperText?: string
+    prefixText?: string
+    suffixText?: string
+    clearable?: boolean
+    expandAllOnOpen?: boolean
+    expandedKeysOnOpen?: readonly string[] | DropTreeEditExpandedKeysResolver<T>
+    queryTextBuilder?: DropTreeEditQueryTextBuilder<T>
+    queryProcessor?: DropTreeEditQueryProcessor<T>
+  }) {
+    super()
+    this._roots = options.roots
+    this._value = options.value ?? ''
+    this.placeholder = options.placeholder ?? '请选择...'
+    this.onChange = options.onChange
+    this._searchable = options.searchable ?? true
+    if (this._searchable) this.onDoubleClick = position => this._selectWord(position)
+    this.maxVisibleItems = options.maxVisibleItems ?? 8
+    this._readonly = options.readonly ?? false
+    this._disabled = options.disabled ?? false
+    this._status = options.status ?? 'default'
+    this._helperText = options.helperText ?? ''
+    this._prefixText = options.prefixText ?? ''
+    this._suffixText = options.suffixText ?? ''
+    this._clearable = options.clearable ?? false
+    this.expandAllOnOpen = options.expandAllOnOpen ?? false
+    this.expandedKeysOnOpen = options.expandedKeysOnOpen
+    this.queryTextBuilder = options.queryTextBuilder
+    this.queryProcessor = options.queryProcessor
+    this._syncFocusRegistration()
+  }
+
+  get searchable(): boolean { return this._searchable }
+  set searchable(searchable: boolean) {
+    if (this._searchable === searchable) return
+    this._searchable = searchable
+    this._invalidateTextActivation()
+    this.onDoubleClick = searchable ? position => this._selectWord(position) : undefined
+    this._popup.close()
+    this._editSession.end()
+    this._resetQueryPresentation()
+    this._startInputSession()
+    this.markNeedsPaint()
+  }
+
+  get roots(): TreeNode<T>[] { return this._roots }
+  set roots(roots: TreeNode<T>[]) {
+    if (roots === this._roots) return
+    this._roots = roots
+    this.refreshTree()
+  }
+
+  refreshTree(): void {
+    this._popup.pruneExpandedKeys(collectExpandableNodeKeys(this.roots))
+    this._popup.refresh()
+    this._syncCommittedInput()
+    this.markNeedsPaint()
+  }
+
+  get value(): string { return this._value }
+  set value(value: string) {
+    const nextValue = String(value ?? '')
+    if (this._value === nextValue) return
+    this._value = nextValue
+    if (this._popup.visible) this._popup.selectedValue = nextValue
+    this._syncCommittedInput()
+    this.markNeedsPaint()
+  }
+
+  getValue(): string {
+    return this.value
+  }
+
+  setValue(value: string): void {
+    const nextValue = String(value ?? '')
+    if (this.value === nextValue) return
+    this._popup.close()
+    this._resetQueryPresentation()
+    this.value = nextValue
+  }
+
+  subscribeValueChange(
+    listener: ValueEditorValueChangeListener<
+      string,
+      DropTreeEditValueChangeReason,
+      TreeNode<T> | null
+    >,
+  ): DisposeFn {
+    return this._valueEditorEvents.subscribeValueChange(listener)
+  }
+
+  subscribeBlur(listener: () => void): DisposeFn {
+    return this._valueEditorEvents.subscribeBlur(listener)
+  }
+
+  get disabled(): boolean { return this._disabled }
+  set disabled(disabled: boolean) {
+    if (this._disabled === disabled) return
+    this._disabled = disabled
+    if (disabled) {
+      runCleanupSteps([
+        () => { this._hovered = false },
+        () => this._endLogicalFocusSession(),
+        () => this._resetQueryPresentation(),
+        () => this._syncFocusRegistration(),
+        () => this.markNeedsPaint(),
+      ])
+      return
+    }
+    this._syncFocusRegistration()
+    this.markNeedsPaint()
+  }
+
+  get status(): FormFieldStatus { return this._status }
+  set status(status: FormFieldStatus) {
+    if (this._status === status) return
+    this._status = status
+    this.markNeedsPaint()
+  }
+
+  get helperText(): string { return this._helperText }
+  set helperText(helperText: string) {
+    if (this._helperText === helperText) return
+    this._helperText = helperText
+    this.markNeedsLayout()
+    this.markNeedsPaint()
+  }
+
+  get prefixText(): string { return this._prefixText }
+  set prefixText(prefixText: string) {
+    if (this._prefixText === prefixText) return
+    this._prefixText = prefixText
+    this.markNeedsPaint()
+  }
+
+  get suffixText(): string { return this._suffixText }
+  set suffixText(suffixText: string) {
+    if (this._suffixText === suffixText) return
+    this._suffixText = suffixText
+    this.markNeedsPaint()
+  }
+
+  get clearable(): boolean { return this._clearable }
+  set clearable(clearable: boolean) {
+    if (this._clearable === clearable) return
+    this._clearable = clearable
+    this.markNeedsPaint()
+  }
+
+  get readonly(): boolean { return this._readonly }
+  set readonly(readonly: boolean) {
+    if (this._readonly === readonly) return
+    this._readonly = readonly
+    if (readonly) {
+      runCleanupSteps([
+        () => { this._hovered = false },
+        () => this._endLogicalFocusSession(),
+        () => this._resetQueryPresentation(),
+        () => this._syncFocusRegistration(),
+        () => this.markNeedsPaint(),
+      ])
+      return
+    }
+    this._syncFocusRegistration()
+    this.markNeedsPaint()
+  }
+
+  visitChildren(_visitor: (child: RenderObject) => void): void {}
+
+  get isFocused(): boolean { return this._focused || this._popup.visible }
+
+  focusIn(): void {
+    if (this.disabled || this.readonly || this._disposed) return
+    if (this._focused) return
+    this._focused = true
+    this._startInputSession()
+    this.markNeedsPaint()
+  }
+
+  focusOut(): void {
+    if (!this._focused) return
+    if (!this.searchable) {
+      const movingIntoOwnedPopup = this._popup.visible
+      this._focused = false
+      this.markNeedsPaint()
+      if (!movingIntoOwnedPopup) this._valueEditorEvents.emitBlur()
+      return
+    }
+    this._focused = false
+    this._invalidateTextActivation()
+    runCleanupSteps([
+      () => this._editSession.end(),
+      () => this._resetSelectionGesture(),
+      () => this._popup.close(),
+      () => this._resetQueryPresentation(),
+      () => this.markNeedsPaint(),
+      () => this._valueEditorEvents.emitBlur(),
+    ])
+  }
+
+  private _endLogicalFocusSession(): void {
+    const wasFocused = this.isFocused
+    this._focused = false
+    this._invalidateTextActivation()
+    runCleanupSteps([
+      () => this._editSession.end(),
+      () => this._resetSelectionGesture(),
+      () => this._popup.close(),
+      () => this._resetQueryPresentation(),
+      () => this.markNeedsPaint(),
+      () => { if (wasFocused) this._valueEditorEvents.emitBlur() },
+    ])
+  }
+
+  requestFocus(): void {
+    if (this.disabled || this.readonly || typeof window === 'undefined') return
+    FocusManager.instance.setFocus(this)
+  }
+
+  blur(): void {
+    this._invalidateTextActivation()
+    this._popup.close()
+    this._resetQueryPresentation()
+    if (typeof window === 'undefined') {
+      this.focusOut()
+      return
+    }
+    FocusManager.instance.clearFocusOf(this)
+  }
+
+  [GET_POPUP_ANCHOR_RECT](): { x: number; y: number; width: number; height: number } {
+    const g = this.globalOffset
+    return { x: g.x, y: g.y, width: this.size.width, height: this._inputStyle().height }
+  }
+
+  performLayout(constraints: BoxConstraints, context: LayoutContext): void {
+    const inputStyle = deriveTextInputStyle(context.theme)
+    this.size = {
+      width: constraints.maxWidth === Infinity ? 220 : constraints.maxWidth,
+      height: measureFormFieldHeight(inputStyle, inputStyle.height, this.helperText),
+    }
+    if (this._focused && this._textInput.hasSession) this._editSession.refresh({ invalidate: false })
+  }
+
+  performPaint(context: PaintContext, offset: Offset): void {
+    const dl = new DrawList(context)
+    const { x, y } = offset
+    const { width: w } = this.size
+    const input = deriveTextInputStyle(context.theme)
+    const dropdown = deriveDropdownStyle(context.theme)
+    const readonlyVisual = this.readonly && !this.disabled
+    const shell = paintTriggerFieldShell(context, offset, w, {
+      focused: readonlyVisual ? false : this._popup.visible || this._focused,
+      hovered: readonlyVisual ? false : this._hovered,
+      disabled: this.disabled,
+      status: this.status,
+      helperText: this.helperText,
+      prefixText: this.prefixText,
+      suffixText: this.suffixText,
+      showClearButton: this._showClearButton(),
+      reserveTrailingWidth: dropdown.fontSize,
+    })
+    const fieldHeight = shell.fieldHeight
+    if (readonlyVisual) {
+      const readonlyTint = blendColor(
+        resolveBgColor(input.inputBg, 'normal'),
+        input.placeholderText,
+        0.06,
+      )
+      dl.fillRect(offset.x + 1, offset.y + 1, Math.max(0, w - 2), Math.max(0, fieldHeight - 2), readonlyTint, Math.max(0, input.borderRadius - 1))
+    }
+    const displayText = this._displayText()
+    const showingPlaceholder = displayText.length === 0 && (!this._selectedNode() || this._showQueryInField)
+    const textColor = this.disabled
+      ? input.textDisabled
+      : showingPlaceholder
+        ? input.placeholderText
+        : resolveTextColor(dropdown.itemText, 'normal')
+    const text = showingPlaceholder ? this.placeholder : displayText
+    dl.pushClip(shell.valueRect.x, y, shell.valueRect.w, fieldHeight)
+    if (this.searchable && this._focused && this._textInput.hasSession) {
+      paintSingleLineEditableText({
+        dl,
+        controller: this._textInput,
+        displayText,
+        measureText: value => this._measureText(value),
+        fontSize: dropdown.fontSize,
+        fontFamily: dropdown.fontFamily,
+        textX: shell.valueRect.x - this._textInput.scrollX,
+        textY: y + fieldHeight / 2,
+        lineTop: y + 4,
+        lineBottom: y + fieldHeight - 4,
+        textColor,
+        selectionBg: input.selectionBg,
+        caretColor: input.caretColor,
+        compositionTextColor: input.compositionText,
+        compositionUnderlineColor: input.focusedBorder,
+        placeholder: showingPlaceholder ? this.placeholder : undefined,
+        placeholderColor: input.placeholderText,
+      })
+    } else paintSingleLineText(dl, {
+      text,
+      x: shell.valueRect.x,
+      y: y + fieldHeight / 2,
+      maxWidth: shell.valueRect.w,
+      color: textColor,
+      fontSize: dropdown.fontSize,
+      fontFamily: dropdown.fontFamily,
+    })
+    dl.popClip()
+
+    const arrowX = (shell.trailingRect?.x ?? (x + w - input.padding - dropdown.fontSize)) + dropdown.fontSize / 2
+    const arrowY = y + fieldHeight / 2
+    const arrowColor = this.disabled
+      ? input.textDisabled
+      : readonlyVisual
+        ? input.placeholderText
+        : resolveTextColor(dropdown.arrowText, this._popup.visible || this._focused ? 'selected' : 'normal')
+    if (readonlyVisual) {
+      paintIconGlyph(context, {
+        name: 'lock',
+        x: arrowX - dropdown.fontSize / 2,
+        y: arrowY - dropdown.fontSize / 2,
+        size: dropdown.fontSize,
+        color: arrowColor,
+      })
+    } else {
+      const ctx = context.ctx
+      ctx.save()
+      ctx.fillStyle = `rgba(${arrowColor.r},${arrowColor.g},${arrowColor.b},${arrowColor.a})`
+      ctx.beginPath()
+      const ar = dropdown.fontSize * 0.3
+      if (this._popup.visible) {
+        ctx.moveTo(arrowX, arrowY - ar)
+        ctx.lineTo(arrowX - ar, arrowY + ar)
+        ctx.lineTo(arrowX + ar, arrowY + ar)
+      } else {
+        ctx.moveTo(arrowX, arrowY + ar)
+        ctx.lineTo(arrowX - ar, arrowY - ar)
+        ctx.lineTo(arrowX + ar, arrowY - ar)
+      }
+      ctx.closePath()
+      ctx.fill()
+      ctx.restore()
+    }
+  }
+
+  onPointerDown(e: PointerEvent): void {
+    if (this._selectionGesture.hasOwner && !this._selectionGesture.owns(e)) return
+    if (!isPrimaryPointerButton(e)) return
+    if (this.disabled || this.readonly || this._disposed || !this._hitField(e.position)) return
+    const layout = this._triggerLayout()
+    if (pointInFormFieldRect(layout.clearRect, e.position)) {
+      this._clearValue()
+      return
+    }
+    if (!this.searchable) {
+      if (this._popup.visible) this._popup.close()
+      else {
+        FocusManager.instance.setFocus(this)
+        this._openPopup()
+      }
+      return
+    }
+    const wasFocused = this._focused
+    FocusManager.instance.setFocus(this)
+    if (!this._focused || this._disposed || this.disabled || this.readonly) return
+    this._startInputSession()
+    this._editSession.focusComposer()
+    if (pointInFormFieldRect(layout.trailingRect, e.position)) {
+      if (this._popup.visible) this._popup.close()
+      else this._openPopup()
+      return
+    }
+    this._popup.clearNavigation()
+    if (!this._popup.visible) this._openPopup()
+    if (!this._focused || this._disposed || this.disabled || this.readonly) return
+    if (wasFocused) this._singleLineInput.setSelectionFromGlobal(e.position.x, { syncComposer: true })
+    this._dragStart = e.position
+    this._dragPosition = e.position
+    if (e.joinGestureArena) this._selectionGesture.begin(e, this)
+    else {
+      this._selectionGesture.captureImmediately(e)
+      this._dragging = true
+    }
+    this._editSession.refresh({ resetBlink: true })
+  }
+
+  onKeyDown(event: KeyboardEvent): boolean {
+    if (event.defaultPrevented || this.disabled || this.readonly || this._disposed || this._isComposingKey(event)) return false
+    if (this.searchable) {
+      if (event.key === 'Tab') {
+        this._popup.close()
+        this._resetQueryPresentation()
+        return false
+      }
+      const navigationKey = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'Escape'].includes(event.key)
+      if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || !navigationKey) {
+        this._popup.clearNavigation()
+        return false
+      }
+      if (!this._popup.visible && ['ArrowDown', 'ArrowUp', 'Enter'].includes(event.key)) {
+        try {
+          this._openPopup()
+          if (event.key !== 'Enter' && this.searchable && this._popup.visible) {
+            PopupManager.instance.withContextFor(this._popup, () => this._popup.onKeyDown(event))
+          }
+        } finally {
+          event.preventDefault()
+        }
+        return true
+      }
+      if (this._popup.visible) return PopupManager.instance.withContextFor(this._popup, () => this._popup.onKeyDown(event))
+      return false
+    }
+    if (event.key === 'Escape' && this._popup.visible) {
+      event.preventDefault()
+      this._popup.close()
+      return true
+    }
+    if (event.key === 'Tab' && this._popup.visible) {
+      this._popup.close()
+      return false
+    }
+    if (this._popup.visible) return false
+    if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
+      event.preventDefault()
+      this._openPopup('', false)
+      return true
+    }
+    if ((event.key === 'Backspace' || event.key === 'Delete') && this._showClearButton()) {
+      event.preventDefault()
+      this._clearValue()
+      return true
+    }
+    return false
+  }
+
+  onPointerMove(e: PointerEvent): void {
+    if (this._selectionGesture.hasOwner && !this._selectionGesture.owns(e)) return
+    const wasHovered = this._hovered
+    this._hovered = !this.disabled && !this.readonly && this._hitField(e.position)
+    if (wasHovered !== this._hovered) this.markNeedsPaint()
+    this._dragPosition = e.position
+    if (this._selectionGesture.isPending && this._dragStart) {
+      const dx = e.position.x - this._dragStart.x
+      const dy = e.position.y - this._dragStart.y
+      if (Math.max(Math.abs(dx), Math.abs(dy)) >= 5) {
+        this._selectionGesture.resolve(Math.abs(dx) >= Math.abs(dy) ? 'accepted' : 'rejected')
+      }
+    }
+    if (this._dragging && this._focused) {
+      this._singleLineInput.setSelectionFromGlobal(e.position.x, { extend: true, syncComposer: true })
+      this._editSession.refresh({ resetBlink: true })
+    }
+  }
+
+  acceptGesture(pointerId: number, pointerType: 'mouse' | 'touch' | 'pen' = 'mouse'): void {
+    if (!this._selectionGesture.accept(pointerId, pointerType)) return
+    this._dragging = true
+    if (this._dragPosition) {
+      this._singleLineInput.setSelectionFromGlobal(this._dragPosition.x, { extend: true, syncComposer: true })
+      this._editSession.refresh({ resetBlink: true })
+    }
+  }
+
+  rejectGesture(pointerId: number, pointerType: 'mouse' | 'touch' | 'pen' = 'mouse'): void {
+    if (!this._selectionGesture.reject(pointerId, pointerType)) return
+    this._dragging = false
+    this._dragStart = undefined
+    this._dragPosition = undefined
+  }
+
+  onPointerUp(e: PointerEvent): void {
+    if (this._selectionGesture.hasOwner && !this._selectionGesture.owns(e)) return
+    this._resetSelectionGesture()
+  }
+
+  onPointerCancel(e: PointerEvent): void {
+    if (this._selectionGesture.hasOwner && !this._selectionGesture.owns(e)) return
+    this._invalidateTextActivation()
+    this._resetSelectionGesture()
+    this._hovered = false
+    this.markNeedsPaint()
+  }
+
+  private _resetSelectionGesture(): void {
+    this._selectionGesture.resolveTerminal('rejected', () => {
+      this._dragging = false
+      this._dragStart = undefined
+      this._dragPosition = undefined
+    })
+  }
+
+  onPointerLeave(_e: PointerEvent): void {
+    if (!this._hovered) return
+    this._hovered = false
+    this.markNeedsPaint()
+  }
+
+  override detach(): void {
+    runCleanupSteps([() => this.blur(), () => super.detach()])
+  }
+
+  protected override onVisibilityChanged(visible: boolean): void {
+    if (!visible) this.blur()
+  }
+
+  dispose(): void {
+    if (this._disposed) return
+    this._disposed = true
+    this._queryText = ''
+    this._showQueryInField = false
+    this._invalidateTextActivation()
+    runCleanupSteps([
+      () => this._resetSelectionGesture(),
+      () => this._textInput.dispose(),
+      () => this._valueEditorEvents.dispose(),
+      () => this._popup.disposePopup(),
+      () => {
+        if (this._focusRegistered && typeof window !== 'undefined') {
+          FocusManager.instance.unregister(this)
+          this._focusRegistered = false
+        }
+        this._focused = false
+        this._hovered = false
+      },
+      () => super.dispose(),
+    ])
+  }
+
+  debugState(): DropTreeEditDebugState {
+    return {
+      popupVisible: this._popup.visible,
+      queryText: this._queryText,
+      showQueryInField: this._showQueryInField,
+      displayText: this._displayText(),
+      focused: this._focused,
+      disabled: this.disabled,
+      readonly: this.readonly,
+      value: this.value,
+      filteredCount: this._debugFilteredCount(),
+      expandedKeys: this._popup.expandedKeys,
+    }
+  }
+
+  private _openPopup(
+    initialQuery = this._showQueryInField ? this._queryText : '',
+    showQueryInField = this._showQueryInField,
+  ): void {
+    if (this.disabled || this.readonly || this._disposed || this._popup.visible) return
+    this._queryText = initialQuery
+    this._showQueryInField = showQueryInField
+    const session = ++this._popupSession
+    const cancellation = this._queryCancellation
+    const ownerInput = this.searchable
+    const current = () => session === this._popupSession && cancellation === this._queryCancellation &&
+      ownerInput === this.searchable && !this._disposed && this.visible &&
+      !this.disabled && !this.readonly && (!ownerInput || this._focused)
+    this._popup.open({
+      anchor: this as PopupAnchorTarget,
+      selectedValue: this.value,
+      searchable: false,
+      ownerInput,
+      isCurrent: current,
+      maxVisibleItems: this.maxVisibleItems,
+      initialQuery,
+      openExpandedKeys: this._openExpandedKeys(),
+      resolveRoots: query => this._resolveQueryRoots(query),
+      onSelect: node => {
+        if (!current()) return false
+        const previousValue = this.value
+        this.value = node.key
+        this._popup.close()
+        this._resetQueryPresentation()
+        this._emitValueChange(node.key, previousValue, node, 'selection')
+        return false
+      },
+      onClose: () => {
+        if (session !== this._popupSession) return
+        this._popupSession += 1
+        this._resetQueryPresentation()
+        this.markNeedsPaint()
+      },
+    })
+    this.markNeedsPaint()
+  }
+
+  private _resolveQueryRoots(query: string): TreeNode<T>[] {
+    const processor = this.queryProcessor ?? defaultDropTreeEditQueryProcessor<T>(this.queryTextBuilder)
+    return processor({
+      query,
+      roots: this.roots,
+      selectedValue: this.value,
+    })
+  }
+
+  private _openExpandedKeys(): string[] | undefined {
+    const valid = new Set(collectExpandableNodeKeys(this.roots))
+    if (this.expandAllOnOpen) return [...valid]
+    const configured = typeof this.expandedKeysOnOpen === 'function'
+      ? this.expandedKeysOnOpen({ roots: this.roots, selectedValue: this.value })
+      : this.expandedKeysOnOpen
+    if (!configured) return undefined
+    return [...new Set([...configured, ...collectAncestorKeys(this.roots, this.value)])].filter(key => valid.has(key))
+  }
+
+  private _selectedNode(): TreeNode<T> | null {
+    return findTreeNodeByKey(this.roots, this.value)
+  }
+
+  private _displayText(): string {
+    if (this._textInput.composing) return this._textInput.composerValue
+    if (this._showQueryInField) return this._queryText
+    return this._selectedNode()?.label ?? ''
+  }
+
+  private _resetQueryPresentation(): void {
+    // Cancellation can happen before the popup is visible, when close() alone is a no-op.
+    this._queryCancellation += 1
+    this._queryText = ''
+    this._showQueryInField = false
+    this._resetSelectionGesture()
+    if (this._textInput.composing) {
+      // Ending a composition retires its native carrier, isolating delayed IME events.
+      this._editSession.end()
+      this._textInput.setScrollX(0)
+      this._startInputSession()
+      return
+    }
+    if (this._focused && this._textInput.hasSession && !this._disposed) {
+      const text = this._selectedLabel()
+      this._textInput.setComposerValue(text)
+      this._textInput.setSelection(0, text.length, { syncComposer: true })
+      this._textInput.setScrollX(0)
+      this._editSession.refresh()
+    }
+  }
+
+  private _syncCommittedInput(): void {
+    if (this._showQueryInField || !this._focused || !this._textInput.hasSession || this._textInput.composing) return
+    const label = this._selectedLabel()
+    const previousText = this._textInput.composerValue
+    if (previousText === label) return
+    this._textInput.syncSelectionFromComposer()
+    const all = this._textInput.selStart === 0 && this._textInput.selEnd === previousText.length
+    const range = normalizeUtf16ScalarRange(label, {
+      start: Math.min(this._textInput.selStart, label.length),
+      end: all ? label.length : Math.min(this._textInput.selEnd, label.length),
+    })
+    const cursor = all || this._textInput.cursorPos >= range.end ? range.end : range.start
+    this._textInput.setComposerValue(label)
+    this._textInput.setSelection(range.start, range.end, { cursorPos: cursor, syncComposer: true })
+    this._editSession.refresh({ resetBlink: true })
+  }
+
+  private _debugFilteredCount(): number {
+    return this._popup.visible ? this._popup.filteredCount : countTreeNodes(this.roots)
+  }
+
+  private _showClearButton(): boolean {
+    return this.clearable && !this.disabled && !this.readonly && this.value.length > 0
+  }
+
+  private _clearValue(): void {
+    if (!this._showClearButton()) return
+    const previousValue = this.value
+    this._popup.close()
+    this._resetQueryPresentation()
+    FocusManager.instance.setFocus(this)
+    this.value = ''
+    this._emitValueChange('', previousValue, null, 'clear')
+    this.markNeedsPaint()
+  }
+
+  private _emitValueChange(
+    value: string,
+    previousValue: string,
+    node: TreeNode<T> | null,
+    reason: DropTreeEditValueChangeReason,
+  ): void {
+    runCleanupSteps([
+      () => this.onChange?.(value, node),
+      () => {
+        if (value === previousValue) return
+        this._valueEditorEvents.emitValueChange({
+          value,
+          previousValue,
+          reason,
+          detail: node,
+        })
+      },
+    ])
+  }
+
+  private _triggerLayout() {
+    const style = this._inputStyle()
+    return layoutFormFieldInlineContent(style, this.globalOffset, this.size.width, style.height, {
+      prefixText: this.prefixText,
+      suffixText: this.suffixText,
+      showClearButton: this._showClearButton(),
+      reserveTrailingWidth: deriveDropdownStyle(this.currentTheme).fontSize,
+    })
+  }
+
+  private _syncFocusRegistration(): void {
+    if (typeof window === 'undefined') return
+    if (this.disabled || this.readonly) {
+      if (this._focusRegistered) {
+        FocusManager.instance.unregister(this)
+        this._focusRegistered = false
+      }
+      return
+    }
+    if (!this._focusRegistered) {
+      FocusManager.instance.register(this)
+      this._focusRegistered = true
+    }
+  }
+
+  private _hitField(position: Offset): boolean {
+    const g = this.globalOffset
+    const fieldHeight = this._inputStyle().height
+    return position.x >= g.x &&
+      position.x <= g.x + this.size.width &&
+      position.y >= g.y &&
+      position.y <= g.y + fieldHeight
+  }
+
+  private _selectedLabel(): string {
+    return this._selectedNode()?.label ?? ''
+  }
+
+  private _measureText(text: string): number {
+    const style = deriveDropdownStyle(this.currentTheme)
+    return TextMeasurer.measureWidth(text, style.fontSize, style.fontFamily)
+  }
+
+  private _startInputSession(): void {
+    if (!this.searchable || !this._focused || this.disabled || this.readonly || this._disposed || this._textInput.hasSession) return
+    const text = this._displayText()
+    this._editSession.start({
+      initialValue: text,
+      initialSelection: { start: 0, end: text.length, syncComposer: true },
+      refreshOnStart: true,
+      onInput: (value, session) => {
+        if (this._textInput.composing) return
+        this._applyQuery(value)
+        session.refresh({ syncSelectionFromComposer: true, resetBlink: true })
+      },
+      onCompositionStart: () => this._popup.clearNavigation(),
+      onCompositionUpdate: (_text, session) => session.refresh({ resetBlink: true }),
+      onCompositionEnd: (value, session) => {
+        this._applyQuery(value)
+        session.refresh({ syncSelectionFromComposer: true, resetBlink: true })
+      },
+      onKeyDown: (event, session) => {
+        if (event.defaultPrevented || this._isComposingKey(event)) return
+        if (this.onKeyDown(event)) return
+        session.defer(() => {}, { syncSelectionFromComposer: true, resetBlink: true })
+      },
+    })
+  }
+
+  shouldIgnoreKeyDown(event: KeyboardEvent): boolean {
+    return this.searchable && this._isComposingKey(event)
+  }
+
+  private _isComposingKey(event: KeyboardEvent): boolean {
+    return event.isComposing || event.keyCode === 229 || event.key === 'Process' || this._textInput.composing
+  }
+
+  private _applyQuery(value: string): void {
+    if (!this.searchable || !this._focused || this.disabled || this.readonly || this._disposed) return
+    this._queryText = value
+    this._showQueryInField = true
+    if (this._popup.visible) this._popup.setQuery(value)
+    else this._openPopup(value, true)
+    this.markNeedsPaint()
+  }
+
+  private _selectWord(position: Offset): void {
+    if (!this.searchable || this.disabled || this.readonly || this._disposed || !this._hitField(position)) return
+    if (!pointInFormFieldRect(this._triggerLayout().valueRect, position)) return
+    this.requestFocus()
+    this._resetSelectionGesture()
+    this._singleLineInput.selectWordFromGlobal(position.x, { text: this._displayText(), syncComposer: true })
+    this._editSession.refresh({ resetBlink: true })
+  }
+
+  private _invalidateTextActivation(): void {
+    this._textActivationKey = Symbol('drop-tree-text')
+  }
+
+  override hitTestPath(point: Offset, result: HitTestResult): boolean {
+    if (!this.searchable) return super.hitTestPath(point, result)
+    const path = new HitTestResult()
+    if (!super.hitTestPath(point, path)) return false
+    const layout = this._triggerLayout()
+    const text = this._hitField(point) && pointInFormFieldRect(layout.valueRect, point) &&
+      !pointInFormFieldRect(layout.clearRect, point) && !pointInFormFieldRect(layout.trailingRect, point)
+    for (const entry of path.path) result.add(entry.target === this ? { ...entry, key: text ? this._textActivationKey : 'drop-tree-field' } : entry)
+    return true
+  }
+
+  private _inputStyle(): ReturnType<typeof deriveTextInputStyle> {
+    return deriveTextInputStyle(this.currentTheme)
+  }
+}
+
+export function defaultDropTreeEditQueryProcessor<T = any>(
+  queryTextBuilder?: DropTreeEditQueryTextBuilder<T>,
+): DropTreeEditQueryProcessor<T> {
+  const builder = queryTextBuilder ?? defaultDropTreeQueryTextBuilder
+  return ({ query, roots }) => {
+    const normalizedQuery = normalizeTreeLookupQuery(query)
+    if (!normalizedQuery) return [...roots]
+    const filtered: TreeNode<T>[] = []
+    for (const node of roots) {
+      const next = filterTreeNode(node, normalizedQuery, builder)
+      if (next) filtered.push(next)
+    }
+    return filtered
+  }
+}
+
+function defaultDropTreeQueryTextBuilder<T>(node: TreeNode<T>): string[] {
+  return [node.key, node.label]
+}
+
+function normalizeTreeLookupQuery(value: unknown): string {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function filterTreeNode<T>(
+  node: TreeNode<T>,
+  query: string,
+  textBuilder: DropTreeEditQueryTextBuilder<T>,
+): TreeNode<T> | null {
+  const texts = textBuilder(node).map(item => normalizeTreeLookupQuery(item))
+  const selfMatch = texts.some(text => text.includes(query))
+  const nextChildren = (node.children ?? []).flatMap(child => {
+    const next = filterTreeNode(child, query, textBuilder)
+    return next ? [next] : []
+  })
+  if (!selfMatch && nextChildren.length === 0) return null
+  return nextChildren.length > 0 ? { ...node, children: nextChildren } : { ...node, children: undefined }
+}
+
+function findTreeNodeByKey<T>(roots: readonly TreeNode<T>[], key: string): TreeNode<T> | null {
+  if (!key) return null
+  for (const node of roots) {
+    if (node.key === key) return node
+    const child = node.children ? findTreeNodeByKey(node.children, key) : null
+    if (child) return child
+  }
+  return null
+}
+
+function collectExpandableNodeKeys<T>(roots: readonly TreeNode<T>[]): string[] {
+  const keys: string[] = []
+  const visit = (nodes: readonly TreeNode<T>[]) => {
+    for (const node of nodes) {
+      if (node.children && node.children.length > 0) {
+        keys.push(node.key)
+        visit(node.children)
+      }
+    }
+  }
+  visit(roots)
+  return keys
+}
+
+function collectAncestorKeys<T>(roots: readonly TreeNode<T>[], key: string): string[] {
+  if (!key) return []
+  const path: string[] = []
+  const visit = (nodes: readonly TreeNode<T>[], ancestors: string[]): boolean => {
+    for (const node of nodes) {
+      if (node.key === key) {
+        path.push(...ancestors)
+        return true
+      }
+      if (node.children && node.children.length > 0) {
+        if (visit(node.children, [...ancestors, node.key])) return true
+      }
+    }
+    return false
+  }
+  visit(roots, [])
+  return path
+}
+
+function countVisibleTreeNodes<T>(roots: readonly TreeNode<T>[], expandedKeys: readonly string[]): number {
+  const expanded = new Set(expandedKeys)
+  let count = 0
+  const visit = (nodes: readonly TreeNode<T>[]) => {
+    for (const node of nodes) {
+      count += 1
+      if (node.children && node.children.length > 0 && expanded.has(node.key)) visit(node.children)
+    }
+  }
+  visit(roots)
+  return count
+}
+
+function countTreeNodes<T>(roots: readonly TreeNode<T>[]): number {
+  let count = 0
+  const visit = (nodes: readonly TreeNode<T>[]) => {
+    for (const node of nodes) {
+      count += 1
+      if (node.children && node.children.length > 0) visit(node.children)
+    }
+  }
+  visit(roots)
+  return count
+}
