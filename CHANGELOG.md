@@ -14,6 +14,29 @@ For earlier releases, see [GitHub Releases](https://github.com/BunnyWay/bunny-st
 
 ## [Unreleased]
 
+### Added
+
+- Resume positions can now be migrated across devices. `exportResumePositions`
+  emits the public `PlaybackPosition[]` shape on both platforms, and
+  `importResumePositions` merges by `videoId` (newer `timestamp` wins), skips
+  invalid entries while still importing the valid remainder, and drops expired
+  entries (seven-day default). On Android imported entries are translated to the
+  SDK's `position`/`duration` fields before reaching the native module.
+- `useResumePosition` accepts `isReady` (set it from `onReady`) so a restored
+  position is only seeked once the player can accept it, and exposes
+  `savePosition(positionMs, durationMs, { manual: true })` for unthrottled
+  user-initiated saves.
+
+### Fixed
+
+- iOS: restoring a resume position no longer seeks before the player is ready,
+  nor after the video was switched or the component unmounted.
+- iOS: auto-saves are throttled by `saveIntervalMs` while manual saves are not.
+- After `clearAllPositions`/`clearPosition`, a later auto-save no longer
+  recreates the cleared progress entry.
+- Expired resume positions are consistently hidden from list, export, import,
+  and restore paths.
+
 ## [1.1.1] - 2026-11-05
 
 ### Added

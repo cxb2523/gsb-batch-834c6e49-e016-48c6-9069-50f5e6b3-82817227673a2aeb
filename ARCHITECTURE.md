@@ -62,7 +62,11 @@ type surface.
 - **Resume positions are platform-split.** Android persists natively
   (SharedPreferences via TurboModule). iOS returns empty stubs — the JS
   AsyncStorage fallback (`player/hooks/resumeStorage.ts`) owns persistence and
-  the public wrapper never calls the iOS native methods.
+  the public wrapper never calls the iOS native methods. Both paths share one
+  contract in `player/resumePositions.ts`: the public `PlaybackPosition` shape,
+  merge-by-`videoId` (newest `timestamp` wins), per-entry validation, and
+  seven-day expiry applied on import, list, and restore. Restores only seek
+  once `isReady` is true and never after a video switch or unmount.
 - **Platform asymmetry is intentional.** Android-only features (e.g. `useNativeTvPlayer`
   / `net.bunny:tv`) and iOS-only behaviors are documented in the source JSDoc
   of the owning file — mirror that pattern when adding platform-gated APIs.

@@ -140,6 +140,9 @@ export function PlayerScreen({ navigation, route }: PlayerScreenProps) {
     videoTitle: videoMeta?.title,
     config: resumeSettings.enabled ? toResumeConfig(resumeSettings) : undefined,
     storage: !isAndroid && resumeSettings.enabled ? AsyncStorage : undefined,
+    // Seek only after the native player reported onReady — a seek issued
+    // before the engine is ready is dropped by the SDK.
+    isReady: state.playbackState === 'ready' || state.playbackState === 'playing',
     onPositionAvailable: (pos) => {
       setResumePosition(pos);
       return false;

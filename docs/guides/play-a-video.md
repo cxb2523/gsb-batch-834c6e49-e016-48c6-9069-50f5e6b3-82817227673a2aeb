@@ -127,6 +127,7 @@ import {
   useResumePosition,
 } from '@bunny.net/stream-react-native';
 import type { ResumePositionStorage } from '@bunny.net/stream-react-native';
+import { useState } from 'react';
 
 export function ResumableVideo({
   videoId,
@@ -136,7 +137,14 @@ export function ResumableVideo({
   storage: ResumePositionStorage;
 }) {
   const player = useBunnyStreamPlayer(undefined, videoId);
-  const resume = useResumePosition({ videoId, playerRef: player.ref, storage });
+  const [ready, setReady] = useState(false);
+  const resume = useResumePosition({
+    videoId,
+    playerRef: player.ref,
+    storage,
+    // Restores seek only once the native player is ready.
+    isReady: ready,
+  });
 
   return (
     <BunnyStreamPlayer
@@ -145,9 +153,14 @@ export function ResumableVideo({
       resumeConfig={{ enableAutoSave: true }}
       style={{ width: '100%', aspectRatio: 16 / 9 }}
       {...player.eventHandlers}
+      onReady={(event) => {
+        player.eventHandlers.onReady(event);
+        setReady(true);
+      }}
       onProgress={(event) => {
         player.eventHandlers.onProgress(event);
         const { positionMs, durationMs } = event.nativeEvent;
+        // Auto-save: throttled by `saveIntervalMs`.
         void resume.savePosition(positionMs, durationMs).catch(console.warn);
       }}
     />
@@ -156,8 +169,21 @@ export function ResumableVideo({
 ```
 
 The JS persistence hook is a no-op on Android. It defaults to seven-day retention, a 30-second
-minimum position, a 5% resume threshold, and a 95% near-end threshold. Remount this screen when
-switching videos so its stored-position state belongs to one video.
+minimum position, a 5% resume threshold, and a 95% near-end threshold.
+
+- **Restore timing.** Pass `isReady` (flip it on `onReady`) so a restored position is only seeked
+  once the engine can accept it. A restore that resolves after the video switched or the component
+  unmounted is discarded — it never seeks the previous video.
+- **Auto vs manual saves.** `savePosition(positionMs, durationMs)` is an auto-save: it is throttled
+  to once per `saveIntervalMs` and respects `enableAutoSave`. Pass `{ manual: true }` for a
+  user-initiated save, which is never throttled.
+- **Clearing then playing.** After `clearPosition`/`clearAllPositions`, a later auto-save from the
+  still-playing video is suppressed; a manual save resumes tracking.
+- **Cross-device migration.** `exportResumePositions` emits the public `PlaybackPosition[]` shape on
+  both platforms; `importResumePositions` merges by `videoId` (newer `timestamp` wins), skips invalid
+  entries while still importing the valid remainder, and drops expired ones. On Android the entries
+  are translated to the SDK's `position`/`duration` fields before reaching the native module.
+
 Use `clearResumePosition`, `getAllResumePositions`, and the other
 [resume helpers](../../src/player/resumePositions.ts) for a resume library; pass storage on iOS.
 

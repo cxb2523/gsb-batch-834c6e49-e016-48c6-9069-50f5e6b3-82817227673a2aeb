@@ -81,8 +81,8 @@ describe('resume position management', () => {
     setPlatform('android');
     mockNativePlayer.getAllSavedPositions.mockResolvedValueOnce(
       JSON.stringify([
-        { ...samplePosition, timestamp: 100 },
-        { ...samplePosition, videoId: 'v2', timestamp: 200 },
+        { ...samplePosition, timestamp: Date.now() - 1000 },
+        { ...samplePosition, videoId: 'v2', timestamp: Date.now() },
       ]),
     );
     const positions = await getAllResumePositions();
@@ -180,6 +180,261 @@ describe('resume position management', () => {
     expect(await getAllResumePositions()).toEqual([]);
     expect(await exportResumePositions()).toBe('[]');
     expect(await importResumePositions('[]')).toBe(false);
+  });
+});
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+describe('resume position migration (iOS storage)', () => {
+  const originalPlatform = Platform.OS;
+
+  afterEach(() => {
+    Object.defineProperty(Platform, 'OS', { value: originalPlatform, configurable: true });
+    jest.clearAllMocks();
+  });
+
+  function setPlatform(os: 'ios' | 'android') {
+    Object.defineProperty(Platform, 'OS', { value: os, configurable: true });
+  }
+
+  it('imports exported positions and keeps the newest timestamp per videoId', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    // Fresh local save for v1.
+    const newer: PlaybackPosition = {
+      videoId: 'v1',
+      positionMs: 90_000,
+      durationMs: 120_000,
+      watchPercentage: 0.75,
+      timestamp: Date.now(),
+    };
+    await storage.setItem('@bunny_resume_positions:v1', JSON.stringify(newer));
+
+    // Export from another device (payload has an older v1 plus a fresh v2).
+    const older: PlaybackPosition = { ...newer, positionMs: 10_000, timestamp: Date.now() - 5000 };
+    const other: PlaybackPosition = {
+      videoId: 'v2',
+      positionMs: 30_000,
+      durationMs: 60_000,
+      watchPercentage: 0.5,
+      timestamp: Date.now() - 1000,
+    };
+    const ok = await importResumePositions(JSON.stringify([older, other]), storage);
+    expect(ok).toBe(true);
+
+    const stored = await getAllResumePositions(storage);
+    expect(stored.map((p) => p.videoId).sort()).toEqual(['v1', 'v2']);
+    // The fresher local v1 wins over the stale imported one.
+    expect(stored.find((p) => p.videoId === 'v1')?.positionMs).toBe(90_000);
+  });
+
+  it('accepts a newer imported entry over a stale local one', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    const stale: PlaybackPosition = {
+      videoId: 'v1',
+      positionMs: 20_000,
+      durationMs: 120_000,
+      watchPercentage: 0.16,
+      timestamp: Date.now() - 2 * DAY_MS,
+    };
+    await storage.setItem('@bunny_resume_positions:v1', JSON.stringify(stale));
+
+    const fresh: PlaybackPosition = { ...stale, positionMs: 80_000, timestamp: Date.now() };
+    expect(await importResumePositions(JSON.stringify([fresh]), storage)).toBe(true);
+
+    const stored = await getAllResumePositions(storage);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.positionMs).toBe(80_000);
+  });
+
+  it('keeps only the newest entry when a payload repeats a videoId', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    const now = Date.now();
+    const older: PlaybackPosition = {
+      videoId: 'v1',
+      positionMs: 10_000,
+      durationMs: 120_000,
+      watchPercentage: 0.08,
+      timestamp: now - 60_000,
+    };
+    const newer: PlaybackPosition = { ...older, positionMs: 70_000, timestamp: now };
+    expect(await importResumePositions(JSON.stringify([older, newer, older]), storage)).toBe(true);
+
+    const stored = await getAllResumePositions(storage);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.positionMs).toBe(70_000);
+  });
+
+  it('drops invalid entries but imports the valid remainder and returns true', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    const valid: PlaybackPosition = {
+      videoId: 'v1',
+      positionMs: 45_000,
+      durationMs: 120_000,
+      watchPercentage: 0.375,
+      timestamp: Date.now(),
+    };
+    const payload = [
+      valid,
+      { ...valid, videoId: 'v2', positionMs: -1 }, // negative position
+      { ...valid, videoId: '' }, // empty id
+      { ...valid, videoId: 'v4', positionMs: 'x' }, // wrong type
+      { ...valid, videoId: 'v5', timestamp: 0 }, // invalid timestamp
+      null,
+      'nope',
+    ];
+    expect(await importResumePositions(JSON.stringify(payload), storage)).toBe(true);
+
+    const stored = await getAllResumePositions(storage);
+    expect(stored.map((p) => p.videoId)).toEqual(['v1']);
+    expect(stored[0]).toEqual(valid);
+  });
+
+  it('never stores or lists expired entries on import or list', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    const expired: PlaybackPosition = {
+      videoId: 'old',
+      positionMs: 40_000,
+      durationMs: 100_000,
+      watchPercentage: 0.4,
+      timestamp: Date.now() - 10 * DAY_MS,
+    };
+    expect(await importResumePositions(JSON.stringify([expired]), storage)).toBe(true);
+    // Expired entry is not written.
+    expect(storage.store.size).toBe(0);
+
+    // A directly-written expired entry is hidden from the list.
+    await storage.setItem('@bunny_resume_positions:old', JSON.stringify(expired));
+    expect(await getAllResumePositions(storage)).toEqual([]);
+    expect(JSON.parse(await exportResumePositions(storage))).toEqual([]);
+  });
+
+  it('normalizes exports to the public PlaybackPosition shape', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    // Stored payload carrying extra fields that are not part of the public shape.
+    await storage.setItem(
+      '@bunny_resume_positions:v1',
+      JSON.stringify({
+        videoId: 'v1',
+        positionMs: 30_000,
+        durationMs: 90_000,
+        timestamp: Date.now(),
+        extraField: 'ignored',
+      }),
+    );
+    const exported = JSON.parse(await exportResumePositions(storage)) as PlaybackPosition[];
+    expect(exported).toHaveLength(1);
+    expect(exported[0]).toMatchObject({
+      videoId: 'v1',
+      positionMs: 30_000,
+      durationMs: 90_000,
+      watchPercentage: 30_000 / 90_000,
+    });
+    expect(exported[0]).not.toHaveProperty('extraField');
+  });
+
+  it('does not import legacy SDK-shaped (position/duration) entries', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    const ok = await importResumePositions(
+      JSON.stringify([{ videoId: 'v1', position: 30_000, duration: 90_000, timestamp: Date.now() }]),
+      storage,
+    );
+    // Array payload → succeeds, but the non-public shape is rejected.
+    expect(ok).toBe(true);
+    expect(storage.store.size).toBe(0);
+  });
+
+  it('rejects non-array import payloads without touching storage', async () => {
+    setPlatform('ios');
+    const storage = makeMemoryStorage();
+    expect(await importResumePositions('not-json', storage)).toBe(false);
+    expect(await importResumePositions('{"videoId":"v1"}', storage)).toBe(false);
+    expect(storage.store.size).toBe(0);
+  });
+});
+
+describe('resume position migration (Android native)', () => {
+  const originalPlatform = Platform.OS;
+
+  afterEach(() => {
+    Object.defineProperty(Platform, 'OS', { value: originalPlatform, configurable: true });
+    jest.clearAllMocks();
+  });
+
+  function setPlatform(os: 'ios' | 'android') {
+    Object.defineProperty(Platform, 'OS', { value: os, configurable: true });
+  }
+
+  it('translates valid entries to SDK fields, drops invalid/expired ones, returns true', async () => {
+    setPlatform('android');
+    const now = Date.now();
+    const payload = [
+      { videoId: 'v1', positionMs: 30_000, durationMs: 90_000, timestamp: now, videoTitle: 'A' },
+      { videoId: 'v2', positionMs: -5, durationMs: 90_000, timestamp: now },
+      { videoId: '', positionMs: 10_000, durationMs: 90_000, timestamp: now },
+      { videoId: 'v4', positionMs: 10_000, durationMs: 90_000, timestamp: now - 10 * DAY_MS },
+      { videoId: 'v5', positionMs: 5_000, timestamp: now }, // missing duration
+    ];
+    const existing: PlaybackPosition[] = [
+      { videoId: 'v1', positionMs: 5_000, durationMs: 90_000, watchPercentage: 0.05, timestamp: now - 1000 },
+    ];
+    mockNativePlayer.getAllSavedPositions.mockResolvedValueOnce(JSON.stringify(existing));
+
+    expect(await importResumePositions(JSON.stringify(payload))).toBe(true);
+
+    const sent = JSON.parse(
+      mockNativePlayer.importPositions.mock.calls[0]?.[0] as string,
+    ) as Array<Record<string, unknown>>;
+    // Only the valid v1 remains; the imported (newer) v1 wins and is translated.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      videoId: 'v1',
+      position: 30_000,
+      duration: 90_000,
+      videoTitle: 'A',
+    });
+    expect(sent[0]).not.toHaveProperty('positionMs');
+  });
+
+  it('keeps a fresher local position over a stale import', async () => {
+    setPlatform('android');
+    const now = Date.now();
+    const existing: PlaybackPosition = {
+      videoId: 'v1',
+      positionMs: 80_000,
+      durationMs: 90_000,
+      watchPercentage: 0.88,
+      timestamp: now,
+    };
+    mockNativePlayer.getAllSavedPositions.mockResolvedValueOnce(JSON.stringify([existing]));
+
+    await importResumePositions(
+      JSON.stringify([{ videoId: 'v1', positionMs: 10_000, durationMs: 90_000, timestamp: now - 5000 }]),
+    );
+    const sent = JSON.parse(
+      mockNativePlayer.importPositions.mock.calls[0]?.[0] as string,
+    ) as Array<Record<string, unknown>>;
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ videoId: 'v1', position: 80_000 });
+  });
+
+  it('hides expired entries from the Android list', async () => {
+    setPlatform('android');
+    const now = Date.now();
+    mockNativePlayer.getAllSavedPositions.mockResolvedValueOnce(
+      JSON.stringify([
+        { videoId: 'fresh', positionMs: 10_000, durationMs: 90_000, timestamp: now },
+        { videoId: 'stale', positionMs: 10_000, durationMs: 90_000, timestamp: now - 10 * DAY_MS },
+      ]),
+    );
+    const positions = await getAllResumePositions();
+    expect(positions.map((p) => p.videoId)).toEqual(['fresh']);
   });
 });
 

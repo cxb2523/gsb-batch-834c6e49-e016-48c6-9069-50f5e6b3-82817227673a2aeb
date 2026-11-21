@@ -305,7 +305,9 @@ import {
 } from '@bunny.net/stream-react-native';
 ```
 
-Android: `resumeConfig` prop on the player enables native auto-save. iOS: use `useResumePosition(videoId, options)` and pass `onResumePositionAvailable`/seek yourself.
+Android: `resumeConfig` prop on the player enables native auto-save. iOS: use `useResumePosition(videoId, options)` and pass `onResumePositionAvailable`/seek yourself. Pass `isReady` (from `onReady`) so restores seek only when the player can accept it, and `{ manual: true }` to `savePosition` for unthrottled user saves.
+
+`exportResumePositions`/`importResumePositions` migrate progress across devices: both use the public `PlaybackPosition` shape, import merges by `videoId` (newest `timestamp` wins), skips invalid entries, and drops entries older than the retention window (7 days default).
 
 ### `BunnyImage` — CDN thumbnails
 
