@@ -1,0 +1,39 @@
+{
+  "name": "jplayer-audiocheck",
+  "version": "3.2.0",
+  "description": "jPlayer Skin",
+  "keywords": [],
+  "homepage": "https://github.com/lukemcdonald/jplayer-skin-audiocheck/",
+  "bugs": {
+    "url": "https://github.com/lukemcdonald/jplayer-skin-audiocheck/issues"
+  },
+  "license": "MIT",
+  "author": "Luke McDonald (https://lukemcdonald.com/)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukemcdonald/jplayer-skin-audiocheck.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "deploy": "gh-pages -d dist",
+    "dev": "vite",
+    "predeploy": "npm run build",
+    "prepare": "lefthook install",
+    "preview": "vite preview",
+    "start": "npm run dev",
+    "style": "ultracite check",
+    "style:fix": "ultracite fix",
+    "style:fix:unsafe": "ultracite fix --unsafe"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.0",
+    "gh-pages": "^6.3.0",
+    "lefthook": "^2.1.9",
+    "oxfmt": "^0.52.0",
+    "oxlint": "^1.67.0",
+    "tailwindcss": "^4.3.0",
+    "ultracite": "^7.8.1",
+    "vite": "^8.0.16"
+  }
+}
