@@ -8,6 +8,9 @@ export default defineConfig({
     test: {
         projects: [
             {
+                resolve: {
+                    alias: [{ find: /^@react-av\/([\w-]+)$/, replacement: packageSources }],
+                },
                 test: {
                     name: "unit",
                     environment: "node",

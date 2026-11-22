@@ -1,7 +1,6 @@
 if (globalThis.document) {
 
 const template = document.createElement("template");
-
 template.innerHTML = `
 <style>
 vtt-region {
@@ -133,6 +132,7 @@ vtt-cue-root.bg_black {
 `;
 class TextTrackContainer extends HTMLElement {
     #hostStyles: HTMLStyleElement;
+    #trackStyleElements: HTMLStyleElement[] = [];
     constructor() {
         super();
         this.attachShadow({ mode: "open" });
@@ -148,6 +148,37 @@ class TextTrackContainer extends HTMLElement {
         this.#hostStyles.textContent = `:host {
     --vtt-view-height: ${viewHeight}px;
 }`;
+    }
+
+    /**
+     * Replace all track STYLE blocks with the given CSS text.
+     *
+     * Previously injected style elements are removed before the new ones are
+     * appended, so re-parsing the same file or switching subtitle sources can
+     * never accumulate duplicate style nodes. Pass an empty list to clear.
+     */
+    setTrackStyles(stylesheets: string[]) {
+        for (const style of this.#trackStyleElements) {
+            style.remove();
+        }
+        this.#trackStyleElements = [];
+        for (const cssText of stylesheets) {
+            const style = document.createElement('style');
+            style.setAttribute('data-vtt-stylesheet', '');
+            style.textContent = cssText;
+            this.shadowRoot!.appendChild(style);
+            this.#trackStyleElements.push(style);
+        }
+    }
+
+    /** Remove every STYLE block injected by `setTrackStyles`. */
+    clearTrackStyles() {
+        this.setTrackStyles([]);
+    }
+
+    /** True when the container still holds injected track STYLE blocks. */
+    get hasTrackStyles() {
+        return this.#trackStyleElements.length > 0;
     }
 
     attributeChangedCallback() {

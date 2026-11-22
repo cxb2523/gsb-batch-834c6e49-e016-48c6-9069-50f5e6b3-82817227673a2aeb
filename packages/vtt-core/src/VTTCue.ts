@@ -127,9 +127,10 @@ export default class VTTCue implements VTTCue {
             return root;
         }
         else if (element instanceof WebVTTVoice) {
-            const root = document.createElement('span');
+            const root = document.createElement('v');
             this.#internalNodeApplyDOMStyle(root, element);
-            root.setAttribute('title', element.value);
+            if (element.value)
+                root.setAttribute('title', element.value);
             for (const child of element.children) {
                 root.appendChild(this.#parseCueTextToDOMTree(child));
             }
@@ -138,7 +139,8 @@ export default class VTTCue implements VTTCue {
         else if (element instanceof WebVTTLanguage) {
             const root = document.createElement('span');
             this.#internalNodeApplyDOMStyle(root, element);
-            root.setAttribute('lang', element.lang);
+            if (element.lang)
+                root.setAttribute('lang', element.lang);
             for (const child of element.children) {
                 root.appendChild(this.#parseCueTextToDOMTree(child));
             }

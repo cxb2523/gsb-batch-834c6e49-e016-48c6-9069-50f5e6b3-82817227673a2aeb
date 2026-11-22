@@ -1,5 +1,7 @@
 import { getCueContext } from "./GlobalState";
 import { TextTrackCue } from "./VTTCue";
+import VTTRegion from "./VTTRegion";
+import VTTStylesheet from "./VTTStylesheet";
 
 export type TextTrackKind = "subtitles" |  "captions" |  "descriptions" |  "chapters" | "metadata";
 export type TextTrackMode = "disabled" | "hidden" | "showing";
@@ -48,6 +50,15 @@ export default class TextTrack extends EventTarget {
         return this.#regions;
     }
 
+    #stylesheets: VTTStylesheet[] = [];
+    /**
+     * The STYLE blocks associated with this track, in document order.
+     * XXX: this is non-standard (the standard TextTrack does not expose stylesheets).
+     */
+    get _stylesheets() {
+        return [...this.#stylesheets];
+    }
+
     addCue(cue: TextTrackCue) {
         if (this.#cues) {
             if (this.#cues.includes(cue)) {
@@ -80,6 +91,10 @@ export default class TextTrack extends EventTarget {
         if (index > -1) {
             this.#regions.splice(index, 1);
         }
+    }
+
+    _addStylesheet(stylesheet: VTTStylesheet) {
+        this.#stylesheets.push(stylesheet);
     }
 
     constructor(kind: TextTrackKind, mode?: TextTrackMode, label?: string, language?: string, id?: string, isBandMetadataTrackDispatchType?: boolean, regions?: VTTRegion[]) {

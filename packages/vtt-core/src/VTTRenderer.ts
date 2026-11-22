@@ -5,7 +5,12 @@ import VTTRegion from "./VTTRegion";
 
 // custom elements
 import './renderer/TextTrackContainer';
-import './renderer/TextTrackContainer';
+
+interface TrackStyleContainer extends HTMLElement {
+    setTrackStyles(stylesheets: string[]): void;
+    clearTrackStyles(): void;
+    readonly hasTrackStyles: boolean;
+}
 
 const uiContainers = new Map<HTMLVideoElement, HTMLDivElement>();
 const didShowUI = new Set<HTMLVideoElement>();
@@ -16,6 +21,24 @@ export function addUIContainer(video: HTMLVideoElement, container: HTMLDivElemen
 
 export function removeUIContainer(video: HTMLVideoElement) {
     uiContainers.delete(video);
+}
+
+/**
+ * Tear down everything the renderer injected around a media element.
+ *
+ * Removes the custom text track container (including its shadow DOM style
+ * nodes for the track STYLE blocks) from the media element's parent. Safe to
+ * call when no container exists. Used on deinit and when subtitle sources are
+ * switched so no style or region DOM survives the previous source.
+ */
+export function WebVTTClearTextTracksDisplay(video: HTMLVideoElement) {
+    const container = video.parentElement;
+    if (!container) return;
+    const textTrackContainer = container.querySelector('vtt-texttrackcontainer') as TrackStyleContainer | null;
+    if (!textTrackContainer) return;
+    textTrackContainer.clearTrackStyles();
+    textTrackContainer.remove();
+    didShowUI.delete(video);
 }
 
 /**
@@ -35,9 +58,9 @@ export default function WebVTTUpdateTextTracksDisplay(
     // TODO: maybe add a fallback for when the video element is not in a container
     if (!container) return;
     container.style.position = "relative";
-    let textTrackContainer = container.querySelector('vtt-texttrackcontainer') as HTMLElement | null;
+    let textTrackContainer = container.querySelector('vtt-texttrackcontainer') as TrackStyleContainer | null;
     if (!textTrackContainer) {
-        textTrackContainer = document.createElement('vtt-texttrackcontainer');
+        textTrackContainer = document.createElement('vtt-texttrackcontainer') as TrackStyleContainer;
         textTrackContainer.style.position = 'absolute';
         textTrackContainer.style.pointerEvents = 'none';
         container.append(textTrackContainer);
@@ -61,6 +84,13 @@ export default function WebVTTUpdateTextTracksDisplay(
     // XXX: since this is a JavaScript implementation and we do not have direct access to the layout engine, we will use divs as CSS boxes as described in the spec.
     // XXX: we directly append to textTrackContainer, so we don't need to keep track of output
     textTrackContainer.innerHTML = '';
+    // Inject the STYLE blocks of every showing track. The custom element replaces
+    // its previous style nodes rather than appending, so repeated updates and
+    // re-parses never accumulate duplicate styles; an empty list clears them.
+    const trackStylesheets = getContext(video)?.tracks
+        .filter(track => track.mode === 'showing')
+        .flatMap(track => track._stylesheets.map(stylesheet => stylesheet.cssText)) ?? [];
+    textTrackContainer.setTrackStyles(trackStylesheets);
     // 4. If the user agent is exposing a user interface for video, add to output one or more completely transparent positioned CSS block boxes that cover the same region as the user interface.
     if (ui) {
         const region = ui.getBoundingClientRect();
@@ -119,6 +149,10 @@ export default function WebVTTUpdateTextTracksDisplay(
             let top = (regionNode.viewportAnchorY / 100 - topOffset) * viewHeight;
             // 2. Apply the terms of the CSS specifications to regionNode within the following constraints, thus obtaining a CSS box box positioned relative to an initial containing block:
             const box = document.createElement('vtt-region');
+            if (regionNode.id !== "")
+                box.setAttribute('region', regionNode.id);
+            if (regionNode.scroll === "up")
+                box.setAttribute('scroll', 'up');
             box.style.width = `${width}px`;
             box.style.maxHeight = `${lines}px`;
             box.style.left = `${left}px`;
@@ -534,7 +568,9 @@ function constructDOMFromNodes(element: WebVTTNode): Node {
     }
     else if (element instanceof WebVTTVoice) {
         const root = document.createElement('v');
-        root.setAttribute('title', element.value);
+        applyClassList(root, element);
+        if (element.value)
+            root.setAttribute('title', element.value);
         for (const child of element.children) {
             root.appendChild(constructDOMFromNodes(child));
         }
@@ -542,7 +578,9 @@ function constructDOMFromNodes(element: WebVTTNode): Node {
     }
     else if (element instanceof WebVTTLanguage) {
         const root = document.createElement('span');
-        root.setAttribute('lang', element.lang);
+        applyClassList(root, element);
+        if (element.lang)
+            root.setAttribute('lang', element.lang);
         for (const child of element.children) {
             root.appendChild(constructDOMFromNodes(child));
         }

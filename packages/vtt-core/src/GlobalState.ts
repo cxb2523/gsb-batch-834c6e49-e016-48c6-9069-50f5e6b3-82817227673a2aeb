@@ -2,7 +2,7 @@
 
 import TextTrack from "./TextTrack";
 import { TextTrackCue } from "./VTTCue";
-import WebVTTUpdateTextTracksDisplay from "./VTTRenderer";
+import WebVTTUpdateTextTracksDisplay, { WebVTTClearTextTracksDisplay } from "./VTTRenderer";
 
 export type TextTrackChangedCallback = (element: HTMLMediaElement, track?: TextTrack) => void;
 export type TextTrackUpdateRule = (element: HTMLMediaElement, affectedTracks: TextTrack[]) => void;
@@ -79,6 +79,11 @@ export function init(element: HTMLMediaElement) {
 
 export function deinit(element: HTMLMediaElement) {
     observer?.unobserve(element);
+    // Remove any style/region DOM injected for this element before dropping its
+    // context, so unmounts and subtitle source switches leave no residue.
+    if (element.nodeName === "VIDEO") {
+        WebVTTClearTextTracksDisplay(element as HTMLVideoElement);
+    }
     trackContext.delete(element);
 }
 

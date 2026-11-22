@@ -63,6 +63,9 @@ export class Track {
             for (const region of parser.regions) {
                 this.#track._addRegion(region);
             }
+            for (const stylesheet of parser.stylesheets) {
+                this.#track._addStylesheet(stylesheet);
+            }
             this.#readyState = Track.LOADED;
         } catch (e) {
             console.error(e);

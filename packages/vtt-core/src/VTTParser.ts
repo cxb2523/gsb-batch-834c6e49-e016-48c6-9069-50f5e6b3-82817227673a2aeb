@@ -1,6 +1,7 @@
 import TextTrack, { TextTrackKind } from './TextTrack';
 import TextTrackCue from './VTTCue';
 import VTTRegion from './VTTRegion';
+import VTTStylesheet from './VTTStylesheet';
 
 export default class VTTParser {
     // 2. Let position be a pointer into input, initially pointing at the start of the string.
@@ -9,7 +10,7 @@ export default class VTTParser {
     // 3. Let seen cue be false.
     #seenCue: boolean = false;
     #cues: TextTrackCue[] = [];
-    #stylesheets: any[] = [];
+    #stylesheets: VTTStylesheet[] = [];
     // 13. Let regions be an empty text track list of regions.
     #regions: VTTRegion[] = [];
 
@@ -26,6 +27,14 @@ export default class VTTParser {
         return [...this.#cues];
     }
 
+    /**
+     * The STYLE blocks collected from the file, in document order.
+     * The returned list and the stylesheets themselves are read-only.
+     */
+    get stylesheets() {
+        return [...this.#stylesheets];
+    }
+
     textTrack(kind: TextTrackKind, language?: string, label?: string , id?: string): TextTrack {
         // TODO: Implement this correctly
         const textTrack = new TextTrack(kind, "hidden", label, language, id);
@@ -35,6 +44,9 @@ export default class VTTParser {
         }
         for (const region of this.#regions) {
             textTrack._addRegion(region);
+        }
+        for (const stylesheet of this.#stylesheets) {
+            textTrack._addStylesheet(stylesheet);
         }
         return textTrack;
     }
@@ -86,7 +98,7 @@ export default class VTTParser {
         // 8. Let cue be null.
         let cue: TextTrackCue | null = null;
         // 9. Let stylesheet be null.
-        let stylesheet = null;
+        let stylesheet: VTTStylesheet | null = null;
         // 10. Let region be null.
         let region: VTTRegion | null = null;
         // 11. Loop: Run these substeps in a loop:
@@ -135,7 +147,10 @@ export default class VTTParser {
                 if (!inHeader && lineCount === 2) {
                     // 1. If seen cue is false and buffer starts with the substring "STYLE" (U+0053 LATIN CAPITAL LETTER S, U+0054 LATIN CAPITAL LETTER T, U+0059 LATIN CAPITAL LETTER Y, U+004C LATIN CAPITAL LETTER L, U+0045 LATIN CAPITAL LETTER E), and the remaining characters in buffer (if any) are all ASCII whitespace, then run these substeps:
                     if (!this.#seenCue && buffer.startsWith("STYLE") && buffer.substring(5).trim() === "") {
-                        // TODO: stylesheet implementation
+                        // 1. Stylesheet creation: Let stylesheet be a new CSS style sheet.
+                        stylesheet = new VTTStylesheet("");
+                        // 8. Let buffer be the empty string.
+                        buffer = "";
                     }
                     // 2. Otherwise, if seen cue is false and buffer starts with the substring "REGION" (U+0052 LATIN CAPITAL LETTER R, U+0045 LATIN CAPITAL LETTER E, U+0047 LATIN CAPITAL LETTER G, U+0049 LATIN CAPITAL LETTER I, U+004F LATIN CAPITAL LETTER O, U+004E LATIN CAPITAL LETTER N), and the remaining characters in buffer (if any) are all ASCII whitespace, then run these substeps:
                     else if (!this.#seenCue && buffer.startsWith("REGION") && buffer.substring(6).trim() === "") {
@@ -160,7 +175,9 @@ export default class VTTParser {
             cue.text = buffer;
         // 13. Otherwise, if stylesheet is not null, then Parse a stylesheet from buffer. If it returned a list of rules, assign the list as stylesheet’s CSS rules; otherwise, set stylesheet’s CSS rules to an empty list. [CSSOM] [CSS-SYNTAX-3] Finally, return stylesheet.
         else if (stylesheet !== null) {
-            // TODO: stylesheet implementation
+            // The raw CSS text is retained verbatim; rule extraction happens
+            // lazily through the read-only VTTStylesheet.cssRules accessor.
+            stylesheet = new VTTStylesheet(buffer);
         }
         // 14. Otherwise, if region is not null, then collect WebVTT region settings from buffer using region for the results. Construct a WebVTT Region Object from region, and return it.
         else if (region !== null) {
@@ -337,8 +354,18 @@ export default class VTTParser {
     #parseCueSettings(input: string, regions: VTTRegion[], cue: TextTrackCue) {
         // 1. Let settings be the result of splitting input on spaces.
         const settings = input.split(" ");
+        // A cue only drops out of its region when it is explicitly positioned
+        // (line), explicitly sized below 100%, or made vertical. The spec applies
+        // these resets immediately, but region settings that appear later in the
+        // list must be able to re-bind the cue, so the reset is performed at the
+        // start of the following setting rather than unconditionally at the end.
+        let regionDropPending = false;
         // 2. For each token setting in the list settings, run the following substeps:
         for (const setting of settings) {
+            if (regionDropPending) {
+                cue.region = null;
+                regionDropPending = false;
+            }
             // 1. If setting does not contain a U+003A COLON character (:), or if the first U+003A COLON character (:) in setting is either the first or last character of setting, then jump to the step labeled next setting.
             if (!setting.includes(":") || setting.indexOf(":") === 0 || setting.indexOf(":") === setting.length - 1) {
                 continue;
@@ -368,7 +395,7 @@ export default class VTTParser {
                     
                     // 3. If cue’s WebVTT cue writing direction is not horizontal, let cue’s WebVTT cue region be null (there are no vertical regions).
                     if (cue.vertical !== "")
-                        cue.region = null;
+                        regionDropPending = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "line"
@@ -433,8 +460,9 @@ export default class VTTParser {
                     // 10. If the last character in linepos is a U+0025 PERCENT SIGN character (%), then let cue’s WebVTT cue snap-to-lines flag be false. Otherwise, let it be true.
                     cue.snapToLines = linepos.charAt(linepos.length - 1) !== "%";
                     // 11. If cue’s WebVTT cue line is not auto, let cue’s WebVTT cue region be null (the cue has been explicitly positioned with a line offset and thus drops out of the region).
-                    // XXX: this makes no sense, we're always setting the region to null because we always set the line to a number
-                    cue.region = null;
+                    // A valid line setting was parsed (all failure paths `continue` above), so the
+                    // cue has an explicit line offset and drops out of its region.
+                    regionDropPending = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "position"
@@ -477,17 +505,22 @@ export default class VTTParser {
                     cue.size = number;
                     // 3. If cue’s WebVTT cue size is not 100, let cue’s WebVTT cue region be null (the cue has been explicitly sized and thus drops out of the region).
                     if (cue.size !== 100)
-                        cue.region = null;
+                        regionDropPending = true;
                 }
                 break;
                 // - If name is a case-sensitive match for "align"
                 case "align":
                 {
-                    if ((["start", "end", "center", "end", "left", "right"]).includes(value)) 
+                    if ((["start", "end", "center", "end", "left", "right"]).includes(value))
                         cue.align = value as AlignSetting;
                 }
                 break;
             }
+        }
+        // Apply a region drop requested by the final setting (line/size/vertical),
+        // when no subsequent region setting re-binds the cue.
+        if (regionDropPending) {
+            cue.region = null;
         }
     }
 
