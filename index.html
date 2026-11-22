@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Senku Ultimate Autoplay - Улучшение плеера</title>
+
+    <!-- Мета-теги для Discord, Telegram, VK, Facebook (Open Graph) -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://haqweti.github.io/auto-play-anime-senku/">
+    <meta property="og:title" content="Senku Ultimate Autoplay v3.5.0">
+    <meta property="og:description" content="Полный контроль скоростью, громкостью и очередью аниме на senku.one. Надёжный автопереход между сериями.">
+    <meta property="og:image" content="https://haqweti.github.io/auto-play-anime-senku/banner.png">
+
+    <!-- Мета-теги специально для Twitter / X -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Senku Ultimate Autoplay v3.5.0">
+    <meta name="twitter:description" content="Полный контроль скоростью, громкостью и очередью аниме на senku.one.">
+    <meta name="twitter:image" content="https://haqweti.github.io/auto-play-anime-senku/banner.png">
+
+    <!-- Дополнительные мета-теги для SEO -->
+    <meta name="description" content="Senku Ultimate Autoplay - Userscript для senku.one с автопереходом, управлением очередью и синхронизацией звука.">
+    <meta name="keywords" content="senku.one, userscript, tampermonkey, автопереход, аниме, плеер">
+    <meta name="theme-color" content="#ff3b47">
+
+    <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --accent: #ff3b47;
+            --bg: #0a0a0a;
+            --card-bg: rgba(22, 22, 22, 0.6);
+            --card-border: rgba(255,255,255,0.08);
+            --text-main: #ffffff;
+            --text-muted: rgba(255, 255, 255, 0.6);
+            --radius: 16px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: 'Unbounded', sans-serif;
+            background-color: var(--bg);
+            color: var(--text-main);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 40px 20px;
+            overflow-x: hidden;
+            line-height: 1.5;
+            position: relative;
+        }
+
+        /* --- ФОНОВОЕ ИЗОБРАЖЕНИЕ С ЗАТЕМНЕНИЕМ --- */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: -1;
+            background-image: url('https://preview.redd.it/lain-linux-desktop-lets-all-love-lain-p-v0-tv4xj2jf4slc1.png?width=1080&crop=smart&auto=webp&s=1fc998a02a6cc49726b94105bf1a893304b39c1d');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            filter: blur(5px) brightness(0.3);
+            transform: scale(1.05);
+            animation: fadeInBg 2s ease-out forwards;
+        }
+        body::after {
+            content: '';
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: -1;
+            background: linear-gradient(180deg, rgba(10, 10, 10, 0.8) 0%, rgba(10, 10, 10, 0.95) 100%);
+            pointer-events: none;
+        }
+        @keyframes fadeInBg { from { opacity: 0; } to { opacity: 1; } }
+
+        /* Плавное появление */
+        .fade-in-up {
+            opacity: 0;
+            transform: translateY(20px);
+            animation: fadeInUp 0.6s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+        }
+        @keyframes fadeInUp { to { opacity: 1; transform: translateY(0); } }
+
+        .container { max-width: 1000px; width: 100%; text-align: center; z-index: 1; display: flex; flex-direction: column; gap: 80px; }
+
+        /* --- Секция 1: Хедер --- */
+        .hero { display: flex; flex-direction: column; align-items: center; gap: 20px; }
+        .banner-wrapper { perspective: 1000px; width: 100%; margin-bottom: 10px; }
+        .banner { width: 100%; border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0,0,0,0.5); transition: transform 0.1s ease-out; will-change: transform; }
+
+        h1 { color: #fff; font-size: 36px; line-height: 1.2; text-shadow: 0 2px 10px rgba(0,0,0,0.5); }
+        h1 span { color: var(--accent); }
+
+        p.desc { color: var(--text-muted); font-size: 16px; max-width: 700px; margin: 0 auto; }
+
+        .version-info { display: inline-block; background: rgba(255, 59, 71, 0.1); border: 1px solid rgba(255, 59, 71, 0.3); padding: 6px 12px; border-radius: 6px; font-size: 12px; color: var(--accent); font-weight: 600; margin-top: 10px; }
+
+        .buttons { display: flex; justify-content: center; gap: 15px; flex-wrap: wrap; margin-top: 20px; }
+        a.btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            padding: 14px 28px; border-radius: 12px;
+            text-decoration: none; font-weight: 600; font-size: 14px;
+            transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
+            position: relative; overflow: hidden;
+        }
+        a.btn:hover { transform: translateY(-2px); }
+        .btn-primary { background: var(--accent); color: #fff; animation: pulseGlow 2s infinite; }
+        .btn-primary:hover { animation: none; box-shadow: 0 8px 30px rgba(255, 59, 71, 0.6); }
+        @keyframes pulseGlow {
+            0% { box-shadow: 0 0 0 0 rgba(255, 59, 71, 0.4); }
+            70% { box-shadow: 0 0 0 15px rgba(255, 59, 71, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 59, 71, 0); }
+        }
+        .btn::before {
+            content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+        .btn:hover::before { left: 100%; }
+        .btn-secondary { background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.1); }
+        .btn-secondary:hover { background: rgba(255,255,255,0.15); }
+
+        /* --- Общие стили для секций --- */
+        .section-title { font-size: 24px; font-weight: 700; margin-bottom: 30px; text-align: center; text-shadow: 0 2px 10px rgba(0,0,0,0.5); position: relative; z-index: 2;}
+        .section-title span { color: var(--accent); }
+
+        /* --- Секция 2: Возможности в действии --- */
+        .features-section { position: relative; }
+        .features-bg-art {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 80%; height: 80%;
+            background-image: url('https://i.pinimg.com/736x/83/5d/17/835d17cb5b78e542e44df892347ce451.jpg');
+            background-size: contain; background-position: center; background-repeat: no-repeat;
+            opacity: 0.05; z-index: 0; pointer-events: none; filter: grayscale(100%);
+        }
+
+        .features-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; text-align: left; position: relative; z-index: 1; }
+        .feature-card {
+            background: var(--card-bg); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+            border: 1px solid var(--card-border); padding: 25px; border-radius: var(--radius); position: relative; overflow: hidden;
+            transition: border-color 0.3s, transform 0.3s, box-shadow 0.3s;
+            display: flex; flex-direction: column;
+        }
+        .feature-card:hover { border-color: rgba(255, 59, 71, 0.3); transform: translateY(-3px); box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
+        .feature-card h3 { color: #fff; font-size: 16px; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+        .feature-card h3::before { content: ''; display: block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+        .feature-card p { color: var(--text-muted); font-size: 13px; margin-bottom: 15px; flex-grow: 1; }
+        .feature-img { width: 100%; border-radius: 8px; margin-top: auto; border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+
+        /* --- Секция 3: Интерактивная демонстрация --- */
+        .demo-section { background: rgba(0,0,0,0.4); border: 1px solid var(--card-border); border-radius: 24px; padding: 40px 20px; position: relative; }
+
+        .demo-container { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; position: relative; z-index: 10; }
+
+        /* НОВАЯ ПАНЕЛЬ: Единый контейнер, который раскрывается */
+        .demo-panel-wrapper {
+            background: rgba(22, 22, 22, 0.92);
+            backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: var(--radius);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+            width: 100%;
+            max-width: 500px;
+            overflow: hidden;
+            transition: height 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Верхняя часть панели (кнопки) */
+        .demo-panel-top {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 14px; font-size: 11px; font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        .demo-trigger { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0.7; transition: opacity 0.2s; }
+        .demo-trigger:hover { opacity: 1; }
+        .demo-trigger svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; }
+
+        .demo-status { color: rgba(255,255,255,0.7); white-space: nowrap; margin-right: auto; }
+        .demo-status.active { color: #fff; }
+
+        .demo-divider { width: 1px; height: 16px; background: rgba(255,255,255,0.1); }
+
+        .demo-vol-wrap { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.04); padding: 4px 8px; border-radius: 8px; }
+        .demo-vol-wrap svg { width: 14px; height: 14px; fill: rgba(255,255,255,0.6); }
+        .demo-vol-slider { -webkit-appearance: none; width: 60px; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.22); background-image: linear-gradient(var(--accent), var(--accent)); background-size: 50% 100%; background-repeat: no-repeat; outline: none; cursor: pointer; }
+        .demo-vol-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 10px; border-radius: 50%; background: #fff; cursor: pointer; }
+
+        .demo-speed-btn {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255, 59, 71, 0.5);
+            color: #fff;
+            font-size: 11px; font-weight: 700;
+            padding: 4px 8px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 0 15px rgba(255, 59, 71, 0.3);
+        }
+        .demo-speed-btn:hover { background: rgba(255, 59, 71, 0.15); }
+
+        .demo-queue-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; cursor: pointer; opacity: 0.7; margin-left: 4px; transition: stroke 0.2s; }
+        .demo-queue-icon:hover { opacity: 1; stroke: var(--accent); }
+        .demo-queue-icon.active-icon { stroke: var(--accent); opacity: 1; }
+
+        .demo-toggle { width: 36px; height: 20px; border-radius: 999px; background: rgba(255,255,255,0.16); position: relative; cursor: pointer; transition: background 0.3s; margin-left: 4px; }
+        .demo-toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform 0.3s; }
+        .demo-toggle.active { background: var(--accent); }
+        .demo-toggle.active::after { transform: translateX(16px); }
+
+        /* Нижняя часть (очередь), которая скрыта */
+        .demo-queue-content {
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+            transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
+            padding: 0 14px;
+            background: rgba(0,0,0,0.2);
+        }
+
+        /* Когда панель раскрыта */
+        .demo-panel-wrapper.expanded {
+            height: auto;
+        }
+        .demo-panel-wrapper.expanded .demo-queue-content {
+            max-height: 250px;
+            opacity: 1;
+            padding-bottom: 14px;
+        }
+
+        /* Стили элементов внутри очереди */
+        .demo-queue-header { display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 700; margin: 10px 0; }
+        .demo-queue-header span { cursor: pointer; color: rgba(255,255,255,0.5); font-size: 18px; line-height: 1; }
+        .demo-queue-item { display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.05); padding: 8px; border-radius: 12px; margin-bottom: 8px; }
+        .demo-queue-img { width: 30px; height: 40px; border-radius: 4px; background: #333; object-fit: cover; }
+        .demo-queue-info { font-size: 10px; text-align: left; }
+        .demo-queue-title { font-weight: bold; color: #fff; margin-bottom: 2px; }
+        .demo-queue-ep { color: var(--accent); font-size: 8px; }
+
+        /* --- Секция 4: Начало работы --- */
+        .steps-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
+        .step-card { background: var(--card-bg); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid var(--card-border); padding: 20px; border-radius: var(--radius); position: relative; transition: transform 0.3s; }
+        .step-card:hover { transform: translateY(-3px); }
+        .step-num { width: 32px; height: 32px; background: rgba(255, 59, 71, 0.1); color: var(--accent); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; margin-bottom: 15px; }
+        .step-card h4 { font-size: 14px; margin-bottom: 8px; }
+        .step-card p { font-size: 12px; color: var(--text-muted); }
+
+        /* --- Секция 5: Обновления (Таймлайн) --- */
+        .updates-container { position: relative; text-align: left; padding-left: 20px; max-width: 800px; margin: 0 auto; min-height: 100px; }
+        .updates-container::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: rgba(255,255,255,0.1); }
+        .update-card { position: relative; margin-bottom: 30px; padding-left: 30px; }
+        .update-card::before { content: ''; position: absolute; left: -26px; top: 5px; width: 10px; height: 10px; border-radius: 50%; background: var(--bg); border: 2px solid var(--accent); box-shadow: 0 0 10px rgba(255,59,71,0.5); }
+        .update-header { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; flex-wrap: wrap; }
+        .update-version { font-size: 18px; font-weight: 700; color: #fff; }
+        .update-badge { font-size: 10px; background: var(--accent); color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: bold; text-transform: uppercase; }
+        .update-date { font-size: 12px; color: var(--text-muted); }
+        .update-list { list-style: none; display: flex; flex-direction: column; gap: 8px; margin-bottom: 15px; }
+        .update-list li { font-size: 13px; color: var(--text-muted); display: flex; gap: 10px; }
+        .update-list li::before { content: '→'; color: var(--accent); }
+
+        /* --- Секция 6: Совместимость --- */
+        .compat-grid { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
+        .compat-item { background: var(--card-bg); backdrop-filter: blur(10px); border: 1px solid var(--card-border); padding: 15px 25px; border-radius: 12px; display: flex; align-items: center; gap: 12px; transition: transform 0.2s, border-color 0.2s; }
+        .compat-item:hover { transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.2); }
+        .compat-icon { width: 24px; height: 24px; fill: var(--text-muted); }
+
+        /* --- Секция 7: FAQ --- */
+        .faq-container { display: flex; flex-direction: column; gap: 10px; text-align: left; max-width: 800px; margin: 0 auto; }
+        details { background: var(--card-bg); backdrop-filter: blur(10px); border: 1px solid var(--card-border); border-radius: 12px; overflow: hidden; transition: background 0.3s, border-color 0.3s; }
+        details:hover { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.15); }
+        summary { padding: 20px; font-weight: 600; font-size: 14px; cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+        summary::-webkit-details-marker { display: none; }
+        summary::after { content: '+'; color: var(--accent); font-size: 20px; font-weight: 300; transition: transform 0.3s; }
+        details[open] summary::after { transform: rotate(45deg); }
+        .faq-content { padding: 0 20px 20px; color: var(--text-muted); font-size: 13px; }
+
+        /* --- Футер --- */
+        footer { margin-top: 20px; padding-top: 30px; border-top: 1px solid var(--card-border); width: 100%; text-align: center; color: var(--text-muted); font-size: 13px; display: flex; flex-direction: column; gap: 8px; }
+        footer .author { color: #fff; font-weight: 600; }
+        footer .copyright { font-size: 11px; opacity: 0.6; }
+        footer .support { font-size: 12px; margin-top: 5px; }
+        footer .support a { color: var(--accent); text-decoration: none; font-weight: 600; }
+        footer .support a:hover { text-decoration: underline; }
+
+        /* Адаптивность */
+        @media (max-width: 768px) {
+            .features-grid { grid-template-columns: 1fr; }
+            .steps-grid { grid-template-columns: 1fr 1fr; }
+            h1 { font-size: 28px; }
+            .container { gap: 60px; }
+            .demo-panel-top { flex-wrap: wrap; justify-content: center; }
+            .demo-status { margin-right: 0; width: 100%; text-align: center; margin-bottom: 5px; }
+        }
+        @media (max-width: 480px) {
+            .steps-grid { grid-template-columns: 1fr; }
+            .buttons { flex-direction: column; width: 100%; }
+            a.btn { width: 100%; }
+            body::before { filter: blur(3px) brightness(0.3); }
+            .demo-panel-wrapper { max-width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <!-- 1. HERO SECTION -->
+        <header class="hero fade-in-up" style="animation-delay: 0.1s;">
+            <div class="banner-wrapper">
+                <img src="banner.png" alt="Senku Ultimate Autoplay" class="banner" id="tiltBanner">
+            </div>
+
+            <h1>Senku <span>Ultimate Autoplay</span></h1>
+            <div class="version-info">v3.5.0 — Исправления безопасности и надёжность</div>
+            <p class="desc">Скрипт для сайта senku.one: умный автопереход серий, расширенное управление очередью, контроль скорости и синхронизация звука.</p>
+
+            <div class="buttons">
+                <a href="https://raw.githubusercontent.com/haqweti/auto-play-anime-senku/main/Senku%20Ultimate%20Autoplay.user.js" class="btn btn-primary" id="btn-install">Установить скрипт</a>
+                <a href="https://github.com/haqweti/auto-play-anime-senku" class="btn btn-secondary" id="btn-github">GitHub</a>
+                <a href="https://t.me/Senkuone" class="btn btn-secondary" id="btn-tg">Telegram Канал</a>
+            </div>
+        </header>
+
+        <!-- 2. FEATURES IN ACTION -->
+        <section class="features-section fade-in-up" style="animation-delay: 0.2s;">
+            <div class="features-bg-art"></div>
+            <h2 class="section-title" data-ru="Возможности в <span>действии</span>" data-en="Features in <span>Action</span>">Возможности в <span>действии</span></h2>
+
+            <div class="features-grid">
+
+                <div class="feature-card" data-tilt>
+                    <h3 data-ru="Панель управления" data-en="Control Panel">Панель управления</h3>
+                    <p data-ru="Полный контроль над громкостью, скоростью, очередью и переключением прямо в плеере." data-en="Full control over volume, speed, queue, and switching right in the player.">Полный контроль над громкостью, скоростью, очередью и переключением прямо в плеере.</p>
+                    <img src="https://github.com/user-attachments/assets/8f4fb13b-f0e9-410d-806b-f26ef78f447a" class="feature-img" style="object-fit: cover; height: 120px; object-position: top;" alt="Control Panel">
+                </div>
+
+                <div class="feature-card" data-tilt>
+                    <h3 data-ru="Контроль скорости" data-en="Speed Control">Контроль скорости</h3>
+                    <p data-ru="Кнопка скорости прямо в панели (0.5x - 2x). Скорость сохраняется между сериями и не сбрасывается плеером." data-en="Speed button right in the panel (0.5x - 2x). Speed is saved between episodes and not reset by the player.">Кнопка скорости прямо в панели (0.5x - 2x). Скорость сохраняется между сериями и не сбрасывается плеером.</p>
+                    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:10px; display:flex; align-items:center; justify-content:center; margin-top:auto; gap:10px;">
+                        <span style="font-size:11px; font-weight:bold; color:#fff;">1x</span>
+                        <span style="font-size:11px; font-weight:bold; color:#ff3b47; background:rgba(255,59,71,0.2); padding:2px 6px; border-radius:4px;">1.5x</span>
+                        <span style="font-size:11px; font-weight:bold; color:#fff;">2x</span>
+                    </div>
+                </div>
+
+                <div class="feature-card" data-tilt>
+                    <h3 data-ru="Умный плейлист" data-en="Smart Playlist">Умный плейлист</h3>
+                    <p data-ru="Добавляйте следующие сезоны или тайтлы в очередь, и они запустятся автоматически после окончания текущего." data-en="Add next seasons or titles to the queue, and they will start automatically after the current one ends.">Добавляйте следующие сезоны или тайтлы в очередь, и они запустятся автоматически после окончания текущего.</p>
+                    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:10px; display:flex; align-items:center; gap:10px; margin-top:auto;">
+                        <div style="width:30px; height:40px; background:rgba(255,255,255,0.1); border-radius:4px;"></div>
+                        <div>
+                            <div style="font-size:10px; font-weight:bold; color:#fff;">Следующий сезон</div>
+                            <div style="font-size:8px; color:#ff3b47;">Запустится автоматически</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="feature-card" data-tilt>
+                    <h3 data-ru="Фикс звука" data-en="Volume Sync">Фикс звука</h3>
+                    <p data-ru="Громкость в панели и плеере синхронизирована. Больше никаких неожиданных сбросов на 100%." data-en="Volume in the panel and player is synchronized. No more unexpected resets to 100%.">Громкость в панели и плеере синхронизирована. Больше никаких неожиданных сбросов на 100%.</p>
+                    <div style="background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:10px; display:flex; align-items:center; gap:10px; margin-top:auto;">
+                        <span style="font-size:14px;">🔊</span>
+                        <div style="flex:1; height:4px; background:rgba(255,255,255,0.2); border-radius:2px; position:relative;">
+                            <div style="position:absolute; left:0; top:0; height:100%; width:50%; background:#ff3b47; border-radius:2px;"></div>
+                        </div>
+                        <span style="font-size:10px; color:rgba(255,255,255,0.6);">50%</span>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+
+        <!-- 3. INTERACTIVE DEMO -->
+        <section class="demo-section fade-in-up" style="animation-delay: 0.3s;">
+            <h2 class="section-title" data-ru="Попробуй <span>сам</span>" data-en="Try it <span>yourself</span>">Попробуй <span>сам</span></h2>
+
+            <div class="demo-container">
+                <!-- Единая панель, которая раскрывается -->
+                <div class="demo-panel-wrapper" id="interactive-panel">
+
+                    <!-- Верхняя часть (статичная) -->
+                    <div class="demo-panel-top">
+                        <div class="demo-trigger" title="Toggle Panel">
+                            <svg viewBox="0 0 24 24"><polygon points="5 4 15 12 5 20 5 4"></polygon><line x1="19" y1="5" x2="19" y2="20"></line></svg>
+                        </div>
+
+                        <span class="demo-status active" id="demo-status-text" data-ru="Смотрю 3/12 | Mute" data-en="Watching 3/12 | Mute">Смотрю 3/12 | Mute</span>
+
+                        <div class="demo-divider"></div>
+
+                        <div class="demo-vol-wrap">
+                            <svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5zM15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                            <input type="range" class="demo-vol-slider" id="demo-vol" min="0" max="100" value="50">
+                        </div>
+
+                        <button class="demo-speed-btn" id="demo-speed-btn" title="Change speed">1.5x</button>
+
+                        <svg class="demo-queue-icon" id="demo-queue-btn" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+
+                        <div class="demo-toggle active" id="demo-toggle"></div>
+                    </div>
+
+                    <!-- Нижняя часть (выдвижная очередь) -->
+                    <div class="demo-queue-content" id="demo-queue-content">
+                        <div class="demo-queue-header">
+                            <span data-ru="Очередь" data-en="Queue">Очередь</span>
+                            <span id="demo-queue-close">×</span>
+                        </div>
+
+                        <div class="demo-queue-item">
+                            <img src="https://i.pinimg.com/736x/83/5d/17/835d17cb5b78e542e44df892347ce451.jpg" class="demo-queue-img" style="object-fit: cover; object-position: top;">
+                            <div class="demo-queue-info">
+                                <div class="demo-queue-title">Lain</div>
+                                <div class="demo-queue-ep" data-ru="Серия 1" data-en="Episode 1">Серия 1</div>
+                            </div>
+                        </div>
+
+                        <div class="demo-queue-item">
+                            <div class="demo-queue-img" style="background: #222;"></div>
+                            <div class="demo-queue-info">
+                                <div class="demo-queue-title" data-ru="Аниме 2" data-en="Anime 2">Аниме 2</div>
+                                <div class="demo-queue-ep" data-ru="Серия 1" data-en="Episode 1">Серия 1</div>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+
+                <p style="font-size: 12px; color: var(--text-muted); margin-top: 20px;" data-ru="* Это интерактивный макет. Он не подключен к реальному плееру." data-en="* This is an interactive mockup. It is not connected to a real player.">* Это интерактивный макет. Он не подключен к реальному плееру.</p>
+            </div>
+        </section>
+
+        <!-- 4. GETTING STARTED -->
+        <section class="fade-in-up" style="animation-delay: 0.4s;">
+            <h2 class="section-title" data-ru="Начало <span>работы</span>" data-en="Getting <span>Started</span>">Начало <span>работы</span></h2>
+            <div class="steps-grid">
+                <div class="step-card">
+                    <div class="step-num">1</div>
+                    <h4 data-ru="Менеджер скриптов" data-en="Userscript Manager">Менеджер скриптов</h4>
+                    <p data-ru="Установите Tampermonkey в ваш браузер." data-en="Install Tampermonkey in your browser.">Установите Tampermonkey в ваш браузер.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-num">2</div>
+                    <h4 data-ru="Установка скрипта" data-en="Install Script">Установка скрипта</h4>
+                    <p data-ru="Нажмите зелёную кнопку выше и подтвердите установку." data-en="Click the green button above and confirm installation.">Нажмите зелёную кнопку выше и подтвердите установку.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-num">3</div>
+                    <h4 data-ru="Открытие сайта" data-en="Open Website">Открытие сайта</h4>
+                    <p data-ru="Перейдите на senku.one и запустите любую серию." data-en="Go to senku.one and start any episode.">Перейдите на senku.one и запустите любую серию.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-num">4</div>
+                    <h4 data-ru="Готово!" data-en="Done!">Готово!</h4>
+                    <p data-ru="Панель появится в правом верхнем углу плеера." data-en="The panel will appear in the top right corner of the player.">Панель появится в правом верхнем углу плеера.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- 5. LATEST UPDATES (Dynamic Timeline) -->
+        <section class="fade-in-up" style="animation-delay: 0.5s;">
+            <h2 class="section-title" data-ru="Последние <span>обновления</span>" data-en="Latest <span>Updates</span>">Последние <span>обновления</span></h2>
+
+            <!-- Сюда JS скрипт будет автоматически вставлять данные с GitHub -->
+            <div class="updates-container" id="dynamic-updates">
+                <div style="text-align: center; color: var(--text-muted); font-size: 14px;">Загрузка обновлений...</div>
+            </div>
+
+            <div style="text-align: center; margin-top: 20px;">
+                <a href="https://github.com/haqweti/auto-play-anime-senku/releases" class="btn btn-secondary" style="font-size: 12px; padding: 10px 20px;" data-ru="Полная история релизов" data-en="Full Release History">Полная история релизов</a>
+            </div>
+        </section>
+
+        <!-- 6. COMPATIBILITY -->
+        <section class="fade-in-up" style="animation-delay: 0.6s;">
+            <h2 class="section-title" data-ru="Совместимость" data-en="Compatibility">Совместимость</h2>
+            <div class="compat-grid">
+                <div class="compat-item">
+                    <svg class="compat-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                    <span>Chrome / Edge / Firefox</span>
+                </div>
+                <div class="compat-item">
+                    <svg class="compat-icon" viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z"/></svg>
+                    <span>Tampermonkey</span>
+                </div>
+                <div class="compat-item">
+                    <svg class="compat-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                    <span data-ru="Требуется senku.one" data-en="Requires senku.one">Требуется senku.one</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- 7. FAQ -->
+        <section class="fade-in-up" style="animation-delay: 0.7s;">
+            <h2 class="section-title" data-ru="Часто задаваемые <span>вопросы</span>" data-en="Frequently Asked <span>Questions</span>">Часто задаваемые <span>вопросы</span></h2>
+            <div class="faq-container">
+
+                <details>
+                    <summary data-ru="Как установить скрипт?" data-en="How to install the script?">Как установить скрипт?</summary>
+                    <div class="faq-content" data-ru="Установите Tampermonkey, затем нажмите кнопку «Установить скрипт». Подтвердите в появившемся окне." data-en="Install Tampermonkey, then click 'Install Script'. Confirm in the popup window.">Установите Tampermonkey, затем нажмите кнопку «Установить скрипт». Подтвердите в появившемся окне.</div>
+                </details>
+
+                <details>
+                    <summary data-ru="Кнопка скорости больше не пропадает?" data-en="Speed button no longer disappears?">Кнопка скорости больше не пропадает?</summary>
+                    <div class="faq-content" data-ru="Да! В v3.5.0 исправлен баг с пропаданием кнопки при смене серии. Состояние панели теперь всегда синхронизировано." data-en="Yes! In v3.5.0, the bug with the button disappearing on episode change is fixed. The panel state is now always synchronized.">Да! В v3.5.0 исправлен баг с пропаданием кнопки при смене серии. Состояние панели теперь всегда синхронизировано.</div>
+                </details>
+
+                <details>
+                    <summary data-ru="Как добавить аниме в очередь?" data-en="How to add anime to the queue?">Как добавить аниме в очередь?</summary>
+                    <div class="faq-content" data-ru="Нажмите на иконку списка в панели, вставьте ссылку на аниме (например, senku.one/watch/123) и нажмите «Доб.»." data-en="Click the list icon in the panel, paste the anime link (e.g., senku.one/watch/123) and click 'Add'.">Нажмите на иконку списка в панели, вставьте ссылку на аниме (например, senku.one/watch/123) и нажмите «Доб.».</div>
+                </details>
+
+                <details>
+                    <summary data-ru="Переходит ли скорость между сериями?" data-en="Does speed carry over between episodes?">Переходит ли скорость между сериями?</summary>
+                    <div class="faq-content" data-ru="Да! Скорость сохраняется в браузере и автоматически применяется к каждой новой серии. Плеер больше не сбрасывает её на 1x." data-en="Yes! Speed is saved in your browser and automatically applied to each new episode. The player no longer resets it to 1x.">Да! Скорость сохраняется в браузере и автоматически применяется к каждой новой серии. Плеер больше не сбрасывает её на 1x.</div>
+                </details>
+
+                <details>
+                    <summary data-ru="Почему переход на следующую серию зависает?" data-en="Why does the transition hang?">Почему переход на следующую серию зависает?</summary>
+                    <div class="faq-content" data-ru="В v3.5.0 это исправлено! Введен флаг transitionInProgress для предотвращения двойных кликов. Таймауты увеличены до 8 сек для гарантированного перехода." data-en="Fixed in v3.5.0! A transitionInProgress flag prevents double-clicks. Timeouts increased to 8 seconds for guaranteed transition.">В v3.5.0 это исправлено! Введен флаг transitionInProgress для предотвращения двойных кликов. Таймауты увеличены до 8 сек для гарантированного перехода.</div>
+                </details>
+
+            </div>
+        </section>
+
+        <!-- FOOTER -->
+        <footer class="fade-in-up" style="animation-delay: 0.8s;">
+            <div class="author">Автор: mikuro</div>
+            <div class="support" data-ru="При поддержке: <a href='https://github.com/Ra9ge' target='_blank'>Ra9ge</a>" data-en="Supported by: <a href='https://github.com/Ra9ge' target='_blank'>Ra9ge</a>">
+                При поддержке: <a href="https://github.com/Ra9ge" target="_blank">Ra9ge</a>
+            </div>
+            <div class="copyright" data-ru="Все права защищены © 2026" data-en="All rights reserved © 2026">Все права защищены © 2026</div>
+        </footer>
+
+    </div>
+
+    <script>
+        // --- 1. Логика перевода ---
+        const isRussian = navigator.language.toLowerCase().startsWith('ru');
+
+        if (!isRussian) {
+            document.querySelectorAll('[data-en]').forEach(el => {
+                el.innerHTML = el.getAttribute('data-en');
+            });
+
+            document.getElementById('btn-install').innerText = 'Install Script';
+            document.getElementById('btn-github').innerText = 'GitHub';
+            document.getElementById('btn-tg').innerText = 'Telegram Channel';
+        }
+
+        // --- 2. 3D-наклон для баннера и карточек ---
+        function initTilt(element) {
+            if (!element) return;
+            const xTransform = 10;
+            const yTransform = 10;
+
+            element.addEventListener('mousemove', (e) => {
+                const rect = element.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+
+                const rotateX = ((y - centerY) / centerY) * -xTransform;
+                const rotateY = ((x - centerX) / centerX) * yTransform;
+
+                element.style.transform = `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale3d(1.01, 1.01, 1.01)`;
+            });
+
+            element.addEventListener('mouseleave', () => {
+                element.style.transform = 'perspective(1000px) rotateX(0deg) rotateY(0deg) scale3d(1, 1, 1)';
+            });
+        }
+
+        const banner = document.getElementById('tiltBanner');
+        initTilt(banner);
+        const cards = document.querySelectorAll('[data-tilt]');
+        cards.forEach(card => initTilt(card));
+
+        // --- 3. Интерактивная демонстрация (Выдвижная панель) ---
+        const demoPanel = document.getElementById('interactive-panel');
+        const demoToggle = document.getElementById('demo-toggle');
+        const demoStatus = document.getElementById('demo-status-text');
+        const demoVol = document.getElementById('demo-vol');
+        const demoSpeedBtn = document.getElementById('demo-speed-btn');
+        const demoQueueBtn = document.getElementById('demo-queue-btn');
+        const demoQueueClose = document.getElementById('demo-queue-close');
+
+        const SPEEDS = [1, 1.25, 1.5, 1.75, 2, 0.5, 0.75];
+        let currentSpeedIndex = 2; // 1.5x
+
+        function updateDemoStatus() {
+            if (!demoToggle.classList.contains('active')) {
+                demoStatus.className = 'demo-status';
+                demoStatus.innerText = isRussian ? 'Выключено' : 'Disabled';
+                return;
+            }
+            const val = demoVol.value;
+            const volText = val == 0 ? 'Mute' : `${val}%`;
+            demoStatus.className = 'demo-status active';
+            demoStatus.innerText = isRussian ? `Смотрю 3/12 | ${volText}` : `Watching 3/12 | ${volText}`;
+        }
+
+        demoToggle.addEventListener('click', () => {
+            demoToggle.classList.toggle('active');
+            updateDemoStatus();
+            if (!demoToggle.classList.contains('active')) {
+                demoPanel.classList.remove('expanded');
+                demoQueueBtn.classList.remove('active-icon');
+            }
+        });
+
+        demoVol.addEventListener('input', (e) => {
+            e.target.style.backgroundSize = `${e.target.value}% 100%`;
+            updateDemoStatus();
+        });
+
+        demoSpeedBtn.addEventListener('click', () => {
+            currentSpeedIndex = (currentSpeedIndex + 1) % SPEEDS.length;
+            demoSpeedBtn.innerText = SPEEDS[currentSpeedIndex] === 1 ? '1x' : `${SPEEDS[currentSpeedIndex]}x`;
+        });
+
+        demoQueueBtn.addEventListener('click', () => {
+            if (demoToggle.classList.contains('active')) {
+                demoPanel.classList.toggle('expanded');
+                demoQueueBtn.classList.toggle('active-icon');
+            }
+        });
+
+        demoQueueClose.addEventListener('click', (e) => {
+            e.stopPropagation();
+            demoPanel.classList.remove('expanded');
+            demoQueueBtn.classList.remove('active-icon');
+        });
+
+        // --- 4. Автоматическая загрузка обновлений с GitHub ---
+        async function fetchLatestReleases() {
+            const container = document.getElementById('dynamic-updates');
+            if (!container) return;
+
+            try {
+                const response = await fetch('https://api.github.com/repos/haqweti/auto-play-anime-senku/releases?per_page=3');
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                const releases = await response.json();
+
+                if (releases.length === 0) {
+                    container.innerHTML = `<div style="text-align: center; color: var(--text-muted);">${isRussian ? 'Нет доступных релизов.' : 'No releases available.'}</div>`;
+                    return;
+                }
+
+                container.innerHTML = '';
+
+                releases.forEach((release, index) => {
+                    const isLatest = index === 0;
+                    const dateObj = new Date(release.published_at);
+                    const formattedDate = `${String(dateObj.getDate()).padStart(2, '0')}.${String(dateObj.getMonth() + 1).padStart(2, '0')}.${dateObj.getFullYear()}`;
+
+                    let bodyText = release.body || 'Описание отсутствует';
+                    let listItems = '';
+                    const lines = bodyText.split('\n').filter(line => line.trim().length > 0);
+
+                    lines.slice(0, 4).forEach(line => {
+                        const cleanLine = line.replace(/^[*#\-\s]+/, '').trim();
+                        if (cleanLine) {
+                            listItems += `<li>${cleanLine}</li>`;
+                        }
+                    });
+
+                    const latestBadgeText = isRussian ? 'Актуальная' : 'Latest';
+                    const badgeHTML = isLatest ? `<div class="update-badge">${latestBadgeText}</div>` : '';
+                    const opacityStyle = isLatest ? '' : 'opacity: 0.7;';
+
+                    const cardHTML = `
+                        <div class="update-card" style="${opacityStyle}">
+                            <div class="update-header">
+                                <div class="update-version">${release.tag_name}</div>
+                                ${badgeHTML}
+                                <div class="update-date">${formattedDate}</div>
+                            </div>
+                            <ul class="update-list">
+                                ${listItems || '<li>Подробности в релизе на GitHub</li>'}
+                            </ul>
+                        </div>
+                    `;
+
+                    container.insertAdjacentHTML('beforeend', cardHTML);
+                });
+
+            } catch (error) {
+                console.error('Ошибка загрузки релизов:', error);
+                container.innerHTML = `
+                    <div style="text-align: center; color: var(--text-muted);">
+                        ${isRussian ? 'Не удалось загрузить обновления.' : 'Failed to load updates.'} <br>
+                        <a href="https://github.com/haqweti/auto-play-anime-senku/releases" style="color: var(--accent);">${isRussian ? 'Посмотреть на GitHub' : 'View on GitHub'}</a>
+                    </div>`;
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', fetchLatestReleases);
+    </script>
+</body>
+</html>

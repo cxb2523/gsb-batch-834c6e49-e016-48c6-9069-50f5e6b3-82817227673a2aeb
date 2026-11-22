@@ -1,0 +1,43 @@
+name: Проблема с плеером из-за скрипта
+description: Скрипт ломает воспроизведение, не переключает серии, блокирует плеер или сбивает настройки
+title: "[Player Issue]: "
+labels: ["video-issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Внимание! Если у вас просто не работает озвучка, серия не загружается или плохое качество на самом сайте — это не проблема скрипта. Здесь мы рассматриваем только ситуации, когда скрипт мешает смотреть.
+  - type: input
+    id: anime-name
+    attributes:
+      label: Название аниме
+      placeholder: Например, Повар-боец Сома
+    validations:
+      required: true
+  - type: input
+    id: episode
+    attributes:
+      label: Номер серии и сезона
+      placeholder: Сезон 2, Серия 5
+    validations:
+      required: true
+  - type: dropdown
+    id: issue-type
+    attributes:
+      label: Что именно делает скрипт?
+      options:
+        - Не переключает на следующую серию
+        - Плеер зависает после переключения
+        - Ломается ползунок громкости
+        - Исчезла панель управления
+        - Очередь работает неправильно
+        - Другое
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Подробное описание
+      description: Опишите, как скрипт мешает просмотру. Приложите скриншот, если возможно.
+    validations:
+      required: true
