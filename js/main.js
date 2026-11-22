@@ -10,8 +10,8 @@ import {
     TRACE_STYLES,
     createEffectRecipe,
     randomSeed,
-    renderEffectFrames
-} from './AbilityEffect.js?v=13';
+    renderCycleFrames
+} from './AbilityEffect.js?v=14';
 import { LOOP_MOTIFS, LOOP_MOTIF_GROUPS } from './engine/LoopArt.js?v=3';
 
 const GIF_WORKER_URL = new URL('./gif.worker.js', import.meta.url).href;
@@ -61,6 +61,7 @@ const notice = document.querySelector('#notice');
 const particleShapePicker = document.querySelector('#particleShapePicker');
 const particleShapeValue = document.querySelector('#particleShapeValue');
 const exportButtons = [...document.querySelectorAll('#exportAtlasBtn, #exportFramesBtn, #exportGifBtn')];
+const cancelExportButton = document.querySelector('#cancelExportBtn');
 
 const allGeometries = [...new Set(Object.values(FORMATIONS)
     .flatMap((family) => Object.values(family))
@@ -97,11 +98,23 @@ let frozenTime = 0;
 let playing = true;
 let noticeTimer;
 let seedInputTimer;
-let exportInProgress = false;
+let activeExport = null;
 let atlasPreviewUrl;
-let lastRenderedTime = Number.NaN;
 let lastProgressStep = -1;
 let lastStageText = '';
+
+// The live preview plays back cached loop frames produced by the same
+// renderCycleFrames pipeline the exporters use, so the canvas always shows
+// exactly what an export would produce. The cache is keyed on the recipe and
+// the size/frame-count settings; any change to those invalidates it.
+const previewState = {
+    cache: null,
+    building: false,
+    buildId: 0,
+    failedKey: null
+};
+let lastDrawnCache = null;
+let lastDrawnFrameIndex = -1;
 
 // Resolving computed styles on every icon repaint forces a style recalculation.
 // The value is cached here and refreshed whenever the recipe palette changes.
@@ -269,7 +282,7 @@ const sanitizeFilename = (value) => String(value ?? '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'ability-fx';
 
-const exportName = () => `${sanitizeFilename(baseRecipe.name)}-${sanitizeFilename(baseRecipe.motif)}`;
+const exportName = (recipe = baseRecipe) => `${sanitizeFilename(recipe.name)}-${sanitizeFilename(recipe.motif)}`;
 
 const timestamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 
@@ -308,20 +321,106 @@ const currentExportOptions = () => ({
     fps: Math.round(boundedSetting(fpsSelect.value, 16, 12, 24))
 });
 
-const beginExport = () => {
-    if (exportInProgress) {
-        setNotice('An export is already in progress.', 'default');
-        return false;
-    }
-    exportInProgress = true;
-    exportButtons.forEach((button) => { button.disabled = true; });
-    return true;
+const previewCacheKey = () => {
+    const { size, frameCount } = currentExportOptions();
+    return JSON.stringify({ recipe: baseRecipe, size, frameCount });
 };
 
-const endExport = () => {
-    exportInProgress = false;
-    exportButtons.forEach((button) => { button.disabled = false; });
+// Bumping the build token marks any in-flight build as stale: its result is
+// discarded instead of overwriting the cache for the newer configuration.
+const invalidatePreviewCache = () => {
+    previewState.buildId += 1;
 };
+
+const ensurePreviewBuild = (key) => {
+    if (previewState.building || previewState.failedKey === key) return;
+    previewState.building = true;
+    const buildId = ++previewState.buildId;
+    const { size, frameCount } = currentExportOptions();
+    const recipeSnapshot = structuredClone(baseRecipe);
+    renderCycleFrames({ recipe: recipeSnapshot, size, frameCount })
+        .then(({ frames, duration }) => {
+            // A build that finished after the configuration moved on is stale
+            // and must never replace the picture of the current one.
+            if (buildId !== previewState.buildId || key !== previewCacheKey()) return;
+            previewState.cache = { key, recipe: recipeSnapshot, frames, frameCount, size, duration };
+        })
+        .catch((error) => {
+            if (buildId !== previewState.buildId) return;
+            // Logged once per configuration and never retried per frame; the
+            // rejection is handled here so nothing escapes as an unhandled
+            // promise rejection from the animation loop.
+            previewState.failedKey = key;
+            console.error('Loop preview generation failed:', error);
+        })
+        .finally(() => {
+            previewState.building = false;
+        });
+};
+
+const beginExport = (kind) => {
+    if (activeExport) {
+        setNotice('An export is already in progress.', 'default');
+        return null;
+    }
+    const controller = new AbortController();
+    activeExport = {
+        kind,
+        controller,
+        signal: controller.signal,
+        cancelled: false,
+        done: false,
+        // Locked once at export start: the atlas, the ZIP's recipe.json and the
+        // GIF all come from this single snapshot. Recipe edits during the
+        // export only affect the next export.
+        snapshot: {
+            recipe: structuredClone(baseRecipe),
+            settings: currentExportOptions()
+        },
+        frames: null,
+        gif: null,
+        urls: new Set()
+    };
+    exportButtons.forEach((button) => { button.disabled = true; });
+    cancelExportButton.disabled = false;
+    return activeExport;
+};
+
+const endExport = (session, message, tone = 'default') => {
+    if (session.done) return;
+    session.done = true;
+    if (session.cancelled) {
+        // A cancelled export keeps nothing behind: object URLs are revoked and
+        // frame canvases are dereferenced below.
+        session.urls.forEach((url) => URL.revokeObjectURL(url));
+    }
+    session.urls.clear();
+    session.frames = null;
+    session.gif = null;
+    if (activeExport === session) activeExport = null;
+    exportButtons.forEach((button) => { button.disabled = false; });
+    cancelExportButton.disabled = true;
+    const stale = JSON.stringify(session.snapshot.recipe) !== JSON.stringify(baseRecipe);
+    if (message && stale && tone === 'success') {
+        setNotice(`${message} — snapshot is now stale: the recipe changed during export.`, 'default');
+    } else if (message) {
+        setNotice(message, tone);
+    } else if (stale) {
+        setNotice('Export snapshot is now stale: the recipe changed during export.', 'default');
+    }
+};
+
+const cancelActiveExport = () => {
+    if (!activeExport || activeExport.done) return;
+    activeExport.cancelled = true;
+    activeExport.controller.abort();
+};
+
+const throwIfExportCancelled = (session) => {
+    if (session.signal.aborted) throw new DOMException('The export was cancelled.', 'AbortError');
+};
+
+const isCancelError = (error) => error?.name === 'AbortError';
 
 const updateRecipeReadout = () => {
     recipeFamily.textContent = EFFECT_FAMILIES[baseRecipe.family]?.shortLabel ?? prettyLabel(baseRecipe.family);
@@ -349,7 +448,8 @@ const resetPlayback = () => {
     startedAt = performance.now();
     frozenTime = 0;
     playing = true;
-    lastRenderedTime = Number.NaN;
+    lastDrawnCache = null;
+    lastDrawnFrameIndex = -1;
     lastProgressStep = -1;
     lastStageText = '';
     pauseButton.textContent = 'Pause';
@@ -362,10 +462,10 @@ const applyRecipe = (recipe, { showNotice = false } = {}) => {
     updateRecipeReadout();
     syncControls();
     resetPlayback();
+    invalidatePreviewCache();
     atlasPreviewShell.hidden = true;
     atlasPreview.replaceChildren();
     releaseAtlasPreview();
-    lastRenderedTime = Number.NaN;
     lastProgressStep = -1;
     lastStageText = '';
     if (showNotice) setNotice('Effect updated', 'success');
@@ -406,7 +506,7 @@ const getStage = () => Object.hasOwn(LOOP_MOTIFS, baseRecipe.motif)
 const animationLoop = (now) => {
     requestAnimationFrame(animationLoop);
 
-    // Background tabs and paused playback do not change the frame; skip the full
+    // Background tabs and paused playback do not change the frame; skip the
     // canvas redraw and the associated DOM writes until the time actually moves.
     if (document.hidden) return;
 
@@ -417,10 +517,23 @@ const animationLoop = (now) => {
         time %= activeEffect.duration;
     }
 
-    if (time === lastRenderedTime) return;
-    lastRenderedTime = time;
+    const key = previewCacheKey();
+    if (previewState.cache?.key !== key) ensurePreviewBuild(key);
 
-    activeEffect.draw(context, time);
+    const cache = previewState.cache;
+    if (cache) {
+        const phase = ((time / cache.duration) % 1 + 1) % 1;
+        const frameIndex = Math.min(cache.frameCount - 1, Math.floor(phase * cache.frameCount));
+        if (cache !== lastDrawnCache || frameIndex !== lastDrawnFrameIndex) {
+            // The frames carry transparency, so the previous frame must be
+            // cleared instead of composited under the new one.
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(cache.frames[frameIndex], 0, 0, canvas.width, canvas.height);
+            lastDrawnCache = cache;
+            lastDrawnFrameIndex = frameIndex;
+        }
+    }
+
     const progress = Math.max(0, Math.min(1, time / activeEffect.duration));
     const progressStep = Math.round(progress * 200);
     if (progressStep !== lastProgressStep) {
@@ -459,15 +572,17 @@ const prepareGifFrame = (frame) => {
     return prepared;
 };
 
-const captureFrames = async () => {
-    const settings = currentExportOptions();
+const captureFrames = async (session) => {
     setNotice('Rendering seamless loop…');
-    const result = await renderEffectFrames({
-        recipe: baseRecipe,
+    const { recipe, settings } = session.snapshot;
+    const result = await renderCycleFrames({
+        recipe,
         size: settings.size,
-        frameCount: settings.frameCount
+        frameCount: settings.frameCount,
+        signal: session.signal
     });
-    return { ...result, ...settings };
+    session.frames = result.frames;
+    return { ...result, ...settings, snapshot: session.snapshot };
 };
 
 // A download must keep its object URL alive until the browser has consumed it;
@@ -477,30 +592,38 @@ const releaseAfterDownload = (url) => {
 };
 
 const exportAtlas = async () => {
-    if (!beginExport()) return;
+    const session = beginExport('atlas');
+    if (!session) return;
     try {
-        const { frames, size } = await captureFrames();
+        const { frames, size, snapshot } = await captureFrames(session);
         const atlas = createAtlas(frames, size);
         const blob = await canvasToBlob(atlas);
+        throwIfExportCancelled(session);
         releaseAtlasPreview();
         // Separate URLs prevent a recipe change (which releases the preview) from
         // invalidating the object URL the browser is still streaming to disk.
         const previewUrl = URL.createObjectURL(blob);
         const downloadBlobUrl = URL.createObjectURL(blob);
+        session.urls.add(previewUrl);
+        session.urls.add(downloadBlobUrl);
         atlasPreviewUrl = previewUrl;
+        session.urls.delete(previewUrl);
         const image = new Image();
         image.src = previewUrl;
-        image.alt = `${baseRecipe.name} sprite atlas`;
+        image.alt = `${snapshot.recipe.name} sprite atlas`;
         atlasPreview.replaceChildren(image);
         atlasPreviewShell.hidden = false;
-        downloadUrl(downloadBlobUrl, `atlas-${exportName()}-${timestamp()}.png`);
+        downloadUrl(downloadBlobUrl, `atlas-${exportName(snapshot.recipe)}-${timestamp()}.png`);
+        session.urls.delete(downloadBlobUrl);
         releaseAfterDownload(downloadBlobUrl);
-        setNotice('Sprite atlas exported', 'success');
+        endExport(session, 'Sprite atlas exported', 'success');
     } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-    } finally {
-        endExport();
+        if (isCancelError(error)) {
+            endExport(session, 'Export cancelled.', 'danger');
+        } else {
+            console.error(error);
+            endExport(session, error.message, 'danger');
+        }
     }
 };
 
@@ -509,25 +632,35 @@ const exportFramesZip = async () => {
         setNotice('ZIP exporter is still loading.', 'danger');
         return;
     }
-    if (!beginExport()) return;
+    const session = beginExport('zip');
+    if (!session) return;
     try {
-        const { frames } = await captureFrames();
+        const { frames, snapshot } = await captureFrames(session);
         const zip = new JSZip();
         const blobs = await Promise.all(frames.map((frame) => canvasToBlob(frame)));
+        throwIfExportCancelled(session);
         blobs.forEach((blob, index) => {
             zip.file(`frame-${String(index).padStart(3, '0')}.png`, blob);
         });
-        zip.file('recipe.json', JSON.stringify(baseRecipe, null, 2));
+        // recipe.json and the PNG frames always describe the same locked snapshot.
+        zip.file('recipe.json', JSON.stringify(snapshot.recipe, null, 2));
         const blob = await zip.generateAsync({ type: 'blob' });
+        // A cancel that landed during compression discards the result instead
+        // of delivering a download for an export the user already aborted.
+        throwIfExportCancelled(session);
         const url = URL.createObjectURL(blob);
-        downloadUrl(url, `frames-${exportName()}-${timestamp()}.zip`);
+        session.urls.add(url);
+        downloadUrl(url, `frames-${exportName(snapshot.recipe)}-${timestamp()}.zip`);
+        session.urls.delete(url);
         releaseAfterDownload(url);
-        setNotice('PNG sequence exported', 'success');
+        endExport(session, 'PNG sequence exported', 'success');
     } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-    } finally {
-        endExport();
+        if (isCancelError(error)) {
+            endExport(session, 'Export cancelled.', 'danger');
+        } else {
+            console.error(error);
+            endExport(session, error.message, 'danger');
+        }
     }
 };
 
@@ -536,25 +669,46 @@ const exportGif = async () => {
         setNotice('GIF exporter is still loading.', 'danger');
         return;
     }
-    if (!beginExport()) return;
+    const session = beginExport('gif');
+    if (!session) return;
 
-    let gif;
-    let watchdog;
-    const finish = () => {
-        window.clearTimeout(watchdog);
-        endExport();
+    let watchdog = null;
+    let finished = false;
+    const releaseGif = () => {
+        const gif = session.gif;
+        if (!gif) return;
+        session.gif = null;
+        // abort() terminates the active workers; the idle pool is terminated
+        // here so a cancelled or finished export never leaves workers behind.
+        try { gif.abort(); } catch { /* encoder already torn down */ }
+        [...gif.freeWorkers, ...gif.activeWorkers].forEach((worker) => worker.terminate());
+        gif.freeWorkers.length = 0;
+        gif.activeWorkers.length = 0;
+        gif.frames = [];
+    };
+    const finish = (message, tone) => {
+        if (finished) return;
+        finished = true;
+        if (watchdog !== null) {
+            window.clearTimeout(watchdog);
+            watchdog = null;
+        }
+        releaseGif();
+        session.frames = null;
+        endExport(session, message, tone);
     };
 
     try {
-        const { frames, fps } = await captureFrames();
+        const { frames, fps, snapshot } = await captureFrames(session);
         setNotice('Encoding transparent GIF…');
-        gif = new GIF({
+        const gif = new GIF({
             workers: 2,
             quality: 10,
             repeat: 0,
             transparent: GIF_TRANSPARENT_COLOR,
             workerScript: GIF_WORKER_URL
         });
+        session.gif = gif;
         frames.forEach((frame) => {
             gif.addFrame(prepareGifFrame(frame), {
                 copy: true,
@@ -562,29 +716,25 @@ const exportGif = async () => {
             });
         });
         gif.on('finished', (blob) => {
-            try {
-                const url = URL.createObjectURL(blob);
-                downloadUrl(url, `loop-${exportName()}-${timestamp()}.gif`);
-                releaseAfterDownload(url);
-                setNotice('Transparent GIF exported', 'success');
-            } finally {
-                finish();
-            }
+            const url = URL.createObjectURL(blob);
+            session.urls.add(url);
+            downloadUrl(url, `loop-${exportName(snapshot.recipe)}-${timestamp()}.gif`);
+            session.urls.delete(url);
+            releaseAfterDownload(url);
+            finish('Transparent GIF exported', 'success');
         });
-        gif.on('abort', () => {
-            setNotice('GIF export was cancelled.', 'danger');
-            finish();
-        });
+        gif.on('abort', () => finish('GIF export was cancelled.', 'danger'));
+        session.signal.addEventListener('abort', () => finish('GIF export was cancelled.', 'danger'), { once: true });
         // Bounds the export lock if a worker never starts or never reports back.
-        watchdog = window.setTimeout(() => {
-            setNotice('GIF export timed out.', 'danger');
-            gif.abort();
-        }, 120_000);
+        watchdog = window.setTimeout(() => finish('GIF export timed out.', 'danger'), 120_000);
         gif.render();
     } catch (error) {
-        console.error(error);
-        setNotice(error.message, 'danger');
-        finish();
+        if (isCancelError(error)) {
+            finish('GIF export was cancelled.', 'danger');
+        } else {
+            console.error(error);
+            finish(error.message, 'danger');
+        }
     }
 };
 
@@ -674,7 +824,8 @@ pauseButton.addEventListener('click', () => {
     if (playing) {
         frozenTime = Math.min((performance.now() - startedAt) / 1000, activeEffect.duration);
         playing = false;
-        lastRenderedTime = Number.NaN;
+        lastDrawnCache = null;
+        lastDrawnFrameIndex = -1;
         pauseButton.textContent = 'Play';
         pauseButton.setAttribute('aria-pressed', 'true');
     } else {
@@ -688,7 +839,20 @@ pauseButton.addEventListener('click', () => {
 document.querySelector('#exportAtlasBtn').addEventListener('click', exportAtlas);
 document.querySelector('#exportFramesBtn').addEventListener('click', exportFramesZip);
 document.querySelector('#exportGifBtn').addEventListener('click', exportGif);
+cancelExportButton.addEventListener('click', cancelActiveExport);
+// Frame geometry changes invalidate the cached preview loop just like recipe edits.
+canvasSizeSelect.addEventListener('change', invalidatePreviewCache);
+frameCountSelect.addEventListener('change', invalidatePreviewCache);
 window.addEventListener('pagehide', releaseAtlasPreview, { once: true });
+
+// Handle for the browser acceptance page (tests/export-acceptance.html), which
+// drives the real app and inspects preview/export state through these getters.
+window.__pixelFxForge = {
+    getRecipe: () => structuredClone(baseRecipe),
+    getPreviewCacheRecipe: () => (previewState.cache ? structuredClone(previewState.cache.recipe) : null),
+    isPreviewBuilding: () => previewState.building,
+    isExportActive: () => Boolean(activeExport && !activeExport.done)
+};
 
 const initialRecipe = createEffectRecipe({ family: 'burst', element: 'arcane', power: 'standard', seed: 734211 });
 applyRecipe({

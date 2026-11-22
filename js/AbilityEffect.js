@@ -1391,12 +1391,17 @@ export const renderEffectFrame = (recipe, time, size = 160) => {
     return canvas;
 };
 
-export const renderEffectFrames = async ({ recipe, size = 160, frameCount = 32 }) => {
+// The single render pipeline shared by the live preview and every exporter.
+// Frame `index` samples the cycle at `duration * index / frameCount`, so the
+// first frame is exactly the cycle-boundary frame (time 0 === time duration)
+// and the last frame stops one step before it instead of repeating it.
+export const renderCycleFrames = async ({ recipe, size = 160, frameCount = 32, signal } = {}) => {
     const dimension = boundedDimension(size);
     const totalFrames = boundedFrameCount(frameCount);
     const effect = new AbilityEffect(recipe);
     const frames = [];
     for (let index = 0; index < totalFrames; index += 1) {
+        if (signal?.aborted) throw new DOMException('Frame rendering was cancelled.', 'AbortError');
         const canvas = document.createElement('canvas');
         canvas.width = dimension;
         canvas.height = dimension;
@@ -1406,5 +1411,7 @@ export const renderEffectFrames = async ({ recipe, size = 160, frameCount = 32 }
         frames.push(canvas);
         if (index % 4 === 3) await new Promise((resolve) => setTimeout(resolve, 0));
     }
-    return { frames, effect };
+    return { frames, effect, duration: effect.duration, frameCount: totalFrames, size: dimension };
 };
+
+export const renderEffectFrames = (options) => renderCycleFrames(options);

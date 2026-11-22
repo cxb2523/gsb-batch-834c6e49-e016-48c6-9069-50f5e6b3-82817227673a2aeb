@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Export pipeline acceptance</title>
+    <style>
+        body { font-family: ui-monospace, Consolas, monospace; background: #0a0b10; color: #d5d9e2; margin: 0; padding: 16px; }
+        h1 { font-size: 18px; margin: 0 0 12px; }
+        .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+        button { padding: 6px 14px; border-radius: 6px; border: 1px solid #3a3f52; background: #1b1e2b; color: inherit; cursor: pointer; font: inherit; }
+        button:disabled { opacity: 0.35; cursor: default; }
+        #liveState { font-size: 12px; color: #9aa3b2; margin-bottom: 8px; min-height: 1.2em; }
+        #report { background: #14161f; border: 1px solid #262a3a; border-radius: 8px; padding: 12px; font-size: 12px; white-space: pre-wrap; max-height: 52vh; overflow: auto; }
+        iframe { width: 1080px; height: 760px; border: 1px solid #262a3a; border-radius: 8px; margin-top: 12px; background: #fff; }
+    </style>
+</head>
+<body data-status="running">
+    <h1>Export pipeline acceptance</h1>
+    <div class="toolbar">
+        <button id="runAllBtn" type="button" disabled>Run all checks</button>
+        <button id="startSlowGifBtn" type="button" disabled>Start slow GIF export (256×48)</button>
+        <button id="cancelExportBtn" type="button" disabled>Cancel in-flight export</button>
+    </div>
+    <div id="liveState">Booting…</div>
+    <pre id="report">Booting…</pre>
+    <iframe id="appFrame" src="../index.html" title="Pixel FX Forge"></iframe>
+
+    <script type="module">
+        import { AbilityEffect, renderCycleFrames } from '../js/AbilityEffect.js';
+
+        const reportEl = document.querySelector('#report');
+        const liveStateEl = document.querySelector('#liveState');
+        const runAllBtn = document.querySelector('#runAllBtn');
+        const startSlowGifBtn = document.querySelector('#startSlowGifBtn');
+        const cancelBtn = document.querySelector('#cancelExportBtn');
+        const iframe = document.querySelector('#appFrame');
+
+        const report = { finished: false, passed: false, checks: [] };
+        const render = () => {
+            report.passed = report.checks.length > 0 && report.checks.every((entry) => entry.passed);
+            reportEl.textContent = JSON.stringify(report, null, 2);
+            document.body.dataset.status = report.finished
+                ? (report.passed ? 'passed' : 'failed')
+                : 'running';
+        };
+        const check = (name, passed, details) => {
+            report.checks.push(details === undefined
+                ? { name, passed }
+                : { name, passed, details });
+            render();
+        };
+
+        // ---- trackers installed inside the app iframe -------------------------------
+        const downloads = [];
+        const liveWorkers = new Set();
+        const liveUrls = new Set();
+        let app = null;
+        let doc = null;
+
+        const installTrackers = () => {
+            const win = iframe.contentWindow;
+            const OriginalWorker = win.Worker;
+            win.Worker = class extends OriginalWorker {
+                constructor(...args) {
+                    super(...args);
+                    liveWorkers.add(this);
+                }
+                terminate() {
+                    liveWorkers.delete(this);
+                    super.terminate();
+                }
+            };
+            const createObjectURL = win.URL.createObjectURL.bind(win.URL);
+            const revokeObjectURL = win.URL.revokeObjectURL.bind(win.URL);
+            win.URL.createObjectURL = (blob) => {
+                const url = createObjectURL(blob);
+                liveUrls.add(url);
+                return url;
+            };
+            win.URL.revokeObjectURL = (url) => {
+                liveUrls.delete(url);
+                revokeObjectURL(url);
+            };
+            const anchorClick = win.HTMLAnchorElement.prototype.click;
+            win.HTMLAnchorElement.prototype.click = function () {
+                if (this.download) {
+                    downloads.push({ name: this.download, href: this.href });
+                    return;
+                }
+                anchorClick.call(this);
+            };
+        };
+
+        // ---- helpers ------------------------------------------------------------------
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        const waitFor = async (condition, timeout = 30000, interval = 60) => {
+            const start = performance.now();
+            while (!condition()) {
+                if (performance.now() - start > timeout) {
+                    throw new Error(`waitFor timed out after ${timeout}ms`);
+                }
+                await sleep(interval);
+            }
+        };
+
+        const checksumCanvas = (canvas) => {
+            const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+            let hash = 2166136261;
+            for (let index = 0; index < data.length; index += 1) {
+                hash ^= data[index];
+                hash = Math.imul(hash, 16777619);
+            }
+            return hash >>> 0;
+        };
+
+        const countEdgePixels = (canvas) => {
+            const context = canvas.getContext('2d');
+            const { width, height } = canvas;
+            const strips = [
+                context.getImageData(0, 0, width, 1).data,
+                context.getImageData(0, height - 1, width, 1).data,
+                context.getImageData(0, 1, 1, height - 2).data,
+                context.getImageData(width - 1, 1, 1, height - 2).data
+            ];
+            let occupied = 0;
+            for (const strip of strips) {
+                for (let index = 3; index < strip.length; index += 4) {
+                    if (strip[index] > 0) occupied += 1;
+                }
+            }
+            return occupied;
+        };
+
+        // Checksums the preview canvas would show for a recipe, computed through the
+        // same renderCycleFrames pipeline plus the 160x160 preview blit.
+        const expectedCanvasChecksums = async (recipe, size, frameCount) => {
+            const { frames } = await renderCycleFrames({ recipe, size, frameCount });
+            const sums = new Set();
+            for (const frame of frames) {
+                const canvas = document.createElement('canvas');
+                canvas.width = 160;
+                canvas.height = 160;
+                const context = canvas.getContext('2d');
+                context.imageSmoothingEnabled = false;
+                context.drawImage(frame, 0, 0, 160, 160);
+                sums.add(checksumCanvas(canvas));
+            }
+            return sums;
+        };
+
+        const setExportSettings = (size, frameCount) => {
+            const sizeSelect = doc.querySelector('#canvasSizeSelect');
+            const frameSelect = doc.querySelector('#frameCountSelect');
+            sizeSelect.value = String(size);
+            frameSelect.value = String(frameCount);
+            sizeSelect.dispatchEvent(new app.Event('change', { bubbles: true }));
+            frameSelect.dispatchEvent(new app.Event('change', { bubbles: true }));
+        };
+
+        const setSeed = (seed) => {
+            const input = doc.querySelector('#seedInput');
+            input.value = String(seed);
+            input.dispatchEvent(new app.Event('change', { bubbles: true }));
+        };
+
+        const settlePreview = async () => {
+            await waitFor(() => {
+                const cacheRecipe = app.__pixelFxForge.getPreviewCacheRecipe();
+                return !app.__pixelFxForge.isPreviewBuilding()
+                    && cacheRecipe
+                    && cacheRecipe.seed === app.__pixelFxForge.getRecipe().seed;
+            }, 45000);
+            await sleep(250); // let the fresh cache reach the canvas
+        };
+
+        // ---- checks -------------------------------------------------------------------
+        const testPipelineConsistency = async () => {
+            const recipe = app.__pixelFxForge.getRecipe();
+            const size = 160;
+            const frameCount = 24;
+            const { frames, duration } = await renderCycleFrames({ recipe, size, frameCount });
+
+            const cycleCanvas = document.createElement('canvas');
+            cycleCanvas.width = size;
+            cycleCanvas.height = size;
+            new AbilityEffect(recipe).draw(cycleCanvas.getContext('2d'), duration);
+            const first = checksumCanvas(frames[0]);
+            check('first frame equals the cycle frame', first === checksumCanvas(cycleCanvas));
+            check('last frame does not repeat the first frame',
+                checksumCanvas(frames[frameCount - 1]) !== first);
+
+            const again = await renderCycleFrames({ recipe, size, frameCount });
+            check('pipeline is deterministic',
+                again.frames.every((frame, index) => checksumCanvas(frame) === checksumCanvas(frames[index])));
+
+            let edge = 0;
+            frames.forEach((frame) => { edge += countEdgePixels(frame); });
+            check('frames keep the border clear', edge === 0, { edgePixels: edge });
+            check('pivot stays fixed at (80, 80)', recipe.originX === 80 && recipe.originY === 80,
+                { originX: recipe.originX, originY: recipe.originY });
+        };
+
+        const testPreviewCache = async () => {
+            setExportSettings(160, 32);
+            await settlePreview();
+            const fx = doc.querySelector('#fxCanvas');
+            const before = app.__pixelFxForge.getRecipe();
+            const oldExpected = await expectedCanvasChecksums(before, 160, 32);
+            check('preview matches the shared pipeline', oldExpected.has(checksumCanvas(fx)));
+
+            const newSeed = before.seed === 91517 ? 734211 : 91517;
+            setSeed(newSeed);
+            await waitFor(() => app.__pixelFxForge.getRecipe().seed === newSeed, 10000);
+            const after = app.__pixelFxForge.getRecipe();
+            const newExpected = await expectedCanvasChecksums(after, 160, 32);
+
+            // While the new loop builds, the canvas may show the old cache or the new
+            // one — never anything else.
+            let foreign = null;
+            const deadline = performance.now() + 5000;
+            while (performance.now() < deadline) {
+                const sum = checksumCanvas(fx);
+                if (!oldExpected.has(sum) && !newExpected.has(sum)) { foreign = sum; break; }
+                await sleep(50);
+            }
+            check('preview only ever shows frames from a valid cache', foreign === null, { foreign });
+
+            await settlePreview();
+            check('preview cache rebuilt for the new recipe',
+                app.__pixelFxForge.getPreviewCacheRecipe().seed === newSeed);
+
+            // Once settled, a late stale build must never overwrite the new picture.
+            let stale = null;
+            const watchEnd = performance.now() + 900;
+            while (performance.now() < watchEnd) {
+                const sum = checksumCanvas(fx);
+                if (!newExpected.has(sum)) { stale = sum; break; }
+                await sleep(60);
+            }
+            check('stale build results never overwrote the new preview', stale === null, { stale });
+        };
+
+        const testNormalExports = async () => {
+            setExportSettings(160, 32);
+            let downloadsBefore = downloads.length;
+            doc.querySelector('#exportAtlasBtn').click();
+            check('export buttons lock while exporting',
+                doc.querySelector('#exportAtlasBtn').disabled
+                && !doc.querySelector('#cancelExportBtn').disabled);
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 30000);
+            check('export buttons unlock after export',
+                !doc.querySelector('#exportAtlasBtn').disabled
+                && doc.querySelector('#cancelExportBtn').disabled);
+            const atlas = downloads.at(-1);
+            check('sprite atlas download produced',
+                downloads.length === downloadsBefore + 1 && atlas.name.startsWith('atlas-') && atlas.name.endsWith('.png'),
+                atlas);
+            check('atlas preview updated',
+                !doc.querySelector('#atlasPreviewShell').hidden
+                && Boolean(doc.querySelector('#atlasPreview img')));
+
+            downloadsBefore = downloads.length;
+            doc.querySelector('#exportFramesBtn').click();
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 30000);
+            const zipDownload = downloads.at(-1);
+            check('png sequence download produced',
+                downloads.length === downloadsBefore + 1 && zipDownload.name.endsWith('.zip'), zipDownload);
+            const zipBlob = await (await fetch(zipDownload.href)).blob();
+            const zip = await app.JSZip.loadAsync(zipBlob);
+            const recipeJson = JSON.parse(await zip.file('recipe.json').async('string'));
+            check('zip recipe.json matches the locked snapshot',
+                JSON.stringify(recipeJson) === JSON.stringify(app.__pixelFxForge.getRecipe()));
+            const pngCount = Object.keys(zip.files).filter((name) => name.endsWith('.png')).length;
+            check('zip holds one png per frame', pngCount === 32, { pngCount });
+
+            downloadsBefore = downloads.length;
+            doc.querySelector('#exportGifBtn').click();
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 120000);
+            const gifDownload = downloads.at(-1);
+            const gifBlob = await (await fetch(gifDownload.href)).blob();
+            const header = new Uint8Array(await gifBlob.slice(0, 6).arrayBuffer());
+            check('transparent gif download produced',
+                downloads.length === downloadsBefore + 1
+                && gifDownload.name.endsWith('.gif')
+                && String.fromCharCode(...header) === 'GIF89a',
+                gifDownload);
+            check('gif workers released after success', liveWorkers.size === 0,
+                { liveWorkers: liveWorkers.size });
+        };
+
+        const testSnapshotLock = async () => {
+            setExportSettings(160, 32);
+            const seedA = 615111;
+            setSeed(seedA);
+            await waitFor(() => app.__pixelFxForge.getRecipe().seed === seedA, 10000);
+            doc.querySelector('#exportFramesBtn').click();
+            await waitFor(() => app.__pixelFxForge.isExportActive(), 10000);
+            const seedB = 628222;
+            setSeed(seedB); // mid-export edit: must not leak into the running export
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 30000);
+
+            const zipDownload = downloads.at(-1);
+            const zipBlob = await (await fetch(zipDownload.href)).blob();
+            const zip = await app.JSZip.loadAsync(zipBlob);
+            const recipeJson = JSON.parse(await zip.file('recipe.json').async('string'));
+            check('zip recipe.json came from the locked snapshot', recipeJson.seed === seedA,
+                { snapshotSeed: recipeJson.seed, expectedSeed: seedA });
+            check('live recipe moved on to the edit', app.__pixelFxForge.getRecipe().seed === seedB);
+            const notice = doc.querySelector('#notice').textContent;
+            check('stale snapshot notice shown on completion', /stale/i.test(notice), { notice });
+        };
+
+        const testCancelAndRelease = async () => {
+            setExportSettings(256, 48);
+
+            // Round A: cancel during frame rendering. The cancel is issued in the
+            // same turn as the export click, while the renderer is suspended at
+            // its first yield — the export is guaranteed to be in progress.
+            const urlsBefore = new Set(liveUrls);
+            let downloadsBefore = downloads.length;
+            doc.querySelector('#exportGifBtn').click();
+            check('export in progress when cancel is triggered', app.__pixelFxForge.isExportActive());
+            doc.querySelector('#cancelExportBtn').click();
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 30000);
+            await sleep(300);
+            check('buttons restored after cancel',
+                !doc.querySelector('#exportGifBtn').disabled
+                && doc.querySelector('#cancelExportBtn').disabled);
+            check('cancelled export produced no download', downloads.length === downloadsBefore);
+            const leakedUrls = [...liveUrls].filter((url) => !urlsBefore.has(url));
+            check('no object urls leaked after cancel', leakedUrls.length === 0, { leakedUrls });
+            check('workers released after cancel', liveWorkers.size === 0,
+                { liveWorkers: liveWorkers.size });
+            const notice = doc.querySelector('#notice').textContent;
+            check('cancel notice shown', /cancel/i.test(notice), { notice });
+
+            // Round B: cancel during GIF encoding, while workers are busy.
+            downloadsBefore = downloads.length;
+            doc.querySelector('#exportGifBtn').click();
+            const sawEncoding = await waitFor(
+                () => doc.querySelector('#notice').textContent.includes('Encoding'),
+                20000, 5
+            ).then(() => true, () => false);
+            check('gif encoding phase reached', sawEncoding);
+            check('encode cancel lands mid-export', app.__pixelFxForge.isExportActive());
+            doc.querySelector('#cancelExportBtn').click();
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 30000);
+            await sleep(300);
+            check('buttons restored after encode cancel',
+                !doc.querySelector('#exportGifBtn').disabled
+                && doc.querySelector('#cancelExportBtn').disabled);
+            check('workers released after encode cancel', liveWorkers.size === 0,
+                { liveWorkers: liveWorkers.size });
+            check('encode cancel produced no download', downloads.length === downloadsBefore);
+
+            await sleep(1200);
+            check('no residual timers fire after cancel',
+                downloads.length === downloadsBefore
+                && liveWorkers.size === 0
+                && !app.__pixelFxForge.isExportActive());
+
+            // Round C: a fresh export must run cleanly after the cancelled ones.
+            setExportSettings(160, 24);
+            downloadsBefore = downloads.length;
+            doc.querySelector('#exportGifBtn').click();
+            await waitFor(() => !app.__pixelFxForge.isExportActive(), 120000);
+            const gifDownload = downloads.at(-1);
+            check('new export after cancel completes',
+                downloads.length === downloadsBefore + 1 && gifDownload.name.endsWith('.gif'),
+                gifDownload);
+            check('workers released after the follow-up export', liveWorkers.size === 0,
+                { liveWorkers: liveWorkers.size });
+        };
+
+        // ---- wiring -------------------------------------------------------------------
+        let running = false;
+        runAllBtn.addEventListener('click', async () => {
+            if (running || !app) return;
+            running = true;
+            runAllBtn.disabled = true;
+            const run = async (name, fn) => {
+                try {
+                    await fn();
+                } catch (error) {
+                    check(`${name} (group)`, false, String(error?.stack || error));
+                }
+            };
+            await run('pipeline consistency', testPipelineConsistency);
+            await run('preview cache', testPreviewCache);
+            await run('normal exports', testNormalExports);
+            await run('snapshot lock', testSnapshotLock);
+            await run('cancel and release', testCancelAndRelease);
+            report.finished = true;
+            render();
+            runAllBtn.disabled = false;
+            running = false;
+        });
+
+        startSlowGifBtn.addEventListener('click', () => {
+            if (!app) return;
+            setExportSettings(256, 48);
+            doc.querySelector('#exportGifBtn').click();
+        });
+        cancelBtn.addEventListener('click', () => {
+            doc?.querySelector('#cancelExportBtn')?.click();
+        });
+
+        setInterval(() => {
+            if (!app || !doc) return;
+            const active = app.__pixelFxForge?.isExportActive?.() ?? false;
+            cancelBtn.disabled = !active;
+            liveStateEl.textContent = [
+                `export active: ${active}`,
+                `atlas button disabled: ${doc.querySelector('#exportAtlasBtn')?.disabled}`,
+                `cancel button disabled: ${doc.querySelector('#cancelExportBtn')?.disabled}`,
+                `downloads: ${downloads.length}`,
+                `live workers: ${liveWorkers.size}`,
+                `live object urls: ${liveUrls.size}`
+            ].join(' · ');
+        }, 250);
+
+        try {
+            await new Promise((resolve, reject) => {
+                iframe.addEventListener('load', resolve, { once: true });
+                setTimeout(() => reject(new Error('iframe load timed out')), 15000);
+            });
+            installTrackers();
+            app = iframe.contentWindow;
+            doc = iframe.contentDocument;
+            await waitFor(() => app.__pixelFxForge, 15000);
+            check('app booted inside iframe', true);
+            runAllBtn.disabled = false;
+            startSlowGifBtn.disabled = false;
+        } catch (error) {
+            check('app booted inside iframe', false, String(error?.stack || error));
+            report.finished = true;
+            render();
+        }
+    </script>
+</body>
+</html>
