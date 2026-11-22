@@ -115,4 +115,71 @@ describe('SegmentManager', () => {
   it('should have a destroy method that does not throw', () => {
     expect(() => segmentManager.destroy()).not.toThrow();
   });
+
+  describe('branch failure and teardown', () => {
+    const getListeners = (type: string) =>
+      (videoElement.addEventListener as vi.Mock).mock.calls
+        .filter((call) => call[0] === type)
+        .map((call) => call[1]);
+
+    it('should restore the main video when the segment errors', () => {
+      segmentManager.playSegment('segment1.mp4');
+      expect(segmentManager.isPlayingSegment()).toBe(true);
+
+      const errorHandler = getListeners('error')[0];
+      errorHandler(new Event('error'));
+
+      expect(videoElement.src).toBe('main.mp4');
+      expect(videoElement.currentTime).toBe(10);
+      expect(segmentManager.isPlayingSegment()).toBe(false);
+      expect(segmentManager.isRestoringMain()).toBe(true);
+    });
+
+    it('should ignore errors when no segment is playing', () => {
+      const errorHandler = getListeners('error')[0];
+      errorHandler(new Event('error'));
+      expect(videoElement.src).toBe('main.mp4');
+      expect(videoElement.load).not.toHaveBeenCalled();
+    });
+
+    it('should restore the main video without playing on destroy', () => {
+      segmentManager.playSegment('segment1.mp4');
+      segmentManager.destroy();
+
+      expect(videoElement.src).toBe('main.mp4');
+      expect(videoElement.currentTime).toBe(10);
+      expect(videoElement.load).toHaveBeenCalledTimes(2); // segment + main restore
+      expect(videoElement.play).not.toHaveBeenCalled();
+      expect(videoElement.removeEventListener).toHaveBeenCalledWith('ended', expect.any(Function));
+      expect(videoElement.removeEventListener).toHaveBeenCalledWith('error', expect.any(Function));
+    });
+
+    it('should not play the segment after destroy', () => {
+      segmentManager.playSegment('segment1.mp4');
+      const loadedMetadata = getListeners('loadedmetadata')[0];
+      segmentManager.destroy();
+
+      loadedMetadata();
+      expect(videoElement.play).not.toHaveBeenCalled();
+    });
+
+    it('should ignore a second playSegment while a branch is active', () => {
+      segmentManager.playSegment('segment1.mp4');
+      segmentManager.playSegment('segment2.mp4');
+      expect(videoElement.src).toBe('segment1.mp4');
+    });
+
+    it('should report the saved main source and time', () => {
+      segmentManager.playSegment('segment1.mp4');
+      expect(segmentManager.getMainVideoSrc()).toBe('main.mp4');
+      expect(segmentManager.getMainVideoTime()).toBe(10);
+    });
+
+    it('should expose handleVideoEnded and return whether a restore started', () => {
+      expect(segmentManager.handleVideoEnded()).toBe(false);
+      segmentManager.playSegment('segment1.mp4');
+      expect(segmentManager.handleVideoEnded()).toBe(true);
+      expect(videoElement.src).toBe('main.mp4');
+    });
+  });
 });

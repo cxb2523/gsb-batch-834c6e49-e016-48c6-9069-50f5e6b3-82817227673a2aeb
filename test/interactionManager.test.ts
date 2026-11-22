@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { InteractionManager } from '../src/interactionManager';
-import { CuePoint, InteractionPayload } from '../src/types';
+import { CuePoint, InteractionPayload, DecisionAdapter } from '../src/types';
 import { I18n } from '../src/i18n';
 
 describe('InteractionManager', () => {
@@ -185,5 +185,99 @@ describe('InteractionManager', () => {
     eventHandler({ target: mockButton });
 
     expect(mockOnResponseCallback).toHaveBeenCalledWith('3', cue);
+  });
+
+  describe('decision source context and deduplication', () => {
+    let saveDecision: vi.Mock;
+    let manager: InteractionManager;
+
+    const branchCue: CuePoint = {
+      id: 'branch',
+      time: 5,
+      payload: {
+        interaction: {
+          type: 'choice-video-segment-change',
+          question: 'Where to?',
+          options: [{ level: 'A', video: 'segment-a.mp4' }],
+        },
+      },
+    };
+    const textCue: CuePoint = {
+      id: 'inside-segment',
+      time: 3,
+      payload: { interaction: { type: 'text', question: 'Name?' } },
+    };
+
+    beforeEach(() => {
+      saveDecision = vi.fn().mockResolvedValue(undefined);
+      manager = new InteractionManager(mockContainer, mockI18n, {
+        saveDecision,
+        getDecisionHistory: vi.fn(),
+        clearDecisionHistory: vi.fn(),
+      } as unknown as DecisionAdapter);
+      manager.onResponse(mockOnResponseCallback);
+    });
+
+    it('records a branch decision as a main-video choice that selected a segment', () => {
+      manager.setSourceContext({ source: 'main' });
+      manager.handleUserResponse('segment-a.mp4', branchCue);
+
+      expect(saveDecision).toHaveBeenCalledTimes(1);
+      expect(saveDecision.mock.calls[0][0]).toMatchObject({
+        cueId: 'branch',
+        choice: 'segment-a.mp4',
+        source: 'main',
+        segmentUrl: 'segment-a.mp4',
+        metadata: {
+          source: 'main',
+          branch: true,
+          selectedSegment: 'segment-a.mp4',
+          interactionType: 'choice-video-segment-change',
+          cueTime: 5,
+        },
+      });
+    });
+
+    it('distinguishes decisions taken inside a branch segment', () => {
+      manager.setSourceContext({ source: 'segment', segmentUrl: 'segment-a.mp4' });
+      manager.handleUserResponse('Taj', textCue);
+
+      expect(saveDecision.mock.calls[0][0]).toMatchObject({
+        cueId: 'inside-segment',
+        choice: 'Taj',
+        source: 'segment',
+        segmentUrl: 'segment-a.mp4',
+        metadata: { source: 'segment', segmentUrl: 'segment-a.mp4' },
+      });
+    });
+
+    it('does not save the same decision twice in one session', () => {
+      manager.setSourceContext({ source: 'main' });
+      manager.handleUserResponse('segment-a.mp4', branchCue);
+      manager.handleUserResponse('segment-a.mp4', branchCue);
+      expect(saveDecision).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps main and segment decisions for the same cue as separate entries', () => {
+      const sharedCue: CuePoint = {
+        id: 'shared',
+        time: 3,
+        payload: { interaction: { type: 'text', question: 'Name?' } },
+      };
+
+      manager.setSourceContext({ source: 'main' });
+      manager.handleUserResponse('first', sharedCue);
+
+      manager.setSourceContext({ source: 'segment', segmentUrl: 'segment-a.mp4' });
+      manager.handleUserResponse('second', sharedCue);
+
+      expect(saveDecision).toHaveBeenCalledTimes(2);
+    });
+
+    it('resets the source context on destroy', () => {
+      manager.setSourceContext({ source: 'segment', segmentUrl: 'segment-a.mp4' });
+      manager.destroy();
+      expect(manager.getSourceContext()).toEqual({ source: 'main' });
+    });
   });
 });

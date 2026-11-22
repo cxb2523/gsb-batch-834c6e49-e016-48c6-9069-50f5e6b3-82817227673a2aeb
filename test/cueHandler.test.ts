@@ -123,4 +123,152 @@ describe('CueHandler', () => {
     expect(registerCuesSpy).toHaveBeenCalledWith(cues);
     expect(videoElement.addEventListener).toHaveBeenCalledWith('timeupdate', expect.any(Function));
   });
+
+  describe('suspension (branch segments)', () => {
+    const setTime = (time: number) => {
+      Object.defineProperty(videoElement, 'currentTime', { value: time, configurable: true });
+    };
+
+    it('should not trigger cues while suspended', () => {
+      cueHandler.registerCues([
+        { id: 'cue1', time: 5 },
+        { id: 'cue2', time: 10 },
+      ]);
+
+      setTime(5);
+      // @ts-ignore - invoking private handler directly
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+
+      cueHandler.suspend();
+      expect(cueHandler.isSuspended()).toBe(true);
+
+      setTime(10);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not re-trigger the cue that started the branch after resuming', () => {
+      cueHandler.registerCues([
+        { id: 'cue1', time: 5 },
+        { id: 'cue2', time: 10 },
+      ]);
+
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+
+      cueHandler.suspend();
+      cueHandler.resume();
+      expect(cueHandler.isSuspended()).toBe(false);
+
+      // Replaying the same position (e.g. restored main video) must not fire
+      // the cue again, but a later cue still fires once.
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+
+      setTime(10);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should treat cues with the same time but different ids independently', () => {
+      cueHandler.registerCues([
+        { id: 'a', time: 5 },
+        { id: 'b', time: 5 },
+      ]);
+
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep triggered state when cues are updated with the same ids', () => {
+      cueHandler.registerCues([{ id: 'cue1', time: 5 }]);
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+
+      // Subtitle-derived cue times are re-resolved after the source switch.
+      cueHandler.updateCues([{ id: 'cue1', time: 7 }], { preserveTriggered: true });
+
+      setTime(7);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+    });
+
+    it('should forget triggered state when updateCues is told not to preserve it', () => {
+      cueHandler.registerCues([{ id: 'cue1', time: 5 }]);
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+
+      cueHandler.updateCues([{ id: 'cue1', time: 5 }], { preserveTriggered: false });
+
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(2);
+    });
+
+    it('should mark a cue as triggered without invoking the callback', () => {
+      const cue: CuePoint = { id: 'cue1', time: 5 };
+      cueHandler.registerCues([cue]);
+      cueHandler.markTriggered(cue);
+      expect(cueHandler.hasTriggered(cue)).toBe(true);
+
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).not.toHaveBeenCalled();
+    });
+
+    it('should not consume a cue when the callback returns false', () => {
+      cueHandler.onCue(() => false);
+      cueHandler.registerCues([{ id: 'cue1', time: 5 }]);
+
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(cueHandler.hasTriggered({ id: 'cue1', time: 5 })).toBe(false);
+
+      // Once the main video is active again the cue can fire.
+      cueHandler.onCue(mockCallback);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).toHaveBeenCalledTimes(1);
+    });
+
+    it('should remove the listener and release the callback on destroy', () => {
+      cueHandler.start();
+      cueHandler.destroy();
+      expect(videoElement.removeEventListener).toHaveBeenCalledWith(
+        'timeupdate',
+        expect.any(Function),
+      );
+
+      cueHandler.registerCues([{ id: 'cue1', time: 5 }]);
+      setTime(5);
+      // @ts-ignore
+      cueHandler.handleTimeUpdate();
+      expect(mockCallback).not.toHaveBeenCalled();
+    });
+
+    it('should only add one timeupdate listener when start is called repeatedly', () => {
+      cueHandler.start();
+      cueHandler.start();
+      cueHandler.start();
+      const timeupdateAdds = (videoElement.addEventListener as vi.Mock).mock.calls.filter(
+        (call) => call[0] === 'timeupdate',
+      );
+      expect(timeupdateAdds).toHaveLength(1);
+    });
+  });
 });

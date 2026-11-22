@@ -47,6 +47,62 @@ describe('InMemoryDecisionAdapter', () => {
     history = await adapter.getDecisionHistory();
     expect(history).toEqual([]);
   });
+
+  it('should keep a single entry when the same decision is saved twice', async () => {
+    const decision: Decision = {
+      cueId: 'cue1',
+      choice: '4',
+      timestamp: 1,
+      source: 'main',
+      metadata: { source: 'main' },
+    };
+    const updated: Decision = { ...decision, choice: '5', timestamp: 2 };
+
+    await adapter.saveDecision(decision);
+    await adapter.saveDecision(decision);
+    expect(await adapter.getDecisionHistory()).toHaveLength(1);
+
+    // Re-answering the same cue in the same source replaces the entry.
+    await adapter.saveDecision(updated);
+    const history = await adapter.getDecisionHistory();
+    expect(history).toHaveLength(1);
+    expect(history[0].choice).toBe('5');
+  });
+
+  it('should keep main-video and segment decisions for the same cue separate', async () => {
+    const mainDecision: Decision = {
+      cueId: 'shared',
+      choice: 'main-choice',
+      timestamp: 1,
+      source: 'main',
+      metadata: { source: 'main' },
+    };
+    const segmentDecision: Decision = {
+      cueId: 'shared',
+      choice: 'segment-choice',
+      timestamp: 2,
+      source: 'segment',
+      segmentUrl: 'segment.mp4',
+      metadata: { source: 'segment', segmentUrl: 'segment.mp4' },
+    };
+
+    await adapter.saveDecision(mainDecision);
+    await adapter.saveDecision(segmentDecision);
+
+    const history = await adapter.getDecisionHistory();
+    expect(history).toHaveLength(2);
+    expect(history.map((d) => d.source)).toEqual(['main', 'segment']);
+  });
+
+  it('should not deduplicate decisions that cannot be identified', async () => {
+    // Legacy decisions without a cue id have no stable identity.
+    const legacyA = { choice: 'a', timestamp: 1 } as unknown as Decision;
+    const legacyB = { choice: 'b', timestamp: 2 } as unknown as Decision;
+
+    await adapter.saveDecision(legacyA);
+    await adapter.saveDecision(legacyB);
+    expect(await adapter.getDecisionHistory()).toHaveLength(2);
+  });
 });
 
 describe('LocalStorageDecisionAdapter', () => {
@@ -167,5 +223,42 @@ describe('LocalStorageDecisionAdapter', () => {
       message: 'Failed to clear decision history',
       cause: error,
     });
+  });
+
+  it('should keep a single entry when the same decision is saved twice', async () => {
+    const decision: Decision = {
+      cueId: 'cue1',
+      choice: '4',
+      timestamp: 1,
+      source: 'main',
+      metadata: { source: 'main' },
+    };
+
+    await adapter.saveDecision(decision);
+    await adapter.saveDecision(decision);
+
+    const history = await adapter.getDecisionHistory();
+    expect(history).toHaveLength(1);
+  });
+
+  it('should keep main-video and segment decisions for the same cue separate', async () => {
+    await adapter.saveDecision({
+      cueId: 'shared',
+      choice: 'main-choice',
+      timestamp: 1,
+      source: 'main',
+      metadata: { source: 'main' },
+    });
+    await adapter.saveDecision({
+      cueId: 'shared',
+      choice: 'segment-choice',
+      timestamp: 2,
+      source: 'segment',
+      segmentUrl: 'segment.mp4',
+      metadata: { source: 'segment', segmentUrl: 'segment.mp4' },
+    });
+
+    const history = await adapter.getDecisionHistory();
+    expect(history).toHaveLength(2);
   });
 });

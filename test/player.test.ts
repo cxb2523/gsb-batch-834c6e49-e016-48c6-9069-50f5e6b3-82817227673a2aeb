@@ -195,10 +195,14 @@ describe('IVLabsPlayer', () => {
     // Simulate segment video ending
     endedCallback();
 
-    // Simulate loadedmetadata for main video after it's restored
-    const mainVideoLoadedMetadataCallback = (
+    // Simulate loadedmetadata for main video after it's restored.
+    // The restore registers a fresh `{ once: true }` handler, so the last such
+    // registration is the one that resumes the main video.
+    const mainVideoLoadedMetadataCalls = (
       videoElement.addEventListener as vi.Mock
-    ).mock.calls.find((call) => call[0] === 'loadedmetadata' && call[2]?.once === true)[1];
+    ).mock.calls.filter((call) => call[0] === 'loadedmetadata' && call[2]?.once === true);
+    const mainVideoLoadedMetadataCallback =
+      mainVideoLoadedMetadataCalls[mainVideoLoadedMetadataCalls.length - 1][1];
     mainVideoLoadedMetadataCallback();
 
     // Expect main video to be restored and played

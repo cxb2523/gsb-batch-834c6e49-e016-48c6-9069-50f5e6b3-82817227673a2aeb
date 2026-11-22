@@ -20,10 +20,24 @@ import { LocalStorageDecisionAdapter } from './localStorageDecisionAdapter';
 import { FALLBACK_CSS } from './style';
 import { SubtitlesManager } from './subtitlesManager';
 
+const ALL_PLAYER_STATES: PlayerState[] = [
+  'idle',
+  'playing',
+  'waitingForInteraction',
+  'ended',
+  'error',
+];
+
 /**
  * The main class for the Interactive Video Labs Player.
  * This class orchestrates the video playback, cue handling, interaction management,
  * and analytics tracking.
+ *
+ * Branch segments temporarily replace the main video source. The player keeps
+ * the cue handler, the segment manager, the interaction manager and the
+ * subtitles manager aligned across that switch so that returning from a
+ * segment resumes the main video at the saved position without re-triggering
+ * already answered cues.
  */
 export class IVLabsPlayer {
   private videoElement: HTMLVideoElementWithControlsList;
@@ -39,6 +53,14 @@ export class IVLabsPlayer {
 
   private videoContainer: HTMLElement;
   private subtitlesElement?: HTMLTrackElement;
+
+  private started = false;
+  private destroyed = false;
+  private eventsBound = false;
+
+  private boundPlayHandler: () => void;
+  private boundPauseHandler: () => void;
+  private boundEndedHandler: () => void;
 
   constructor(target: string, config: PlayerConfig) {
     const targetElement = document.getElementById(target);
@@ -57,10 +79,14 @@ export class IVLabsPlayer {
       this.subtitlesElement.src = config.subtitlesUrl;
       this.subtitlesElement.kind = 'subtitles';
       this.subtitlesElement.default = true;
-      this.subtitlesManager = new SubtitlesManager(this.subtitlesElement, config.cues);
+      this.subtitlesManager = new SubtitlesManager(
+        this.subtitlesElement,
+        config.cues,
+        this.videoElement,
+      );
       this.videoElement.appendChild(this.subtitlesElement);
       this.subtitlesManager.onLoad((cues) => {
-        this.start(cues);
+        this.handleSubtitleCues(cues);
       });
     }
 
@@ -89,15 +115,73 @@ export class IVLabsPlayer {
     }
     this.analytics = new Analytics();
     this.stateMachine = new StateMachine(config.initialState || 'idle');
+    this.registerTransitions();
     this.interactionManager = new InteractionManager(
       this.videoContainer,
       this.i18n,
       this.decisionAdapter,
     );
     this.cueHandler = new CueHandler(this.videoElement);
-    this.segmentManager = new SegmentManager(this.videoElement);
+    this.segmentManager = new SegmentManager(this.videoElement, {
+      onSegmentStart: this.handleSegmentStart,
+      onSegmentEnd: this.handleSegmentEnd,
+      onSegmentError: this.handleSegmentError,
+    });
+
+    this.boundPlayHandler = () => {
+      this.analytics.track('VIDEO_STARTED', {
+        event: 'VIDEO_STARTED',
+        timestamp: Date.now(),
+      });
+    };
+    this.boundPauseHandler = () => {
+      this.analytics.track('VIDEO_PAUSED', {
+        event: 'VIDEO_PAUSED',
+        timestamp: Date.now(),
+      });
+    };
+    this.boundEndedHandler = () => {
+      if (this.destroyed) return;
+      // A branch segment's `ended` event is handled by the SegmentManager,
+      // which restores the main video. Only the main video's end should put
+      // the player into the `ended` state.
+      if (this.segmentManager.isPlayingSegment() || this.segmentManager.isRestoringMain()) {
+        return;
+      }
+      this.analytics.track('VIDEO_ENDED', {
+        event: 'VIDEO_ENDED',
+        timestamp: Date.now(),
+      });
+      this.setState('ended');
+    };
+
     if (!config.subtitlesUrl) {
       this.start(config.cues);
+    }
+  }
+
+  /**
+   * Registers every state-to-state transition so the player can authoritatively
+   * reflect the playback state instead of silently failing transitions.
+   */
+  private registerTransitions(): void {
+    for (const from of ALL_PLAYER_STATES) {
+      for (const to of ALL_PLAYER_STATES) {
+        if (from === to) continue;
+        this.stateMachine.addTransition({ from, to });
+      }
+    }
+  }
+
+  /**
+   * Moves the player to `next`. If the state machine rejects the transition the
+   * state is forced rather than leaving the player in a stale state.
+   */
+  private setState(next: PlayerState): void {
+    if (this.destroyed) return;
+    if (this.stateMachine.getState() === next) return;
+    if (!this.stateMachine.transitionTo(next)) {
+      this.stateMachine.reset(next);
     }
   }
 
@@ -105,86 +189,161 @@ export class IVLabsPlayer {
     this.cueHandler.registerCues(cues || []);
     if (!this.config.videoUrl) throw new Error('videoUrl must be provided in the PlayerConfig.');
     this.videoElement.src = this.config.videoUrl;
-    this.bindEvents();
+    if (!this.eventsBound) {
+      this.bindEvents();
+      this.eventsBound = true;
+    }
     this.cueHandler.start();
+    this.started = true;
+  }
+
+  /**
+   * Handles cue points resolved from subtitles. The first resolution starts the
+   * player; later resolutions (e.g. after the main video was restored following
+   * a branch) refresh cue timings without forgetting which cues already fired.
+   */
+  private handleSubtitleCues(cues?: CuePoint[]): void {
+    if (this.destroyed) return;
+    if (!this.started) {
+      this.start(cues);
+      return;
+    }
+    this.cueHandler.updateCues(cues || this.config.cues || [], { preserveTriggered: true });
   }
 
   /**
    * Binds event listeners for cue handling, interaction response, and analytics.
    */
   private bindEvents(): void {
-    this.cueHandler.onCue((cue: CuePoint) => {
-      this.analytics.track('onCueEnter', {
-        event: 'onCueEnter',
-        cueId: cue.id,
-        timestamp: Date.now(),
-      });
-
-      if (cue.payload?.interaction) {
-        this.videoElement.pause();
-        this.stateMachine.transitionTo('waitingForInteraction');
-        this.interactionManager.handleInteractionCue(cue);
-        this.analytics.track('onPromptShown', {
-          event: 'onPromptShown',
-          cueId: cue.id,
-          timestamp: Date.now(),
-        });
-      } else {
-        this.stateMachine.transitionTo('playing');
-      }
-    });
+    this.cueHandler.onCue((cue: CuePoint) => this.handleCue(cue));
     //eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.interactionManager.onResponse((response: any, cue: CuePoint) => {
-      this.analytics.track('onInteractionSelected', {
-        event: 'onInteractionSelected',
+      this.handleInteractionResponse(response, cue);
+    });
+
+    this.videoElement.addEventListener('play', this.boundPlayHandler);
+    this.videoElement.addEventListener('pause', this.boundPauseHandler);
+    this.videoElement.addEventListener('ended', this.boundEndedHandler);
+  }
+
+  /**
+   * Handles a fired cue.
+   * @returns `false` when the cue must not be consumed yet (a branch segment is
+   *   active), so it can fire once the main video resumes.
+   */
+  private handleCue(cue: CuePoint): boolean {
+    if (this.destroyed) return true;
+    // Defensive guard: main-video cues must never be evaluated while a branch
+    // segment owns the timeline. Returning `false` leaves the cue untriggered
+    // instead of silently swallowing it.
+    if (this.segmentManager.isPlayingSegment() || this.cueHandler.isSuspended()) return false;
+
+    this.analytics.track('onCueEnter', {
+      event: 'onCueEnter',
+      cueId: cue.id,
+      timestamp: Date.now(),
+    });
+
+    if (cue.payload?.interaction) {
+      this.videoElement.pause();
+      this.setState('waitingForInteraction');
+      this.interactionManager.handleInteractionCue(cue);
+      this.analytics.track('onPromptShown', {
+        event: 'onPromptShown',
         cueId: cue.id,
-        data: { response },
         timestamp: Date.now(),
       });
+    } else {
+      this.setState('playing');
+    }
 
-      if (response && response.nextSegment) {
-        this.analytics.track('onBranchJump', {
-          event: 'onBranchJump',
-          cueId: cue.id,
-          data: { nextSegment: response.nextSegment },
-          timestamp: Date.now(),
-        });
-        this.segmentManager.playSegment(response.nextSegment);
-      } else {
-        this.videoElement.play().catch((error) => {
-          console.error('Video playback failed:', error);
-        });
-      }
-      console.log('Interaction response received:', response);
-      this.stateMachine.transitionTo('playing');
-      this.analytics.track('INTERACTION_COMPLETED', {
-        event: 'INTERACTION_COMPLETED',
+    return true;
+  }
+
+  //eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private handleInteractionResponse(response: any, cue: CuePoint): void {
+    if (this.destroyed) return;
+
+    this.analytics.track('onInteractionSelected', {
+      event: 'onInteractionSelected',
+      cueId: cue.id,
+      data: { response },
+      timestamp: Date.now(),
+    });
+
+    if (response && response.nextSegment) {
+      this.analytics.track('onBranchJump', {
+        event: 'onBranchJump',
         cueId: cue.id,
-        data: { response },
+        data: { nextSegment: response.nextSegment },
         timestamp: Date.now(),
       });
-    });
+      this.startBranch(response.nextSegment, cue);
+    } else {
+      this.videoElement.play().catch((error) => {
+        console.error('Video playback failed:', error);
+      });
+      this.setState('playing');
+    }
 
-    this.videoElement.addEventListener('play', () => {
-      this.analytics.track('VIDEO_STARTED', {
-        event: 'VIDEO_STARTED',
-        timestamp: Date.now(),
-      });
+    this.analytics.track('INTERACTION_COMPLETED', {
+      event: 'INTERACTION_COMPLETED',
+      cueId: cue.id,
+      data: { response },
+      timestamp: Date.now(),
     });
+  }
 
-    this.videoElement.addEventListener('pause', () => {
-      this.analytics.track('VIDEO_PAUSED', {
-        event: 'VIDEO_PAUSED',
-        timestamp: Date.now(),
-      });
-    });
+  /**
+   * Enters a branch segment: the answered cue is consumed, cue triggering is
+   * suspended, subtitles are detached and the segment manager takes over the
+   * video source. The main source and position were saved by the segment
+   * manager at this point.
+   */
+  private startBranch(segmentUrl: string, cue?: CuePoint): void {
+    if (this.destroyed) return;
+    if (this.segmentManager.isPlayingSegment() || this.segmentManager.isRestoringMain()) {
+      // Ignore nested branch requests while a branch transition is in flight.
+      return;
+    }
+    if (cue) this.cueHandler.markTriggered(cue);
+    this.cueHandler.suspend();
+    this.setState('playing');
+    this.segmentManager.playSegment(segmentUrl);
+  }
 
-    this.videoElement.addEventListener('ended', () => {
-      this.analytics.track('VIDEO_ENDED', {
-        event: 'VIDEO_ENDED',
-        timestamp: Date.now(),
-      });
+  private handleSegmentStart = (segmentUrl: string): void => {
+    if (this.destroyed) return;
+    this.cueHandler.suspend();
+    this.interactionManager.setSourceContext({ source: 'segment', segmentUrl });
+    this.subtitlesManager?.detachForSegment();
+    this.setState('playing');
+  };
+
+  private handleSegmentEnd = (): void => {
+    if (this.destroyed) return;
+    // Order matters: re-resolve the subtitle track against the restored main
+    // video (which refreshes cue timings) before cue triggering resumes, so
+    // the first `timeupdate` after the branch already uses main-video times.
+    this.subtitlesManager?.attachForMain();
+    this.cueHandler.resume();
+    this.interactionManager.setSourceContext({ source: 'main' });
+    this.setState('playing');
+  };
+
+  private handleSegmentError = (error: unknown): void => {
+    if (this.destroyed) return;
+    this.analytics.track('ERROR', {
+      event: 'ERROR',
+      timestamp: Date.now(),
+      data: { segmentError: String(error) },
     });
+  };
+
+  private releaseVideoListeners(): void {
+    this.videoElement.removeEventListener('play', this.boundPlayHandler);
+    this.videoElement.removeEventListener('pause', this.boundPauseHandler);
+    this.videoElement.removeEventListener('ended', this.boundEndedHandler);
   }
 
   /** Loads cue points into the player. */
@@ -200,6 +359,11 @@ export class IVLabsPlayer {
   /** Returns the current player state. */
   public getState(): PlayerState {
     return this.stateMachine.getState();
+  }
+
+  /** Whether a branch segment currently owns the video element. */
+  public isPlayingSegment(): boolean {
+    return this.segmentManager.isPlayingSegment();
   }
 
   /** Plays the video. */
@@ -267,11 +431,27 @@ export class IVLabsPlayer {
     document.head.appendChild(style);
   }
 
-  /** Cleans up the player, removes listeners and resets state. */
+  /**
+   * Cleans up the player, removes listeners and resets state.
+   *
+   * When called while a branch segment is playing the main video source and
+   * position are restored first (paused), so the underlying video element is
+   * left in a state where the main video can be played again.
+   */
   public destroy(): void {
+    if (this.destroyed) return;
     console.log('IVLabsPlayer destroy() called.');
+    this.destroyed = true;
+
+    this.releaseVideoListeners();
+    // Restores the main source/time (paused) and removes the segment listeners.
+    this.segmentManager.destroy();
     this.cueHandler.destroy();
     this.interactionManager.destroy();
+    this.subtitlesManager?.destroy();
+    this.started = false;
+    this.eventsBound = false;
+
     this.analytics.track('onSessionEnd', {
       event: 'onSessionEnd',
       timestamp: Date.now(),

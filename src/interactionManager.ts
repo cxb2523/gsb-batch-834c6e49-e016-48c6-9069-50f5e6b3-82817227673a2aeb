@@ -5,11 +5,14 @@ import {
   CuePoint as Cue,
   Decision,
   DecisionAdapter,
+  DecisionMetadata,
+  DecisionSourceContext,
   TextInteraction,
   InteractionPayload,
   RatingInteraction,
 } from './types';
 import { I18n } from './i18n';
+import { decisionKey } from './decisionUtils';
 
 type InteractionHandler = (payload: InteractionPayload, cue: Cue) => void;
 //eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -23,6 +26,9 @@ export class InteractionManager {
   private interactionStore: Map<number, Cue>;
   private i18n: I18n;
   private decisionAdapter: DecisionAdapter;
+  private sourceContext: DecisionSourceContext = { source: 'main' };
+  /** Keys of the decisions this manager saved, so a retried response does not duplicate. */
+  private savedDecisionKeys: Set<string> = new Set();
 
   private interactionRenderers = {
     choice: this.renderChoiceInteraction.bind(this) as (
@@ -65,6 +71,23 @@ export class InteractionManager {
 
   public onResponse(handler: ResponseHandler) {
     this.onResponseCallback = handler;
+  }
+
+  /**
+   * Records which playback source (main video or branch segment) is active.
+   * Decisions made afterwards carry this context so the history can tell a
+   * main-video choice apart from a choice made inside a branch segment.
+   */
+  public setSourceContext(context: DecisionSourceContext): void {
+    this.sourceContext = {
+      source: context.source,
+      ...(context.segmentUrl ? { segmentUrl: context.segmentUrl } : {}),
+    };
+  }
+
+  /** Returns the current playback source context. */
+  public getSourceContext(): DecisionSourceContext {
+    return { ...this.sourceContext };
   }
 
   public handleInteractionCue(cue: Cue) {
@@ -232,20 +255,65 @@ export class InteractionManager {
     this.interactionDiv?.remove();
     this.interactionDiv = null;
   }
+
+  /**
+   * Builds the decision for a user response, including the playback source
+   * that was active when the response was given.
+   */
+  private buildDecision(response: unknown, cue: Cue): Decision {
+    const payload = cue.payload?.interaction;
+    const isBranch = payload?.type === 'choice-video-segment-change';
+    const source = this.sourceContext.source;
+    const activeSegmentUrl = this.sourceContext.segmentUrl;
+
+    const metadata: DecisionMetadata = {
+      interactionType: payload?.type,
+      source,
+      cueTime: cue.time,
+    };
+
+    if (activeSegmentUrl) {
+      metadata.segmentUrl = activeSegmentUrl;
+    }
+    if (isBranch) {
+      metadata.selectedSegment = String(response);
+      metadata.branch = true;
+    }
+
+    return {
+      cueId: cue.id,
+      choice: String(response),
+      timestamp: Date.now(),
+      source,
+      // The branch target is the decision's segment; for a decision taken
+      // inside a segment, the active segment is the relevant one.
+      ...(isBranch
+        ? { segmentUrl: String(response) }
+        : activeSegmentUrl
+          ? { segmentUrl: activeSegmentUrl }
+          : {}),
+      metadata,
+    };
+  }
+
   //eslint-disable-next-line @typescript-eslint/no-explicit-any
   public handleUserResponse(response: any, cue: Cue) {
     const payload = cue.payload?.interaction;
 
     if (!this.onResponseCallback) return;
 
-    const decision: Decision = {
-      cueId: cue.id,
-      choice: response,
-      timestamp: Date.now(),
-      metadata: { interactionType: payload?.type },
-    };
+    const decision = this.buildDecision(response, cue);
+    const key = decisionKey(decision);
 
-    this.decisionAdapter.saveDecision(decision);
+    // Persist the decision once per (cue, source, segment). A duplicated
+    // response (e.g. double click, or a cue answered twice) must not append a
+    // second history entry.
+    if (!key || !this.savedDecisionKeys.has(key)) {
+      if (key) this.savedDecisionKeys.add(key);
+      Promise.resolve(this.decisionAdapter.saveDecision(decision)).catch((error) => {
+        console.error('Failed to save decision:', error);
+      });
+    }
 
     if (payload?.type === 'choice-video-segment-change') {
       this.onResponseCallback({ nextSegment: response }, cue);
@@ -261,5 +329,7 @@ export class InteractionManager {
     this.onResponseCallback = undefined;
     this.clearInteractions();
     this.interactionStore.clear();
+    this.savedDecisionKeys.clear();
+    this.sourceContext = { source: 'main' };
   }
 }

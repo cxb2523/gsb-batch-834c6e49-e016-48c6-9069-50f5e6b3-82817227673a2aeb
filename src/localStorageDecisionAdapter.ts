@@ -1,8 +1,12 @@
 import { Decision, DecisionAdapter } from './types';
+import { decisionKey } from './decisionUtils';
 
 /**
  * The LocalStorageDecisionAdapter class implements the DecisionAdapter interface
  * and uses local storage to store decisions.
+ *
+ * Saving a decision that identifies the same (cue, playback source, segment)
+ * pair replaces the previous entry instead of appending a duplicate.
  */
 export class LocalStorageDecisionAdapter implements DecisionAdapter {
   private readonly STORAGE_KEY = 'ivl_decision_history';
@@ -14,7 +18,13 @@ export class LocalStorageDecisionAdapter implements DecisionAdapter {
   async saveDecision(decision: Decision): Promise<void> {
     try {
       const history = await this.getDecisionHistory();
-      history.push(decision);
+      const key = decisionKey(decision);
+      const existingIndex = key ? history.findIndex((saved) => decisionKey(saved) === key) : -1;
+      if (existingIndex >= 0) {
+        history[existingIndex] = decision;
+      } else {
+        history.push(decision);
+      }
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(history));
     } catch (error) {
       console.error('Failed to save decision to localStorage:', error);
