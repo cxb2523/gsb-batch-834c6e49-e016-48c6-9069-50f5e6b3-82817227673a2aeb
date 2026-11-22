@@ -34,10 +34,11 @@ import {
     GetMaxRenderCount,
     GetLodActiveXyz,
     SplatUpdateBoundBox,
-    GetDataArrayTexture,
     OnStartLodShown,
     GetSortType,
     WorkerUpdateParams,
+    NotifyWkA01ReleaseSplatFile,
+    LodDownloadManagerDispose,
 } from '../../events/EventConstants';
 import {
     WkA10Information,
@@ -81,7 +82,7 @@ import { DataStatus, SplatFile, SplatTiles } from '../SplatTiles';
 import { SplatMeshOptions } from '../../meshs/splatmesh/SplatMeshOptions';
 import { sleep } from '../../utils/CommonUtils';
 import { ModelOptions } from '../ModelOptions';
-import { DataArrayTexture, Matrix4, Vector3 } from 'three';
+import { Matrix4, Vector3 } from 'three';
 
 export function setupWorkerLod(events: Events) {
     let disposed = false;
@@ -95,7 +96,8 @@ export function setupWorkerLod(events: Events) {
 
     const oSetFileKey = new Set<string>();
     const mapCalcLayer = new Map<string, Function>();
-    const recycleMap = new Map<string, SplatFile>();
+    /** 已发起槽位请求的分块，避免同一分块重复占位 */
+    const requestedLayerSet = new Set<string>();
 
     let fnResolveSplatTiles: Function;
     const primoseSplatTiles = new Promise(res => (fnResolveSplatTiles = res));
@@ -172,7 +174,8 @@ export function setupWorkerLod(events: Events) {
         splatFile.status = DataStatus.WaitFetch;
         splatFile.downloadData = null;
         splatFile.xyz = null;
-        splatFile.targetLayer = -9;
+        // 保留已分配的槽位（重传需按该槽位写入），未分配时标记待分配
+        if (splatFile.targetLayer === undefined || splatFile.targetLayer === null) splatFile.targetLayer = -9;
 
         oSetFileKey.add(fileKey);
         fire(OnFetchStart);
@@ -221,71 +224,68 @@ export function setupWorkerLod(events: Events) {
 
     function onWkA10ReturnLayer(fileKey: string, targetLayer: number) {
         const splatFile = splatTiles.files[fileKey];
+        if (!splatFile) return;
         splatFile.targetLayer = targetLayer;
+        requestedLayerSet.delete(fileKey);
     }
 
     function onWkA10BoundBox(wkBox: number[]) {
         fire(SplatUpdateBoundBox, ...wkBox);
     }
 
-    function onWkA10Recycle(fileKey: string, offset: number, downloadCount: number, xyz: Float32Array) {
-        const dataTexture: DataArrayTexture = fire(GetDataArrayTexture);
-        const downloadData = new Uint8Array(dataTexture.image.data.buffer).slice(offset * 32, (offset + downloadCount) * 32);
-        recycleMap.set(fileKey, { fileKey, downloadCount, xyz, downloadData, lastTime: Date.now() });
+    function onWkA10Recycle(fileKey: string) {
+        // 回收：通知GPU缓存释放槽位、清除就绪标记与旧偏移量（正在写入的槽位由缓存延迟释放）
+        fire(NotifyWkA01ReleaseSplatFile, fileKey);
+        // 移出待上传集合，避免下一轮又立刻为它请求槽位（重新靠近时由worker重新触发下载与占位）
+        oSetFileKey.delete(fileKey);
+        const splatFile = splatTiles.files[fileKey];
+        if (splatFile) {
+            // 与worker侧保持一致的"需要重新下载/上传"状态，避免用陈旧数据再次上传
+            splatFile.textureReady = false;
+            splatFile.offset = undefined;
+            splatFile.targetLayer = -1;
+            splatFile.downloadCount = 0;
+            splatFile.downloadData = null;
+            splatFile.xyz = null;
+            splatFile.status = DataStatus.None;
+            requestedLayerSet.delete(fileKey);
+        }
     }
 
     async function processDownload() {
         oSetFileKey.forEach(async fileKey => {
             const splatFile = splatTiles.files[fileKey];
             if (splatFile.status === DataStatus.WaitFetch) {
-                if (recycleMap.has(fileKey)) {
-                    // 尝试从缓存恢复取数据
-                    const tmpFile = recycleMap.get(fileKey);
-                    recycleMap.delete(fileKey);
+                // 下载
+                splatFile.status = DataStatus.WaitFetch | DataStatus.Fetching;
 
-                    splatFile.downloadData = tmpFile.downloadData;
-                    splatFile.xyz = tmpFile.xyz;
-                    splatFile.downloadCount = tmpFile.downloadCount;
-                    splatFile.status = DataStatus.WaitFetch | DataStatus.Fetching | DataStatus.FetchDone;
+                const warpModel = new SplatModel({ url: splatFile.url });
+                warpModel.abortController = new AbortController();
+                await fire(SplatDataFetcher, warpModel);
+
+                if (warpModel.status === ModelStatus.FetchDone) {
+                    // 下载成功，设定数据
+                    splatFile.downloadData = warpModel.splatData;
+                    splatFile.xyz = warpModel.xyz;
+                    splatFile.downloadCount = warpModel.downloadSplatCount;
+                    splatFile.status |= DataStatus.FetchDone;
                 } else {
-                    // 下载
-                    splatFile.status = DataStatus.WaitFetch | DataStatus.Fetching;
-
-                    const warpModel = new SplatModel({ url: splatFile.url });
-                    warpModel.abortController = new AbortController();
-                    await fire(SplatDataFetcher, warpModel);
-
-                    if (warpModel.status === ModelStatus.FetchDone) {
-                        // 下载成功，设定数据
-                        splatFile.downloadData = warpModel.splatData;
-                        splatFile.xyz = warpModel.xyz;
-                        splatFile.downloadCount = warpModel.downloadSplatCount;
-                        splatFile.status |= DataStatus.FetchDone;
-                    } else {
-                        // 下载失败
-                        splatFile.status |= DataStatus.FetchFailed;
-                    }
+                    // 下载失败
+                    splatFile.status |= DataStatus.FetchFailed;
                 }
             }
         });
-
-        // 缓存检查清理
-        while (recycleMap.size > 30) {
-            let file: SplatFile;
-            for (let item of recycleMap.values()) {
-                if (!file || item.lastTime < file.lastTime) file = item;
-            }
-            recycleMap.delete(file.fileKey);
-        }
     }
 
     async function processCalcTargetLayerGpuCache() {
         if (isFullCache) return;
         oSetFileKey.forEach(fileKey => {
             const splatFile = splatTiles.files[fileKey];
-            if ((splatFile.status & DataStatus.FetchDone) > 0 && splatFile.targetLayer < -1) {
+            // 已下载但尚未分配槽位的分块，请求分配（同一分块只请求一次，避免重复占位）
+            if ((splatFile.status & DataStatus.FetchDone) > 0 && splatFile.targetLayer < 0 && !requestedLayerSet.has(fileKey)) {
                 splatFile.targetLayer = -1;
-                postWkA01CalcTargetLayer(splatFile.fileKey);
+                requestedLayerSet.add(fileKey);
+                postWkA01CalcTargetLayer(fileKey);
             }
         });
     }
@@ -408,15 +408,22 @@ export function setupWorkerLod(events: Events) {
         worker.postMessage({ [WkA01BackSplatBuffer]: true, [WkTexData]: dataArray }, [dataArray.buffer]);
     }
 
-    on(
-        WorkerDispose,
-        () => {
-            disposed = true;
-            worker.postMessage({ [WkA01Dispose]: true });
-            worker.terminate();
-        },
-        true,
-    );
+    function disposeLodManager() {
+        if (disposed) return;
+        disposed = true;
+        // 通知worker清理槽位表与等待队列，避免销毁后残留回调再次写入
+        worker.postMessage({ [WkA01Dispose]: true });
+        worker.terminate();
+        oSetFileKey.clear();
+        mapCalcLayer.clear();
+        requestedLayerSet.clear();
+        lodActiveXyzBuffer = null;
+        lodActiveXyz = null;
+    }
+
+    on(WorkerDispose, disposeLodManager, true);
+    // 销毁LOD下载管理（与WorkerDestroy同源，兼容既有调用方）
+    on(LodDownloadManagerDispose, disposeLodManager, true);
 
     worker.onmessage = (e: any) => {
         if (disposed) return;
@@ -438,7 +445,7 @@ export function setupWorkerLod(events: Events) {
             onWkA10UpdateDblTexture(data[WkJson], data[WkTexData], data[WkXyz]);
         } else if (data[WkA10Recycle]) {
             // 回收数据
-            onWkA10Recycle(data[WkFileKey], data[WkOffset], data[WkDownloadCount], data[WkXyz]);
+            onWkA10Recycle(data[WkFileKey]);
         } else if (data[WkA10BoundBox]) {
             // 更新包围盒
             onWkA10BoundBox(data[WkBox]);

@@ -94,6 +94,9 @@ npm run dev
 # build
 npm run build
 
+# 运行单元测试（GPU纹理槽位回收与重传）
+npm test
+
 # open a web browser to render your 3dgs model
 # http://hostname:port/index.html?url=your-model-link-address
 

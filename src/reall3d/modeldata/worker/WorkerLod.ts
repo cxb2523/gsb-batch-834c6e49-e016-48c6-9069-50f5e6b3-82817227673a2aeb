@@ -76,13 +76,26 @@ const xyzIndexCache: Uint32Array[] = [];
 
 const memFileQueue = new Queue<QueueItem>();
 const gpuFileQueue = new Queue<QueueItem>();
-const calcLayerQueue = new Queue<QueueItem>();
 
+/** 槽位表：layer -> 分块，null 表示空闲；长度恒为 maxLayer */
 const layers: SplatFile[] = [];
+/** 已提交取层级请求、正在等待槽位的分块（避免同一分块重复占位） */
+const pendingLayerSet = new Set<string>();
 let maxLayer = 10; // 初始化，会被自动更正
 let sortType = SortTypes.Radial2;
 
+/** 最近若干次合并引用的分块，回收时需保留，避免影响当前渲染 */
 const fifoFileSet: Set<string>[] = [new Set(), new Set(), new Set()];
+/** 上一轮合并实际使用的分块，回收时优先保护（保证可见分块数据完整） */
+let protectedFileKeys: Set<string> = new Set<string>();
+/** 主动回收远处分块的相机距离阈值（超过 lodDistances 最远切换距离即视为远处） */
+let farEvictDistance = 150;
+/** 无从得知距离时，按空闲时长判定为远处分块 */
+const FarEvictIdleTime = 8000;
+/** 远处分块回收的最小空闲时间与单轮上限，避免频繁抖动 */
+const FarEvictMinIdleTime = 3000;
+const FarEvictMaxPerRound = 4;
+let lastFarEvictTime = 0;
 
 export interface QueueItem {
     fileKey?: string;
@@ -114,6 +127,9 @@ function onWkA01FetchOkMemCache(fileKey: string, downloadCount: number, download
 function onWkA01SetTextureSize(wkJson: string) {
     const oTexSize = JSON.parse(wkJson);
     maxLayer = oTexSize.texdepth;
+    layers.length = 0;
+    for (let i = 0; i < maxLayer; i++) layers.push(null);
+    pendingLayerSet.clear();
     sceneMeta?.useGpuCache && (isFullCache = oTexSize.fullCache);
 }
 
@@ -122,20 +138,58 @@ function onWkA01Refresh(wkViewProjection: number[], wkCameraPosition: number[]) 
     mergeLod(new Matrix4().fromArray(wkViewProjection), new Vector3().fromArray(wkCameraPosition));
 }
 
+/**
+ * 取槽位：有空闲槽位直接分配；否则登记等待，由占位调度（calcAllWkA10TargetLayer）回收远处分块后分配。
+ * 同一分块的重复请求合并为一次，不重复占位。
+ */
 function onWkA01CalcTargetLayer(fileKey: string) {
-    // 坑位足，直接用
-    let targetLayer = layers.length;
-    if (targetLayer < maxLayer) {
-        const file = splatTiles.files[fileKey];
-        file.targetLayer = targetLayer;
-        file.textureReady = false;
-        layers[targetLayer] = file;
-        postWkA10TargetLayer(fileKey, targetLayer);
+    const file = splatTiles?.files?.[fileKey];
+    if (!file) return;
+
+    // 已有槽位或已在排队，直接回传当前状态，避免重复占位
+    if (file.targetLayer !== undefined && file.targetLayer >= 0 && layers[file.targetLayer] === file) {
+        postWkA10TargetLayer(fileKey, file.targetLayer);
+        return;
+    }
+    if (pendingLayerSet.has(fileKey)) return;
+
+    // 有空闲槽位，直接用
+    const freeLayer = findFreeLayer();
+    if (freeLayer >= 0) {
+        assignLayer(file, freeLayer);
         return;
     }
 
-    // 堆积起来待异步妥当处理
-    new Promise<number>(resolve => calcLayerQueue.add({ fileKey, resolve })).then(layer => postWkA10TargetLayer(fileKey, layer));
+    // 无空闲槽位，登记等待；由占位调度回收远处分块后再分配
+    pendingLayerSet.add(fileKey);
+}
+
+/**
+ * 已登记等待的分块若获得空闲槽位（例如回收后腾出），立即分配并回传。
+ */
+function recheckPendingLayer() {
+    if (!pendingLayerSet.size) return;
+    for (const fileKey of [...pendingLayerSet]) {
+        const file = splatTiles?.files?.[fileKey];
+        if (!file) {
+            pendingLayerSet.delete(fileKey);
+            continue;
+        }
+        if (file.targetLayer !== undefined && file.targetLayer >= 0 && layers[file.targetLayer] === file) {
+            pendingLayerSet.delete(fileKey); // 已有槽位
+            continue;
+        }
+        const freeLayer = findFreeLayer();
+        if (freeLayer < 0) break; // 无空闲槽位，留给回收调度处理
+        assignLayer(file, freeLayer);
+    }
+}
+
+function findFreeLayer(): number {
+    for (let i = 0; i < maxLayer; i++) {
+        if (!layers[i]) return i;
+    }
+    return -1;
 }
 
 function onWkA01FetchNG(fileKey: string) {
@@ -159,21 +213,168 @@ function onWkA01DblActive(index: number) {
     }
 }
 
-function findReplaceableSplatFile(): SplatFile {
-    const usedSet = new Set<string>([...fifoFileSet[0], ...fifoFileSet[1], ...fifoFileSet[2]]);
-    let file: SplatFile = null;
+/**
+ * 查找最久未使用且可回收的分块（从最久到最近，供批量回收）
+ * 排除：刚更新的、未就绪的、当前渲染使用中的、已登记等待占位的
+ * @param allowInUse 为真时放宽"使用中"限制（仅在无其他可回收项时作为兜底，仍排除近处可见分块）
+ */
+function findEvictableFiles(allowInUse = false): SplatFile[] {
+    const usedSet = new Set<string>([...fifoFileSet[0], ...fifoFileSet[1], ...fifoFileSet[2], ...protectedFileKeys]);
     const baseTime = Date.now();
+    const candidates: SplatFile[] = [];
     for (let i = 0; i < maxLayer; i++) {
         const f = layers[i];
-        if (f.lastTime > baseTime || !f.textureReady || usedSet.has(f.fileKey)) continue; // 排除刚更新的、排除已被占坑的、排除使用中的
-        (!file || f.lastTime < file.lastTime) && (file = f); // 筛选出最旧的
+        if (!f || !f.textureReady) continue; // 空闲槽位、未就绪分块不可回收
+        if (f.lastTime > baseTime) continue; // 排除刚更新的
+        if (pendingLayerSet.has(f.fileKey)) continue; // 排除等待占位中的
+        if (!allowInUse && usedSet.has(f.fileKey)) continue; // 正常情况排除当前渲染使用中的
+        if (allowInUse && !isFarAway(f)) continue; // 兜底时仍只回收远处分块，保护近处可见数据
+        candidates.push(f);
     }
-    return file;
+    candidates.sort((a, b) => a.lastTime - b.lastTime); // 升序：最久未使用的排前面
+    return candidates;
+}
+
+/** 无节点中心信息时，以"最久未被合并引用"作为远处分块的近似判断 */
+function isFarByAge(file: SplatFile): boolean {
+    const referenced = fifoFileSet.some(set => set.has(file.fileKey));
+    if (referenced) return false;
+    return Date.now() - (file.lastTime || 0) >= FarEvictIdleTime;
+}
+
+function isFarAway(file: SplatFile): boolean {
+    const distance = getFileCameraDistance(file);
+    if (distance === undefined || isNaN(distance)) return isFarByAge(file);
+    return distance >= farEvictDistance;
+}
+
+/** 分块到相机的距离：优先按分块中心与当前相机位置计算（本帧最新），否则回退到合并时的距离 */
+let lastCameraPosition: Vector3 = null;
+function getFileCameraDistance(file: SplatFile): number {
+    const center = file.center;
+    if (center && lastCameraPosition) {
+        const dx = center[0] - lastCameraPosition.x;
+        const dy = center[1] - lastCameraPosition.y;
+        const dz = center[2] - lastCameraPosition.z;
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    if (file.currentDistance !== undefined && file.currentDistance !== null) return file.currentDistance;
+    return undefined;
+}
+
+/**
+ * 回收一个分块：调用GPU缓存释放槽位，清除占位与就绪标记，安排后续重传。
+ * 回收后分块标记未就绪，渲染端不会读取旧槽位数据；再次靠近时由渲染取数逻辑重新取层级并重传。
+ */
+function recycleFile(file: SplatFile): boolean {
+    if (!file) return false;
+
+    const layer = file.targetLayer;
+    postWkA10Recycle(file); // 通知主线程GPU缓存释放槽位并清理就绪标记
+    if (layer >= 0 && layer < maxLayer && layers[layer] === file) layers[layer] = null;
+
+    // 设置为脏数据，允许后续重新下载
+    totalDownloadedCount -= file.downloadCount || 0;
+    totalDownloadedCount = Math.max(0, totalDownloadedCount);
+    file.textureReady = false;
+    file.offset = undefined;
+    file.downloadCount = 0;
+    file.xyz = null;
+    file.downloadData = null;
+    file.lastTime = Date.now() + 5000; // 指定时间后才能再次下载
+    file.status = DataStatus.None;
+    file.targetLayer = -1; // 清除旧槽位，重传时重新分配，避免写入已被其他分块占用的槽位
+    isDownloadAllDone = false; // 回收后允许再次触发下载
+
+    return true;
+}
+
+/**
+ * 按相机距离回收远处分块，并把空出的槽位分配给等待中的分块。
+ * - 正在写入的槽位不会回收（由GPU缓存侧兜底：写入中的槽位延迟释放）；
+ * - 当前可见/近处分块受保护，保证回收前后渲染数据一致。
+ */
+function calcAllWkA10TargetLayer(): boolean {
+    let derty = false;
+
+    // 1) 等待槽位的分块：优先近处，回收最久未用的远处分块腾出槽位
+    const waiting = [...pendingLayerSet]
+        .map(key => splatTiles.files[key])
+        .filter(f => f)
+        .sort((a, b) => (a.currentDistance ?? Infinity) - (b.currentDistance ?? Infinity)); // 近处优先
+
+    for (const newFile of waiting) {
+        const freeLayer = findFreeLayer();
+        if (freeLayer >= 0) {
+            assignLayer(newFile, freeLayer);
+            derty = true;
+            continue;
+        }
+
+        // 从最久未用到最近依次尝试，跳过正在写入/无法立即释放的槽位
+        const candidates = findEvictableFiles();
+        let assigned = false;
+        for (const oldFile of candidates) {
+            const layer = oldFile.targetLayer;
+            if (layer === undefined || layer < 0) continue;
+            recycleFile(oldFile);
+            derty = true;
+            if (layers[layer] === null) {
+                assignLayer(newFile, layer);
+                assigned = true;
+                break;
+            }
+        }
+        if (assigned) continue;
+
+        // 冻结保护：若所有槽位都被当前渲染/保护集长期占用，则允许回收最久未用的非近处分块，
+        // 避免等待者永远得不到槽位导致显存与渲染都卡住。
+        if (!candidates.length) {
+            const fallback = findEvictableFiles(true).shift();
+            if (fallback && fallback.targetLayer >= 0) {
+                const layer = fallback.targetLayer;
+                recycleFile(fallback);
+                derty = true;
+                if (layers[layer] === null) assignLayer(newFile, layer);
+            }
+        }
+        break; // 仍无法分配，留待后续
+    }
+
+    // 2) 无等待者时，按相机距离主动回收过远的空闲分块，控制显存占用
+    //    顶层级分块用于远处渲染且会被优先重新下载，主动回收只会造成抖动，故跳过
+    if (!waiting.length && Date.now() - lastFarEvictTime >= FarEvictMinIdleTime) {
+        const topLod = getTopLod();
+        const candidates = findEvictableFiles().filter(f => f.lod !== topLod && isFarAway(f));
+        if (candidates.length) {
+            for (const file of candidates.slice(0, FarEvictMaxPerRound)) recycleFile(file);
+            lastFarEvictTime = Date.now();
+            derty = true;
+        }
+    }
+
+    // 3) 回收后腾出的槽位优先补给已下载的等待者
+    recheckPendingLayer();
+
+    return derty;
+}
+
+/** 为分块分配槽位并回传层级 */
+function assignLayer(file: SplatFile, layer: number) {
+    file.targetLayer = layer;
+    file.textureReady = false;
+    file.offset = undefined;
+    layers[layer] = file;
+    pendingLayerSet.delete(file.fileKey);
+    postWkA10TargetLayer(file.fileKey, layer);
+    // 数据已在内存中时，主线程会立即上传；否则安排重新下载
+    if (!file.downloadCount && !file.status) todoDownloadLod(file);
 }
 
 async function mergeLod(viewProjMatrix: Matrix4, cameraPosition: Vector3) {
     if (disposed || mergeDoing) return;
     mergeDoing = true;
+    lastCameraPosition = cameraPosition;
 
     checkDownload();
     await sleep();
@@ -193,6 +394,8 @@ function setDownloadDataGpuCache(): boolean {
     while (!gpuFileQueue.isEmpty()) {
         data = gpuFileQueue.get();
         const file = splatTiles.files[data.fileKey];
+        if (!file) continue;
+
         file.xyz = data.xyz;
         file.offset = data.offset;
         file.downloadCount = data.downloadCount;
@@ -202,7 +405,8 @@ function setDownloadDataGpuCache(): boolean {
         fetchingSet.delete(file.fileKey);
 
         file.lastTime = Math.max(Date.now() + 5000, file.lastTime); // 刚下载好的数据，控制至少存活N秒
-        file.textureReady = true; // sceneMeta.useGpuCache; // TODO 可以统一按true管理
+        // gpuFileQueue 只接收主线程已确认写入GPU纹理的分块，此时才可标记就绪
+        file.textureReady = true;
 
         derty = true;
     }
@@ -370,6 +574,7 @@ async function mergeLodGpuCache(viewProjMatrix: Matrix4, cameraPosition: Vector3
     await sleep();
 
     // 合并
+    protectedFileKeys = new Set<string>(); // 重置本轮保护集，合并过程中重新收集
     const sysTime = Date.now();
     texture.version = sysTime;
     texture.active = true;
@@ -385,6 +590,9 @@ async function mergeLodGpuCache(viewProjMatrix: Matrix4, cameraPosition: Vector3
             if (!tileMapping) continue;
 
             const file = splatTiles.files[tileMapping.fileKey];
+            // 未就绪（如刚被回收尚未重传）的分块不参与合并，避免读取陈旧或半写数据
+            if (!file || !file.textureReady || !file.xyz || file.offset === undefined) continue;
+
             file.lastTime = Math.max(Date.now(), file.lastTime);
             xyz.set(file.xyz.subarray(tileMapping.offset * 3, (tileMapping.offset + tileMapping.count) * 3), mergeDataCount * 3);
             mergeDataCount += tileMapping.count;
@@ -394,6 +602,7 @@ async function mergeLodGpuCache(viewProjMatrix: Matrix4, cameraPosition: Vector3
             }
 
             mergeFileSet.add(file.fileKey);
+            protectedFileKeys.add(file.fileKey); // 本轮实际使用，回收时保护
         }
     }
     await sleep();
@@ -406,6 +615,7 @@ async function mergeLodGpuCache(viewProjMatrix: Matrix4, cameraPosition: Vector3
             xyzIndex[n++] = file.offset + i;
         }
         mergeFileSet.add(file.fileKey);
+        protectedFileKeys.add(file.fileKey);
     }
     // if (watermarkCount) {
     //     mergeSplatData.set(splatModel.watermarkData.subarray(0, watermarkCount * 32), mergeDataCount * 32);
@@ -842,6 +1052,8 @@ async function downloadAndParseLodMetaJson(lodMetaJsonUrl: string) {
                 const fileKey = obj.file + '';
                 lods[lod] = { fileKey, offset: obj.offset, count: obj.count };
                 files[fileKey].lod = lod;
+                // 记录该分块所属节点中心，供按相机距离回收使用（不依赖排序类型）
+                files[fileKey].center = nd.center;
                 totalCount += obj.count;
                 if (targetLods.includes(lod)) {
                     files[fileKey].count += obj.count;
@@ -864,6 +1076,7 @@ async function downloadAndParseLodMetaJson(lodMetaJsonUrl: string) {
     splatTiles.fetchSet = new Set<string>();
     splatTiles.lodTargets = getLodTargets(splatTiles);
     splatTiles.lodDistances = getLodDistances(splatTiles);
+    farEvictDistance = calcFarEvictDistance(splatTiles.lodDistances);
 
     const toplod = getTopLod();
     for (let key of Object.keys(splatTiles.files)) {
@@ -920,6 +1133,7 @@ async function downloadAndParseLodJson(lodJsonUrl: string) {
             splatTiles.fetchSet = new Set<string>();
             splatTiles.lodTargets = getLodTargets(splatTiles);
             splatTiles.lodDistances = getLodDistances(splatTiles);
+            farEvictDistance = calcFarEvictDistance(splatTiles.lodDistances);
 
             const toplod = getTopLod();
             const targetFileSet = new Set();
@@ -986,7 +1200,7 @@ function getLodTargets(splatTiles: SplatTiles): number[] {
 
 function getLodDistances(splatTiles: SplatTiles): number[] {
     const tgtLodCount = splatTiles.lodTargets.length;
-    let lodDistances = [...new Set((isMobile ? splatTiles.mobileLodDistances : splatTiles.pcLodDistances) || [])];
+    let lodDistances: number[] = [...new Set((isMobile ? splatTiles.mobileLodDistances : splatTiles.pcLodDistances) || [])];
 
     if (lodDistances.length == tgtLodCount) {
         lodDistances.sort((a, b) => a - b); // 升序
@@ -1011,14 +1225,25 @@ function getLodDistances(splatTiles: SplatTiles): number[] {
     return lodDistances;
 }
 
+/**
+ * 远处分块回收距离阈值：取最远一级LOD切换距离的2倍，并设置上下限。
+ * 超过该距离的分块通常只以最粗糙层参与渲染，回收后可再次靠近时重传。
+ */
+function calcFarEvictDistance(lodDistances: number[]): number {
+    const maxDistance = lodDistances?.length ? Math.max(...lodDistances) : 20;
+    return Math.max(150, maxDistance * 2);
+}
+
 function checkTopLodDownloadStatus() {
     if (splatTiles.topLodReady) return;
     let ready = true;
     let cnt = 0;
+    let total = 0;
     const topLod = getTopLod();
     for (let key of Object.keys(splatTiles.files)) {
         let file = splatTiles.files[key];
         if (file.lod === topLod) {
+            total++;
             if (sceneMeta.useGpuCache ? file.textureReady : file.downloadCount) {
                 cnt++;
             } else {
@@ -1026,7 +1251,8 @@ function checkTopLodDownloadStatus() {
             }
         }
     }
-    splatTiles.topLodReady = ready || cnt >= 4;
+    // 顶层级分块全部就绪才视为顶层级可用；分块缓存模式下回收可能让顶层级暂时缺位，需等待重传
+    splatTiles.topLodReady = ready || (total > 0 && cnt >= Math.min(4, total));
 }
 
 async function checkDownload() {
@@ -1040,13 +1266,15 @@ async function checkDownload() {
     let unfinishedCnt = 0;
     let lod0Files: SplatFile[] = [];
     if ((splatTiles?.environment as SplatFile)?.url) {
-        const status = (splatTiles.environment as SplatFile).status;
+        const envFile = splatTiles.environment as SplatFile;
+        const status = envFile.status;
         status < DataStatus.FetchDone && unfinishedCnt++;
-        !status && lod0Files.push(splatTiles.environment as SplatFile);
+        !status && lod0Files.push(envFile);
     }
     const topLod = getTopLod();
     for (let file of Object.values(splatTiles.files)) {
         if (!file.status) {
+            // 顶层级数据优先下载（已回收的顶层级分块也会在此重新排队）
             file.lod === topLod && lod0Files.length < MaxDownloadCount && lod0Files.push(file);
         }
         file.status < DataStatus.FetchDone && unfinishedCnt++;
@@ -1066,7 +1294,6 @@ async function checkDownload() {
 
     // 调整优先顺序
     const allsets = [...todoSplatFileSet];
-    const alldone = allsets.filter(v => v.status == DataStatus.FetchDone); // 仅处理待下载的
     const alltodos = allsets.filter(v => !v.status); // 仅处理待下载的
     alltodos.sort((a, b) => a.currentDistance - b.currentDistance); // 从近到远排序
     const todos = alltodos.slice(0, Math.min(MaxDownloadCount - fetchingCnt, alltodos.length)); // 截取近处限制数内节点
@@ -1078,8 +1305,9 @@ async function checkDownload() {
         postDownloadSplatFile(splatFile);
     }
 
+    // 全量缓存模式下保留未到期的待下载项，其余情况每轮重算
     if (isFullCache) {
-        for (let file of alldone) todoSplatFileSet.delete(file);
+        for (let splatFile of todos) todoSplatFileSet.delete(splatFile);
     } else {
         todoSplatFileSet.clear();
     }
@@ -1134,43 +1362,8 @@ function postWkA10TargetLayer(fileKey: string, targetLayer: number) {
 }
 
 function postWkA10Recycle(oldFile: SplatFile) {
-    const { fileKey, offset, downloadCount, xyz } = oldFile;
-    worker.postMessage({ [WkA10Recycle]: true, [WkFileKey]: fileKey, [WkOffset]: offset, [WkDownloadCount]: downloadCount, [WkXyz]: xyz }, [xyz.buffer]);
-}
-
-function calcAllWkA10TargetLayer(): boolean {
-    let derty = false;
-    let todo: QueueItem = null;
-    while (!calcLayerQueue.isEmpty()) {
-        const oldFile = findReplaceableSplatFile();
-        if (!oldFile) {
-            break;
-        }
-        todo = calcLayerQueue.get();
-
-        // 回收数据
-        postWkA10Recycle(oldFile);
-
-        // 设置为脏数据
-        totalDownloadedCount -= oldFile.downloadCount;
-        oldFile.textureReady = false;
-        oldFile.downloadCount = 0;
-        oldFile.xyz = null;
-        oldFile.lastTime = Date.now() + 5000; // 指定时间后才能再次下载
-        oldFile.status = DataStatus.None;
-
-        // 替换占坑
-        const fileKey = todo.fileKey;
-        const newFile = splatTiles.files[fileKey];
-        newFile.targetLayer = oldFile.targetLayer;
-        newFile.textureReady = false;
-        layers[newFile.targetLayer] = newFile;
-        todo.resolve(newFile.targetLayer);
-
-        derty = true;
-    }
-
-    return derty;
+    const { fileKey } = oldFile;
+    worker.postMessage({ [WkA10Recycle]: true, [WkFileKey]: fileKey });
 }
 
 worker.onmessage = (e: any) => {
@@ -1213,7 +1406,15 @@ worker.onmessage = (e: any) => {
         // 回收
         mergeDataCache.push(new Uint8Array(data[WkTexData].buffer));
     } else if (data[WkA01Dispose]) {
-        // 销毁
+        // 销毁：清理槽位表与等待队列，避免残留回调再次访问
         disposed = true;
+        for (let i = 0; i < layers.length; i++) layers[i] = null;
+        layers.length = 0;
+        pendingLayerSet.clear();
+        protectedFileKeys.clear();
+        fifoFileSet.forEach(set => set.clear());
+        todoSplatFileSet.clear();
+        fetchingSet.clear();
+        memCachedFileSet.clear();
     }
 };

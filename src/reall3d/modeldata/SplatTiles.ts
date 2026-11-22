@@ -76,6 +76,8 @@ export interface SplatFile {
 
     // 内部计算用
     currentDistance?: number;
+    /** 分块所属节点中心（供按相机距离回收使用） */
+    center?: number[];
 
     targetLayer?: number;
 }

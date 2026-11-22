@@ -94,6 +94,9 @@ npm run dev
 # build
 npm run build
 
+# run unit tests (GPU cache slot eviction & re-upload)
+npm test
+
 # open a web browser to render your 3dgs model
 # http://hostname:port/index.html?url=your-model-link-address
 

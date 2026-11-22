@@ -98,6 +98,7 @@ import {
     NotifyWkA01BackXyz,
     NotifyWkA01BackXyzIndex,
     NotifyWkA01SetTextureSize,
+    NotifyWkA01ReleaseSplatFile,
     SplatUpdateDblTexture,
     NotifyWkA01BackSplatBuffer,
     NotifyWkA09DblTextureReady,
@@ -387,15 +388,48 @@ export function setupSplatMesh(events: Events) {
         });
 
         let cacheDoing = false;
+        /** 排队中的GPU缓存上传（同一分块只保留一个待处理请求，避免重复占位） */
+        const pendingCacheUploads: Map<string, SplatFile> = new Map();
         on(SplatUploadTextureGpuCache, async (splatFile: SplatFile) => {
-            if (cacheDoing) return (await sleep(5)) && fire(SplatUploadTextureGpuCache, splatFile);
+            if (disposed || !splatFile || !splatCacheManager) return;
+            const fileKey = splatFile.fileKey;
+            if (!fileKey) return;
+
+            // 已就绪且槽位未变则无需上传
+            if (splatFile.textureReady && splatCacheManager.hasSlot(fileKey) && splatCacheManager.getSlot(fileKey) === splatFile.targetLayer) return;
+
+            // 同一分块排队期间重复请求：合并为一次，不重复占用槽位
+            if (pendingCacheUploads.has(fileKey)) return;
+            pendingCacheUploads.set(fileKey, splatFile);
+
+            if (cacheDoing) return; // 由正在执行的上传顺带处理后续队列
+
             cacheDoing = true;
+            try {
+                while (pendingCacheUploads.size && !disposed) {
+                    const [key, file] = pendingCacheUploads.entries().next().value as [string, SplatFile];
+                    pendingCacheUploads.delete(key);
 
-            await splatCacheManager.uploadSplatFile(splatFile);
-            splatFile.textureReady = true;
+                    const uploaded = await splatCacheManager.uploadSplatFile(file);
+                    // 就绪标记以实际写入结果为准；未完成写入的分块必须保持未就绪
+                    if (!uploaded && !splatCacheManager.hasSlot(key)) file.textureReady = false;
+                    if (disposed) break;
 
+                    fire(NotifyViewerNeedUpdate);
+                    await sleep(5); // 让出渲染帧，避免长时间占用主线程
+                }
+            } finally {
+                cacheDoing = false;
+                if (disposed) pendingCacheUploads.clear();
+            }
+        });
+
+        // 回收远处分块：释放槽位并清除就绪标记，重传时按新槽位重算偏移量
+        on(NotifyWkA01ReleaseSplatFile, (fileKey: string) => {
+            if (disposed || !splatCacheManager || !fileKey) return;
+            pendingCacheUploads.delete(fileKey); // 撤销尚未开始的上传
+            splatCacheManager.releaseSlot(fileKey);
             fire(NotifyViewerNeedUpdate);
-            cacheDoing = false;
         });
 
         on(SplatUpdateSh12Texture, async (datas: Uint8Array[]) => {
