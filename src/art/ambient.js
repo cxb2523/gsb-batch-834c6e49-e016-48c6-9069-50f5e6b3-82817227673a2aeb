@@ -100,6 +100,20 @@
     const m = ow.map, e = env(m), t = ow.t;
     if (state.map !== m.name) { state = { map: m.name, parts: [], env: e }; }
     const d = s.data;
+    // Shared per-frame draw budget: the pool is capped like the battle's effect list (oldest ambient particles are
+    // dropped first). Fireflies (drawn after the night grade) are kept preferentially, but if they alone exceed the
+    // cap the oldest of them go too, so the field frame's live count is never above fieldCap.
+    const cap = G.fxBudget ? G.fxBudget.fieldCap : 64;
+    if (state.parts.length > cap) {
+      let drop = state.parts.length - cap;
+      const kept = [];
+      for (const p of state.parts) {
+        if (drop > 0 && p.kind !== 'firefly') { drop--; continue; }
+        kept.push(p);
+      }
+      state.parts = kept;
+      if (state.parts.length > cap) state.parts.splice(0, state.parts.length - cap);
+    }
     // --- cloud shadows (outdoors) ---
     if ((e === 'outdoor' || e === 'safari' || e === 'lavender') && G.timeOfDay().night < 0.5) {
       const ox = Math.floor(t * 0.18), oy = Math.floor(t * 0.07);
@@ -202,4 +216,6 @@
     }
     if (e === 'ice') { for (let i = 0; i < d.length; i += 1) d[i] = mix(d[i], hex('#dceeff'), 0.08); }
   };
+  // live ambient particle count, reported into the shared per-frame draw budget by the overworld
+  G.ambientCount = function () { return state.parts ? state.parts.length : 0; };
 })(window.G);

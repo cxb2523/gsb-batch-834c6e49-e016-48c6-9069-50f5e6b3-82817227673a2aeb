@@ -17,6 +17,7 @@
   class BattleScene {
     constructor(opts) {
       this.opaque = true; this.t = 0; this.opts = opts;
+      this.isBattleScene = true; // engine.pop() calls dispose() so no battle state outlives its scene
       this.bg = G.battleBg(opts.bg || 'grass');
       this.show = { p: false, e: false };
       this.disp = { p: 0, e: 0 }; // displayed HP
@@ -35,6 +36,28 @@
       this.screenFx = null; // wave distortion etc.
     }
     key(side) { return side.isPlayer ? 'p' : 'e'; }
+    // Whole-scene transient state an interrupted animation / early finish can leave behind: sprite offset, tint,
+    // visibility, reveal clip, scale, screen distortion, flash and shake. Resetting it all is the contract the next
+    // battle relies on (offsets 0, tint empty, scale/vis/clip 1).
+    resetTransient() {
+      this.offs = { p: { x: 0, y: 0 }, e: { x: 0, y: 0 } };
+      this.tint = { p: null, e: null };
+      this.vis = { p: 1, e: 1 };
+      this.clip = { p: 1, e: 1 };
+      this.scale = { p: 1, e: 1 };
+      this.screenFx = null; this.flash = 0; this.flashColor = P.white; this.shake = 0;
+    }
+    // The frame's effect list keeps at most G.fxBudget.cap live entries; decorative ones are dropped oldest-first,
+    // hit/status effects are kept. Called once per drawn frame, before the fx passes walk the list.
+    frameBudget() { if (G.vfx && G.vfx.frame) G.vfx.frame(this); }
+    // Battle over (normally or cancelled): give the screen back, clear effects and presentation state, and hand the
+    // frame budget back to the field so nothing accumulates into the next battle.
+    dispose() {
+      this.resetTransient();
+      this.fx = []; this.overlay = null; this.menu = null; this.statsBox = null; this.expDisp = null;
+      this.box = null;
+      if (G.vfx && G.vfx.endBattle) G.vfx.endBattle();
+    }
     mon(k) { return k === 'p' ? this.b.mon(this.b.p) : this.b.mon(this.b.e); }
     sprite(k) {
       const m = this.mon(k);
@@ -46,6 +69,7 @@
 
     // ---------------- drawing ----------------
     draw(s) {
+      this.frameBudget();
       const sh = this.shake > 0 ? Math.round((Math.random() - 0.5) * this.shake * 2) : 0;
       if (this.shake > 0) { this.shake -= 0.5; if (this.shake < 0) this.shake = 0; }
       // background
@@ -75,11 +99,12 @@
         const x = base.x - 32 + o.x + sh + (k === 'e' ? eoff : poff);
         let y = base.y - 64 + o.y + (k === 'e' ? 10 : 12) + bob + breathe;
         const c = this.clip[k], sc = this.scale[k];
-        if (this.vis[k] <= 0) continue;
+        if (this.vis[k] <= 0 || sc <= 0) continue; // scale 0: fully shrunk away (send-out / ball open start)
         const opts = { alpha: this.vis[k] < 1 ? this.vis[k] : 1 };
         if (this.tint[k]) { opts.tint = this.tint[k][0]; opts.tintAmt = this.tint[k][1]; }
         if (sc !== 1) {
-          const w = Math.round(64 * sc), h = Math.round(64 * sc);
+          const w = Math.max(1, Math.round(64 * sc)), h = Math.max(1, Math.round(64 * sc));
+          // scale + fade (send-out / ball open) go together; blitScaled blends the fade itself
           s.blitScaled(spr, base.x - w / 2 + o.x, y + 64 - h, w, h, opts);
         } else if (c < 1) {
           const hh = Math.round(64 * c);
@@ -444,15 +469,17 @@
     *faint(side) {
       const k = this.key(side);
       if (G.cry) G.cry(this.mon(k).species, 'faint');
-      for (let i = 0; i < 20; i++) { this.clip[k] = 1 - i / 20; this.offs[k].y = i * 1.2; yield; }
-      this.show[k] = false; this.clip[k] = 1; this.offs[k].y = 0;
-      if (k === 'p') this.boxes.p = false; else this.boxes.e = false;
+      try {
+        for (let i = 0; i < 20; i++) { this.clip[k] = 1 - i / 20; this.offs[k].y = i * 1.2; yield; }
+        this.show[k] = false;
+        if (k === 'p') this.boxes.p = false; else this.boxes.e = false;
+      } finally { this.clip[k] = 1; this.offs[k].y = 0; } // cancelled mid-faint: no clipped / sunk sprite left
     }
     *withdraw(side) {
       const k = this.key(side);
       yield* this.msg(k === 'p' ? this.mon(k).name + ', come back!' : '', { auto: 8 });
-      for (let i = 12; i >= 0; i--) { this.scale[k] = i / 12; this.tint[k] = [hex('#ff8080'), 1 - i / 12]; yield; }
-      this.show[k] = false; this.scale[k] = 1; this.tint[k] = null; this.boxes[k] = false;
+      try { for (let i = 12; i >= 0; i--) { this.scale[k] = i / 12; this.tint[k] = [hex('#ff8080'), 1 - i / 12]; yield; } }
+      finally { this.show[k] = false; this.scale[k] = 1; this.tint[k] = null; this.boxes[k] = false; }
     }
     *sendOut(side) {
       const k = this.key(side);
@@ -481,9 +508,9 @@
     *statAnim(side, up) { if (G.vfx) yield* G.vfx.stat(this, this.key(side), up); }
     *anim(move, side, hit) { if (G.vfx && G.state.options.battleAnim !== false) yield* G.vfx.move(this, move, this.key(side), hit || 0); else yield* G.engine.wait(8); }
     *hide(side, h) { this.hidden[this.key(side)] = h; yield; }
-    *substitute(side, on) { const k = this.key(side); for (let i = 0; i < 8; i++) { this.vis[k] = 1 - i / 8; yield; } this.subs[k] = on; for (let i = 0; i < 8; i++) { this.vis[k] = i / 8; yield; } this.vis[k] = 1; }
-    *transform(side, sp) { const k = this.key(side); for (let i = 0; i < 16; i++) { this.tint[k] = [P.white, i / 16]; yield; } this.transformed[k] = sp; for (let i = 16; i >= 0; i--) { this.tint[k] = [P.white, i / 16]; yield; } this.tint[k] = null; }
-    *flee(side) { const k = this.key(side); for (let i = 0; i < 16; i++) { this.offs[k].x += k === 'e' ? 6 : -6; yield; } this.show[k] = false; this.offs[k].x = 0; }
+    *substitute(side, on) { const k = this.key(side); try { for (let i = 0; i < 8; i++) { this.vis[k] = 1 - i / 8; yield; } this.subs[k] = on; for (let i = 0; i < 8; i++) { this.vis[k] = i / 8; yield; } } finally { this.vis[k] = 1; } }
+    *transform(side, sp) { const k = this.key(side); try { for (let i = 0; i < 16; i++) { this.tint[k] = [P.white, i / 16]; yield; } this.transformed[k] = sp; for (let i = 16; i >= 0; i--) { this.tint[k] = [P.white, i / 16]; yield; } } finally { this.tint[k] = null; } }
+    *flee(side) { const k = this.key(side); try { for (let i = 0; i < 16; i++) { this.offs[k].x += k === 'e' ? 6 : -6; yield; } } finally { this.show[k] = false; this.offs[k].x = 0; } }
     *trainerSays(text) { if (text) yield* this.msg(text); }
     *dexEntry(sp) { if (G.dexPage) yield* G.dexPage(sp, true); }
     *trainerDefeated(b) {

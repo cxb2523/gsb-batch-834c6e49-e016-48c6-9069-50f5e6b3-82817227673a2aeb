@@ -465,9 +465,11 @@
     draw(s) {
       const [cx, cy] = this.camera();
       const R = this.render, mx = MR.MX * 16, my = MR.MY * 16;
-      if (!this.map.outdoor) s.clear(G.PAL.black);
-      MR.animate(R, this.t, cx + mx, cy + my, 320, 180);
-      MR.blitOpaque(s, R.s, -(cx + mx), -(cy + my));
+      if (R) {
+        if (!this.map.outdoor) s.clear(G.PAL.black);
+        MR.animate(R, this.t, cx + mx, cy + my, 320, 180);
+        MR.blitOpaque(s, R.s, -(cx + mx), -(cy + my));
+      }
       for (const n of this.neighbors) {
         if (!n.R) { n.R = MR.cache[n.map.name] || null; if (!n.R) { this.queueBuild(n); continue; } }
         const ox = n.c.ox * 16 - cx, oy = n.c.oy * 16 - cy;
@@ -481,14 +483,14 @@
       list.sort((a, b) => (a.py - b.py) || (a.isPlayer ? 1 : -1)); // nearer the bottom of the screen = in front, the walking partner included
       for (const a of list) this.drawActor(s, a, cx, cy);
       // upper layers
-      s.blit(R.up, -(cx + mx), -(cy + my));
+      if (R && R.up) s.blit(R.up, -(cx + mx), -(cy + my));
       for (const n of this.neighbors) {
         if (!n.R) continue;
         const ox = n.c.ox * 16 - cx, oy = n.c.oy * 16 - cy;
         if (ox > 320 || oy > 180 || ox + n.map.w * 16 < 0 || oy + n.map.h * 16 + 16 < 0) continue;
-        s.blit(n.R.up, ox, oy - 16, { sx: mx, sy: my - 16, sw: n.map.w * 16, sh: n.map.h * 16 + 16 });
+        if (n.R.up) s.blit(n.R.up, ox, oy - 16, { sx: mx, sy: my - 16, sw: n.map.w * 16, sh: n.map.h * 16 + 16 });
       }
-      if (R.interior) G.interior.drawOverlay(s, R, this.t, cx, cy, mx, my);
+      if (R && R.interior) G.interior.drawOverlay(s, R, this.t, cx, cy, mx, my);
       for (const a of list) this.drawGrassFront(s, a, cx, cy);
       for (const a of list) if (a.emote) this.drawEmote(s, a, cx, cy);
       if (this.autoPath && this.autoDest) { // click-to-walk destination marker
@@ -500,6 +502,7 @@
       }
       for (let i = this.fx.length - 1; i >= 0; i--) { const f = this.fx[i]; if (f.under) continue; if (f.draw(s, cx, cy, this.t) === false) this.fx.splice(i, 1); }
       if (G.ambient) G.ambient(s, this, cx, cy);
+      if (G.vfx && G.vfx.reportField && G.ambientCount) G.vfx.reportField(G.ambientCount());
       MR.drawFires(s, R, -(cx + mx), -(cy + my), this.t);
       for (const n of this.neighbors) if (n.R) MR.drawFires(s, n.R, n.c.ox * 16 - cx - mx, n.c.oy * 16 - cy - my, this.t);
       if (G.ambientDark) G.ambientDark(s, this, cx, cy);
@@ -529,7 +532,8 @@
     // flipped, faint and blue, drawn only onto pixels the map renderer painted as water (its animation mask), so a
     // reflection never lands on the sand or grass half of a shore cell or spills past the water's edge
     reflect(s, fr, dx, dy, cx, cy) {
-      const R = this.render, M = R.wmask, ox = MR.MX * 16 + cx, oy = MR.MY * 16 + cy, d = s.data, src = fr.data, TINT = rgb(150, 190, 255);
+      const R = this.render, M = R && R.wmask, ox = MR.MX * 16 + cx, oy = MR.MY * 16 + cy, d = s.data, src = fr.data, TINT = rgb(150, 190, 255);
+      if (!R || !M) return; // the map is closed (no render built yet): nothing to reflect onto
       for (let j = 0; j < fr.h; j++) {
         const sy = dy + j, ry = sy + oy; if (sy < 0 || sy >= s.h || ry < 0 || ry >= R.H) continue;
         const row = (fr.h - 1 - j) * fr.w;
@@ -544,7 +548,7 @@
       if (a.jump) return;
       const gx = Math.floor((a.px + 8) / 16), gy = Math.floor((a.py + 12) / 16);
       if (!this.map.isGrass(gx, gy)) return;
-      const cell = this.render.gcell[gx + ',' + gy];
+      const cell = this.render && this.render.gcell[gx + ',' + gy];
       if (!cell) return;
       const sp = G.terrain.tallGrassFront(cell.v, cell.rustle > 0 ? 1 : 0);
       s.blit(sp, gx * 16 - cx, gy * 16 - cy);

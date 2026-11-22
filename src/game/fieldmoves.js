@@ -20,7 +20,8 @@
   function front() { const p = G.ow.player, [dx, dy] = G.DIRS[p.dir]; return [p.x + dx, p.y + dy]; }
   function partyWith(mv) { return G.state.party.find(m => m.hp > 0 && m.moves.some(x => x.id === mv)) || G.state.party.find(m => m.moves.some(x => x.id === mv)); }
   G.ow_rerender = function () {
-    const ow = G.ow; delete G.mapRender.cache[ow.map.name];
+    const ow = G.ow;
+    G.mapRender.evictOne(ow.map.name); // release the old render (units, water mask, fires) before rebuilding
     ow.render = G.mapRender.get(ow.map);
   };
   // override a map cell's label/passability (e.g. cut trees, card-key doors); persists until the map reloads

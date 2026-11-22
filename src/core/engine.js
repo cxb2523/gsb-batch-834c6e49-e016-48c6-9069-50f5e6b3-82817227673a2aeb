@@ -10,8 +10,12 @@
   function push(scene) { scene.bornFrame = frame; scenes.push(scene); if (scene.enter) scene.enter(); return scene; }
   function pop(scene) {
     const i = scene ? scenes.lastIndexOf(scene) : scenes.length - 1;
-    if (i >= 0) { const s = scenes.splice(i, 1)[0]; if (s.exit) s.exit(); return s; }
+    if (i >= 0) { const s = scenes.splice(i, 1)[0]; if (s.exit) s.exit(); disposeLeaving(s); return s; }
   }
+  // A scene leaving the stack releases battle presentation state (see BattleScene.dispose): sprite offsets / tint /
+  // scale, the effect list and the shared per-frame budget. Covers a finished battle and any cancelled or replaced
+  // one, so nothing survives into the next battle.
+  function disposeLeaving(s) { if (s && s.isBattleScene && s.dispose) s.dispose(); }
   function top() { return scenes[scenes.length - 1]; }
   // Start a coroutine; returns a handle { done, value }
   function spawn(gen, name) {

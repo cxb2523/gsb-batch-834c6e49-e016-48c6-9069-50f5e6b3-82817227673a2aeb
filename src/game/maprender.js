@@ -128,7 +128,7 @@
       if (ground.mat[i] === MATOF.water && s.data[i] === T.waterColor(wx0 + x, wy0 + y, ground.wdist[i], 0)) wmask[i] = 1;
     } }
     // first frame of animated cells
-    const R = { map, s, up, W, H, mx: MX, my: MY, anim, wmask, wdist: ground.wdist, wx0, wy0, lastT: -1, gcell: {}, lights, fires };
+    const R = { map, s, up, W, H, mx: MX, my: MY, anim, wmask, wdist: ground.wdist, wx0, wy0, lastT: -1, phase: 0, gcell: {}, lights, fires };
     for (const a of anim) if (a.t === 'grass') R.gcell[a.cx + ',' + a.cy] = a;
     for (const a of anim) drawAnim(R, a, 0);
     return R;
@@ -144,24 +144,29 @@
     }
   }
 
-  // Animate visible region; (vx,vy) = top-left of view in surface pixels
+  // Animate visible region; (vx,vy) = top-left of view in surface pixels.
+  // `R.phase` is the animation clock of this cached render: it starts at 0 when the render is built and is only
+  // advanced by calls made while this render is the one on screen, so a map that was evicted and rebuilt animates
+  // from frame 0 again instead of picking up the phase it had before eviction.
   function animate(R, t, vx, vy, vw, vh) {
-    if (R.interior) { G.interior.animate(R, t, vx, vy); return; }
+    if (!R) return;
+    const phase = R.phase = (R.phase || 0) + 1;
+    if (R.interior) { G.interior.animate(R, phase, vx, vy); return; }
     // water every 4 frames
-    if (t % 4 === 0) {
+    if (phase % 4 === 0) {
       const x0 = Math.max(0, vx), y0 = Math.max(0, vy), x1 = Math.min(R.W, vx + vw), y1 = Math.min(R.H, vy + vh);
       const d = R.s.data, m = R.wmask, wd = R.wdist, W = R.W;
       for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
         const i = y * W + x; if (!m[i]) continue;
-        d[i] = T.waterColor(R.wx0 + x, R.wy0 + y, wd[i], t);
+        d[i] = T.waterColor(R.wx0 + x, R.wy0 + y, wd[i], phase);
       }
     }
     for (const a of R.anim) {
       if (a.px + 16 < vx || a.py + 16 < vy || a.px > vx + vw || a.py > vy + vh) continue;
-      if (a.t === 'flower' && t % 24 === 0) drawAnim(R, a, t);
+      if (a.t === 'flower' && phase % 24 === 0) drawAnim(R, a, phase);
       if (a.t === 'grass') {
-        if (a.rustle > 0) { a.rustle--; if (a.rustle === 0 || a.rustle === 11) drawAnim(R, a, t); }
-        else if (t % 40 === 0) drawAnim(R, a, t);
+        if (a.rustle > 0) { a.rustle--; if (a.rustle === 0 || a.rustle === 11) drawAnim(R, a, phase); }
+        else if (phase % 40 === 0) drawAnim(R, a, phase);
       }
     }
   }
@@ -172,6 +177,7 @@
 
   // Copy an opaque surface region to the screen quickly
   function blitOpaque(dst, src, dx, dy) {
+    if (!src) return;
     const x0 = Math.max(0, dx), y0 = Math.max(0, dy), x1 = Math.min(dst.w, dx + src.w), y1 = Math.min(dst.h, dy + src.h);
     if (x1 <= x0) return;
     for (let y = y0; y < y1; y++) {
@@ -180,18 +186,63 @@
     }
   }
 
-  // incremental background build with a per-frame time budget
+  // incremental background build with a per-frame time budget.
+  // Animated units of one cached render: flower / tall-grass cells plus the fires (braziers) and the water-wave mask.
+  // Dropping the cache entry alone would let the Surface, the per-cell background snapshots and the mask arrays stay
+  // reachable from anything still holding the object, so eviction clears them on the object itself first.
+  function release(R) {
+    if (!R) return;
+    if (R.anim) R.anim.length = 0;
+    if (R.interiorAnim) R.interiorAnim.length = 0;
+    if (R.fires) R.fires.length = 0;
+    if (R.lights) R.lights.length = 0;
+    R.wmask = null; R.wdist = null;
+    if (R.gcell) for (const k in R.gcell) delete R.gcell[k];
+    // the next build starts its animation phase from zero (flowers / grass / water t=0), it does not resume
+    R.phase = 0; R.lastT = 0; R.t = 0;
+    R.s = null; R.up = null; R.map = null;
+    R.released = true;
+  }
+  const building = new Set(), evictedWhileBuilding = new Set();
   function* buildAsync(map, budgetMs) {
     if (cache[map.name]) return cache[map.name];
+    const name = map.name;
+    building.add(name);
     const it = buildGen(map); let r;
-    for (;;) { const t0 = performance.now(); do { r = it.next(); } while (!r.done && performance.now() - t0 < (budgetMs || 4)); if (r.done) break; yield; }
-    cache[map.name] = r.value; return r.value;
+    try {
+      for (;;) { const t0 = performance.now(); do { r = it.next(); } while (!r.done && performance.now() - t0 < (budgetMs || 4)); if (r.done) break; yield; }
+    } finally { building.delete(name); }
+    // evicted while still building (a cancelled scene / another warp): throw the render away instead of
+    // resurrecting a cache entry the eviction just bounded away
+    if (evictedWhileBuilding.has(name)) { evictedWhileBuilding.delete(name); release(r.value); return null; }
+    if (cache[name]) return cache[name]; // a newer build already landed
+    cache[name] = r.value; return r.value;
   }
   function get(map) {
     if (!cache[map.name]) cache[map.name] = build(map);
     return cache[map.name];
   }
-  function evict(keep) { for (const k in cache) if (!keep.has(k)) delete cache[k]; }
+  // Drop every cached render not in `keep`, releasing what it animates (units, water mask, fires). `keep` holds the
+  // map names the caller still needs — the map on screen and its connections. Neighbour borders are baked into each
+  // render at build time, so dropping a map another render shares an edge with does not change that render.
+  function evict(keep) {
+    const keepSet = new Set();
+    for (const k of keep) keepSet.add(typeof k === 'string' ? k : (k && k.name));
+    for (const k in cache) if (!keepSet.has(k)) { release(cache[k]); delete cache[k]; }
+    for (const k of evictedWhileBuilding) if (!keepSet.has(k)) evictedWhileBuilding.delete(k);
+  }
+  // Evict one map's render (used when its grid changes and must be rebuilt), releasing first.
+  function evictOne(name) {
+    if (cache[name]) { release(cache[name]); delete cache[name]; }
+    if (building.has(name)) evictedWhileBuilding.add(name);
+  }
+  // Cache size, for tests / diagnostics.
+  function stats() {
+    const names = Object.keys(cache);
+    let units = 0, fires = 0, masks = 0, surfaces = 0;
+    for (const k of names) { const R = cache[k]; if (!R) continue; units += (R.anim ? R.anim.length : 0) + (R.interiorAnim ? R.interiorAnim.length : 0); fires += R.fires ? R.fires.length : 0; if (R.wmask) masks++; if (R.s && R.up) surfaces += 2; }
+    return { maps: names.length, names, units, fires, masks, surfaces };
+  }
 
   // animated brazier flames, drawn after night grading so they glow
   function drawFires(s, R, ox, oy, t) {
@@ -236,5 +287,5 @@
       }
     }
   }
-  G.mapRender = { elevationEdges, build, buildGen, buildAsync, get, animate, rustle, blitOpaque, evict, drawFires, MX, MY, cache };
+  G.mapRender = { elevationEdges, build, buildGen, buildAsync, get, animate, rustle, blitOpaque, evict, evictOne, release, stats, drawFires, MX, MY, cache };
 })(window.G);

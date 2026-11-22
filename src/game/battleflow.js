@@ -201,6 +201,13 @@
     let result;
     try { result = yield* b.run(sc); }
     catch (e) { console.error(e); result = 'win'; }
+    finally {
+      // Cancelled (task killed / exception / closed coroutine) or finished: clear the sprite presentation state and
+      // effect list and hand the per-frame budget back to the field. Idempotent — the engine's pop hook calls
+      // dispose() again when the scene actually leaves the stack. A battle ended early never carries offsets / tint /
+      // scale or leftover particles into the next one.
+      sc.dispose();
+    }
     if (G.glitch) G.glitch.afterBattle(b, opts); // the last enemy's stats stay in RAM (src/game/glitches.js)
     // pay day
     if (b.payDay && (result === 'win' || result === 'caught')) { G.state.money += b.payDay; yield* sc.msg(G.state.name + ' picked up $' + b.payDay + '!'); }

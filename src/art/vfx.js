@@ -11,11 +11,97 @@
   function center(sc, k) { return k === 'e' ? { x: G.E_POS.x, y: G.E_POS.y - 28 } : { x: G.P_POS.x, y: G.P_POS.y - 34 }; }
   function other(k) { return k === 'e' ? 'p' : 'e'; }
 
+  // ---------- shared per-frame draw budget ----------
+  // One observable budget per drawn frame, fed by the battle scene's effect list (here) and by the overworld's
+  // ambient particle pool (src/art/ambient.js). Only one of the two draws on any given frame: the battle scene is
+  // opaque, so while it is on top the field is not drawn and vice versa. Whichever reports a frame owns it.
+  //
+  // The battle side enforces the cap: every frame the live effect entries are counted, and when the total would
+  // exceed `cap` the OLDEST decorative entries are dropped first. Hit feedback (impact sparks / the impact flash)
+  // and status animations (`G.vfx.status`, `G.vfx.stat`) are marked essential and are never dropped.
+  //
+  // `resetBattle()` runs when a battle scene is destroyed (BattleScene.dispose), so the battle's occupancy (live /
+  // peak) never carries over to the next battle. `dropped` / `droppedParticles` / `frames` are session diagnostics
+  // and are NOT reset, so a test can report how hard the cap had to work over several battles.
+  //
+  // Caps are in the spirit of the Game Boy: a performance target, not a limit on choreography. `cap` bounds the
+  // battle's live entries; `fieldCap` bounds the overworld's ambient particle pool (which spawns clouds of 30-50 on
+  // a forest / ice map). Both are overridable at runtime (G.fxBudget.cap = n) for tests that want to force pressure.
+  const budget = G.fxBudget = {
+    cap: 96,          // max live effect entries per battle frame
+    fieldCap: 64,     // max live ambient particles drawn in an overworld frame
+    live: 0,          // live effects in the last reported frame (battle or field)
+    battle: 0,        // battle-owned live entries (0 while the field draws / after a battle ends)
+    field: 0,         // overworld ambient particles in the last field frame
+    peak: 0,          // highest battle `live` since the last resetBattle()
+    particles: 0,     // live particle entries in the last battle frame
+    essential: 0,     // live essential (hit / status) entries in the last battle frame
+    effects: 0,       // live battle effect entries in the last battle frame
+    dropped: 0,       // decorative battle entries dropped by the cap this session
+    droppedParticles: 0,
+    frames: 0,        // battle frames reported this session
+    owner: null,      // 'battle' | 'field' | null
+    resetBattle() {
+      budget.battle = 0; budget.live = 0; budget.peak = 0;
+      budget.particles = 0; budget.essential = 0; budget.effects = 0;
+      budget.owner = null;
+    },
+  };
+
+  // Count (and enforce) the battle scene's live effects. While the list is over `cap`, the OLDEST decorative entries
+  // are dropped first. Essential entries (hit feedback / status animations) are never dropped, so even a
+  // pathological pile of them still shows. (Particles deliberately spawned off-frame — blizzard snow, screen rain —
+  // are left alone; they are part of the recipe, not garbage.)
+  function frame(sc) {
+    if (!sc || !Array.isArray(sc.fx)) return;
+    const cap = budget.cap;
+    const over = sc.fx.length - cap;
+    if (over > 0) {
+      const kept = [];
+      let drop = over;
+      for (let i = 0; i < sc.fx.length; i++) {
+        const f = sc.fx[i];
+        if (f.fxEssential || drop === 0) { kept.push(f); continue; }
+        drop--;
+        budget.dropped++;
+        if (f.fxParticle) budget.droppedParticles++;
+      }
+      sc.fx = kept;
+    }
+    let essential = 0, parts = 0;
+    for (const f of sc.fx) { if (f.fxEssential) essential++; if (f.fxParticle) parts++; }
+    budget.battle = sc.fx.length; budget.field = 0; budget.owner = 'battle';
+    budget.live = budget.battle; budget.effects = sc.fx.length;
+    budget.particles = parts; budget.essential = essential;
+    budget.frames++;
+    if (budget.live > budget.peak) budget.peak = budget.live;
+  }
+
+  // Battle scene destroyed: hand the frame back to the field and zero the battle's occupancy. Not accumulated
+  // across scenes.
+  function endBattle() {
+    budget.resetBattle();
+    budget.live = 0;
+    budget.owner = null;
+  }
+
+  // Overworld ambient particles report through the same budget so the two animation systems share one observable
+  // per-frame number.
+  function reportField(n) {
+    if (budget.owner === 'battle') return; // a lower scene is not drawn under an opaque battle scene
+    budget.field = n | 0; budget.battle = 0;
+    budget.live = budget.field; budget.effects = budget.field;
+    budget.particles = budget.field; budget.essential = 0;
+    budget.owner = 'field';
+  }
+
   // ---------- particle system ----------
   function particle(sc, o) {
     const p = Object.assign({ x: 0, y: 0, vx: 0, vy: 0, ax: 0, ay: 0, drag: 1, life: 30, age: 0, size: 1, shape: 'dot', cols: [WHITE], spin: 0, rot: 0 }, o);
     sc.fx.push({
       layer: o.layer,
+      fxParticle: true, // counted in the shared per-frame budget
+      fxEssential: !!o.essential, // hit feedback / status animations: never dropped by the cap
       draw(s) {
         if (p.delay > 0) { p.delay--; return true; }
         p.age++;
@@ -68,8 +154,9 @@
     const c = center(sc, k);
     const cc = col ? C(col) : hex('#ffffff');
     const x = c.x + rand(-6, 6), y = c.y + rand(-6, 6);
-    sc.fx.push({ age: 0, draw(s) { this.age++; if (this.age > 8) return false; const r = (big ? 14 : 10) * (1 - Math.abs(this.age - 4) / 5); for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2 + 0.3; const L = i % 2 ? r : r * 0.55; s.lineBlend(x, y, x + Math.cos(a) * L, y + Math.sin(a) * L, i % 2 ? cc : hex('#fff4b0'), 1); } s.disc(x, y, 2.5, WHITE); return true; } });
-    for (let i = 0; i < 6; i++) { const a = rand(0, Math.PI * 2); particle(sc, { x, y, vx: Math.cos(a) * rand(1, 2.5), vy: Math.sin(a) * rand(1, 2.5), drag: 0.85, life: 12, shape: 'spark', cols: [WHITE, cc] }); }
+    sc.fx.push({ age: 0, fxEssential: true, draw(s) { this.age++; if (this.age > 8) return false; const r = (big ? 14 : 10) * (1 - Math.abs(this.age - 4) / 5); for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2 + 0.3; const L = i % 2 ? r : r * 0.55; s.lineBlend(x, y, x + Math.cos(a) * L, y + Math.sin(a) * L, i % 2 ? cc : hex('#fff4b0'), 1); } s.disc(x, y, 2.5, WHITE); return true; } });
+    // hit feedback: the impact flash and its sparks are essential, the cap may never drop them
+    for (let i = 0; i < 6; i++) { const a = rand(0, Math.PI * 2); particle(sc, { x, y, vx: Math.cos(a) * rand(1, 2.5), vy: Math.sin(a) * rand(1, 2.5), drag: 0.85, life: 12, shape: 'spark', cols: [WHITE, cc], essential: true }); }
     if (big) sc.shake = Math.max(sc.shake, 4);
     yield* W(8);
   }
@@ -255,7 +342,17 @@
     leechseed: function* (sc, a, t) { yield* projectile(sc, a, t, 20, 'seed', [0], { count: 3, gap: 3, arc: 22, spread: 8 }); emit(sc, t, 6, { life: 20, shape: 'leaf', cols: GRASS.map(C), vy: -0.4 }); yield* W(12); },
     seeddrain: function* (sc, a) { yield* R.drain(sc, other(a), a, ['#e8f898', '#a8d848']); },
     powder: function* (sc, a, t, col) { const c = center(sc, t); for (let i = 0; i < 30; i++) particle(sc, { x: c.x + rand(-18, 18), y: c.y - 34 + rand(-6, 6), vy: rand(0.6, 1.2), vx: rand(-0.3, 0.3), delay: Math.floor(rand(0, 18)), life: 30, shape: 'dot', size: 2, cols: [C(col), shade(C(col), 0.3)] }); yield* W(40); },
-    petaldance: function* (sc, a, t) { yield* vortex(sc, t, 36, ['#ffb0d0', '#f880b0', '#ffe0f0'], 'leaf'); yield* impact(sc, t); },
+    // 40 petal sprites swirling around the target, over a purple haze (a monster display, not a particle shower)
+    petaldance: function* (sc, a, t) {
+      const c = center(sc, t);
+      for (let i = 0; i < 40; i++) {
+        const a0 = rand(0, Math.PI * 2), r0 = rand(10, 30);
+        particle(sc, { delay: Math.floor(rand(0, 16)), life: 30, shape: 'leaf', size: 3, cols: ['#ffb0d0', '#f880b0', '#ffe0f0'].map(C),
+          onUpdate: p => { const an = a0 + p.age * 0.3; const r = r0 * (1 - p.age / 44); p.x = c.x + Math.cos(an) * r; p.y = c.y + Math.sin(an) * r * 0.5 - p.age * 0.4; } });
+      }
+      sc.fx.push({ age: 0, layer: 'under', draw(s) { this.age++; if (this.age > 46) return false; const k = Math.sin(this.age / 46 * Math.PI) * 0.3; const d = s.data; for (let i = 0; i < 320 * 132; i++) d[i] = mix(d[i], 0xffffd0f0, k); return true; } });
+      yield* W(46); yield* impact(sc, t);
+    },
     icebeam: function* (sc, a, t) { yield* beam(sc, a, t, 28, ICE, 5, { sparks: 'snow' }); emit(sc, t, 10, { life: 26, shape: 'shard', cols: ICE.map(C), jx: 1, jy: 1 }); yield* W(12); },
     blizzard: function* (sc, a, t) {
       sc.fx.push({ age: 0, layer: 'under', draw(s) { this.age++; if (this.age > 70) return false; const k = Math.sin(this.age / 70 * Math.PI) * 0.35; const d = s.data; for (let i = 0; i < 320 * 132; i++) d[i] = mix(d[i], 0xfffff0e8, k); return true; } });
@@ -364,34 +461,56 @@
     FLY_CHARGE: ['fly_charge'], DIG_CHARGE: ['dig_charge'], BIDE_HIT: ['counter'], HORN: ['needles', 2],
   };
 
+  // Per-slot presentation state a recipe can drive. Reset after every move so an interrupted coroutine can never
+  // leave a sprite displaced, tinted, faded, clipped, scaled or the screen distorted into the next turn / battle.
+  function resetSlot(sc, k) {
+    if (sc.offs[k]) { sc.offs[k].x = 0; sc.offs[k].y = 0; }
+    sc.tint[k] = null;
+    sc.vis[k] = 1;
+    sc.clip[k] = 1;
+    sc.scale[k] = 1;
+  }
+  function resetScreen(sc) {
+    sc.screenFx = null;
+    sc.flash = 0;
+    sc.flashColor = G.PAL.white;
+    sc.shake = 0;
+  }
   function* move(sc, id, k, hit) {
     const m = MOVES[id] || ['hit'];
     const t = other(k);
-    if (hit > 0 && !['needles', 'claw'].includes(m[0])) { yield* impact(sc, t); return; }
-    const f = R[m[0]] || R.hit;
-    const ar = m[1];
-    if (m[0] === 'drain' && id === 'DRAIN') { yield* R.drain(sc, k, t); return; }
-    yield* f(sc, k, t, ar);
-    // make sure transient states are reset
-    sc.offs[k].x = 0; sc.offs[k].y = 0;
-  }
-  function* status(sc, k, st) {
-    switch (st) {
-      case 'PSN': emit(sc, k, 10, { life: 24, shape: 'bubble', size: 2, vy: -0.8, cols: POIS.map(C), spreadT: 14 }); yield* tint(sc, k, '#b060d0', 24); break;
-      case 'BRN': emit(sc, k, 10, { life: 20, shape: 'flame', size: 2, vy: -0.8, cols: FIRE.map(C), spreadT: 12 }); yield* tint(sc, k, '#f86030', 24); break;
-      case 'PAR': emit(sc, k, 12, { life: 12, shape: 'spark', cols: ELEC.map(C), spreadT: 18 }); yield* tint(sc, k, '#f8e040', 24); break;
-      case 'SLP': emit(sc, k, 3, { life: 36, shape: 'z', vy: -0.6, vx: 0.5, cols: [C('#e0e8ff')], spreadT: 20, rx: 4, ry: 4 }); yield* W(36); break;
-      case 'FRZ': emit(sc, k, 10, { life: 24, shape: 'shard', cols: ICE.map(C), spreadT: 10 }); yield* tint(sc, k, '#a0e0ff', 24); break;
-      case 'CONF': { const c = center(sc, k); for (let i = 0; i < 3; i++) { const a0 = i / 3 * Math.PI * 2; particle(sc, { life: 36, shape: 'star', size: 2, cols: [C('#fff8a0')], onUpdate: p => { const an = a0 + p.age * 0.25; p.x = c.x + Math.cos(an) * 14; p.y = c.y - 18 + Math.sin(an) * 4; } }); } yield* W(36); break; }
+    try {
+      if (hit > 0 && !['needles', 'claw'].includes(m[0])) { yield* impact(sc, t); return; }
+      const f = R[m[0]] || R.hit;
+      const ar = m[1];
+      if (m[0] === 'drain' && id === 'DRAIN') { yield* R.drain(sc, k, t); return; }
+      yield* f(sc, k, t, ar);
+    } finally {
+      // make sure transient states are reset even if the coroutine is cancelled mid-animation
+      resetSlot(sc, k); resetSlot(sc, t); resetScreen(sc);
     }
   }
+  // Battle status animations. Every effect this spawns is marked essential, so the per-frame cap can never drop a
+  // status reaction no matter how many decorative particles are already alive.
+  function* status(sc, k, st) {
+    const emitEssential = o => particle(sc, Object.assign({}, o, { essential: true }));
+    switch (st) {
+      case 'PSN': for (let i = 0; i < 10; i++) emitEssential({ x: center(sc, k).x + rand(-12, 12), y: center(sc, k).y + rand(-10, 10), vx: rand(-0.3, 0.3), vy: -0.8, life: 24, shape: 'bubble', size: 2, cols: POIS.map(C) }); yield* tint(sc, k, '#b060d0', 24); break;
+      case 'BRN': for (let i = 0; i < 10; i++) emitEssential({ x: center(sc, k).x + rand(-12, 12), y: center(sc, k).y + rand(-10, 10), vx: rand(-0.3, 0.3), vy: -0.8, life: 20, shape: 'flame', size: 2, cols: FIRE.map(C) }); yield* tint(sc, k, '#f86030', 24); break;
+      case 'PAR': for (let i = 0; i < 12; i++) emitEssential({ x: center(sc, k).x + rand(-10, 10), y: center(sc, k).y + rand(-10, 10), life: 12, shape: 'spark', cols: ELEC.map(C) }); yield* tint(sc, k, '#f8e040', 24); break;
+      case 'SLP': { const c = center(sc, k); for (let i = 0; i < 3; i++) emitEssential({ x: c.x + rand(-4, 4), y: c.y + rand(-4, 4), vy: -0.6, vx: 0.5, delay: i * 6, life: 36, shape: 'z', cols: [C('#e0e8ff')] }); yield* W(36); break; }
+      case 'FRZ': for (let i = 0; i < 10; i++) emitEssential({ x: center(sc, k).x + rand(-12, 12), y: center(sc, k).y + rand(-10, 10), life: 24, shape: 'shard', cols: ICE.map(C) }); yield* tint(sc, k, '#a0e0ff', 24); break;
+      case 'CONF': { const c = center(sc, k); for (let i = 0; i < 3; i++) { const a0 = i / 3 * Math.PI * 2; particle(sc, { life: 36, shape: 'star', size: 2, cols: [C('#fff8a0')], essential: true, onUpdate: p => { const an = a0 + p.age * 0.25; p.x = c.x + Math.cos(an) * 14; p.y = c.y - 18 + Math.sin(an) * 4; } }); } yield* W(36); break; }
+    }
+  }
+  // Stat-change animation: its rising / falling streaks are essential for the same reason.
   function* stat(sc, k, up, col) {
     const c = center(sc, k);
     const cols = up ? [C(col || '#fff0a0'), C('#f8a040'), C('#e05030')] : [C('#c0e0ff'), C('#6090e0'), C('#3050a0')];
     for (let i = 0; i < 18; i++) particle(sc, { x: c.x + rand(-20, 20), y: c.y + (up ? 20 : -26) + rand(-6, 6), vy: up ? -2 : 2, delay: Math.floor(rand(0, 16)), life: 16, shape: 'dot', size: 1, cols,
-      onUpdate: p => { /* streak */ } });
+      essential: true, onUpdate: p => { /* streak */ } });
     for (let i = 0; i < 24; i++) { sc.tint[k] = [cols[1], 0.4 * Math.sin(i / 24 * Math.PI)]; yield; }
     sc.tint[k] = null;
   }
-  G.vfx = { move, status, stat, burst, sparkle, particle, MOVES, R };
+  G.vfx = { move, status, stat, burst, sparkle, particle, MOVES, R, frame, endBattle, reportField, budget };
 })(window.G);
