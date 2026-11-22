@@ -1,6 +1,13 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { VideoSeekSlider, Props } from '..';
+import { FakeImage } from '../test/FakeImage';
 
 const getWrapper = (overrides: Partial<Props> = {}): any => (
   <VideoSeekSlider
@@ -151,10 +158,12 @@ describe('VideoSeekSlider.tsx', () => {
         left: 0,
         width: 100,
       } as DOMRect);
+      FakeImage.install();
     });
 
     afterEach(() => {
       vi.restoreAllMocks();
+      FakeImage.restore();
     });
 
     const thumbnails = [
@@ -182,6 +191,7 @@ describe('VideoSeekSlider.tsx', () => {
       render(getWrapper({ max: 100000, previewThumbnails: thumbnails }));
 
       fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 70 });
+      act(() => FakeImage.getBySrc('sprite.jpg')!.load());
 
       const preview = screen.getByTestId('preview-screen');
       const sprite = preview.firstElementChild as HTMLElement;
@@ -205,6 +215,19 @@ describe('VideoSeekSlider.tsx', () => {
       );
       fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 30 });
 
+      await waitFor(() =>
+        expect(
+          FakeImage.getBySrc('http://localhost:3000/media/sheet.jpg')
+        ).toBeDefined()
+      );
+
+      // While the sprite preload is in flight there is no preview frame yet.
+      expect(screen.queryByTestId('preview-screen')).not.toBeInTheDocument();
+
+      act(() =>
+        FakeImage.getBySrc('http://localhost:3000/media/sheet.jpg')!.load()
+      );
+
       const preview = await screen.findByTestId('preview-screen');
       const sprite = preview.firstElementChild as HTMLElement;
 
@@ -227,10 +250,96 @@ describe('VideoSeekSlider.tsx', () => {
       );
 
       fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 80 });
+      act(() => FakeImage.getBySrc('sprite.jpg')!.load());
 
       expect(screen.getByTestId('preview-screen').style.backgroundImage).toBe(
         'url("fallback.jpg")'
       );
+    });
+
+    it('falls back while the sprite is loading and switches to it once ready', () => {
+      const getPreviewScreenUrl = vi.fn(() => 'fallback.jpg');
+
+      render(
+        getWrapper({
+          max: 100000,
+          previewThumbnails: thumbnails,
+          getPreviewScreenUrl,
+          timeCodes: [{ fromMs: 0, description: 'Intro' }],
+        })
+      );
+
+      fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 70 });
+
+      // Sprite not ready yet: the callback preview fills in instead of a blank.
+      let preview = screen.getByTestId('preview-screen');
+      expect(preview.style.backgroundImage).toBe('url("fallback.jpg")');
+      expect(getPreviewScreenUrl).toHaveBeenCalledWith(70000);
+
+      // Chapter label and time bubble stay on screen throughout.
+      const hoverTime = screen.getByTestId('hover-time');
+      expect(hoverTime).toHaveTextContent('Intro');
+      expect(hoverTime).toHaveTextContent('01:10');
+
+      act(() => FakeImage.getBySrc('sprite.jpg')!.load());
+
+      // Ready now: the sprite fragment replaces the fallback frame, while the
+      // label and time bubble are untouched.
+      preview = screen.getByTestId('preview-screen');
+      expect(preview).toHaveClass('sprite');
+      expect(preview.style.backgroundImage).toBe('');
+      expect(
+        (preview.firstElementChild as HTMLElement).style.backgroundPosition
+      ).toBe('-320px 0px');
+      expect(hoverTime).toHaveTextContent('Intro');
+      expect(hoverTime).toHaveTextContent('01:10');
+    });
+
+    it('shows no preview frame before readiness without a fallback', () => {
+      render(getWrapper({ max: 100000, previewThumbnails: thumbnails }));
+
+      fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 70 });
+
+      expect(screen.queryByTestId('preview-screen')).not.toBeInTheDocument();
+
+      act(() => FakeImage.getBySrc('sprite.jpg')!.load());
+
+      expect(screen.getByTestId('preview-screen')).toBeInTheDocument();
+    });
+
+    it('releases preloaded images when the thumbnail source changes', () => {
+      const nextThumbnails = [
+        { fromMs: 0, toMs: 100000, url: 'other-sprite.jpg' },
+      ];
+      const { rerender } = render(
+        getWrapper({ max: 100000, previewThumbnails: thumbnails })
+      );
+
+      fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 50 });
+      act(() => FakeImage.getBySrc('sprite.jpg')!.load());
+      const previousImage = FakeImage.getBySrc('sprite.jpg')!;
+
+      rerender(getWrapper({ max: 100000, previewThumbnails: nextThumbnails }));
+
+      // The old sprite loses its Image reference, only the new set is retained.
+      expect(previousImage.src).toBe('');
+      expect(FakeImage.getBySrc('other-sprite.jpg')!.src).toBe(
+        'other-sprite.jpg'
+      );
+    });
+
+    it('releases preloaded images on unmount', () => {
+      const { unmount } = render(
+        getWrapper({ max: 100000, previewThumbnails: thumbnails })
+      );
+
+      fireEvent.pointerMove(screen.getByTestId('main-track'), { clientX: 50 });
+      const image = FakeImage.getBySrc('sprite.jpg')!;
+      expect(image.src).toBe('sprite.jpg');
+
+      unmount();
+
+      expect(image.src).toBe('');
     });
 
     it('renders the heatmap only with data and activates it on hover', () => {

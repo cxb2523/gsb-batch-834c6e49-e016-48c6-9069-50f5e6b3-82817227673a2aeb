@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react';
+import { useRef } from 'react';
 import { getHoverTimePosition } from '../utils/getHoverTimePosition';
 import { timeToTimeString } from '../utils/timeToTimeString';
 import { findThumbnail } from '../utils/findThumbnail';
 import { PreviewThumbnail } from '../utils/parseThumbnailsVtt';
+import { usePreloadedThumbnailImages } from '../hooks/usePreloadedThumbnailImages';
 import { PreviewImage } from './previewImage';
 
 interface Props {
@@ -35,25 +36,11 @@ export const HoverTimeWithPreview: React.FC<Props> = ({
   previewThumbnails,
 }) => {
   const hoverTimeElement = useRef<HTMLDivElement>(null);
-  const preloadedThumbnails = useRef<PreviewThumbnail[]>(undefined);
+  const readySpriteUrls = usePreloadedThumbnailImages(
+    previewThumbnails,
+    isThumbActive
+  );
   const hoverTimeClassName = isThumbActive ? 'hover-time active' : 'hover-time';
-
-  /** Warm up every sprite sheet on the first hover so scrubbing does not flicker. */
-  useEffect(() => {
-    if (
-      !isThumbActive ||
-      !previewThumbnails ||
-      preloadedThumbnails.current === previewThumbnails
-    ) {
-      return;
-    }
-
-    preloadedThumbnails.current = previewThumbnails;
-
-    new Set(previewThumbnails.map(({ url }) => url)).forEach((url) => {
-      new Image().src = url;
-    });
-  }, [isThumbActive, previewThumbnails]);
 
   const hoverTimePosition = getHoverTimePosition(
     seekHoverPosition,
@@ -72,8 +59,11 @@ export const HoverTimeWithPreview: React.FC<Props> = ({
 
   const thumbnail =
     previewThumbnails && findThumbnail(previewThumbnails, hoverTimeValue);
+  // A matched thumbnail whose sprite has not preloaded yet would render an
+  // empty box: show the caller-provided screen url instead until it is ready.
+  const isSpriteReady = thumbnail ? readySpriteUrls.has(thumbnail.url) : false;
   const previewUrl =
-    !thumbnail && getPreviewScreenUrl && isThumbActive
+    (!thumbnail || !isSpriteReady) && getPreviewScreenUrl && isThumbActive
       ? getPreviewScreenUrl(hoverTimeValue)
       : undefined;
 
@@ -84,7 +74,9 @@ export const HoverTimeWithPreview: React.FC<Props> = ({
       ref={hoverTimeElement}
       data-testid="hover-time"
     >
-      {isThumbActive && thumbnail && <PreviewImage thumbnail={thumbnail} />}
+      {isThumbActive && thumbnail && isSpriteReady && (
+        <PreviewImage thumbnail={thumbnail} />
+      )}
       {previewUrl !== undefined && (
         <PreviewImage thumbnail={{ fromMs: 0, toMs: 0, url: previewUrl }} />
       )}
