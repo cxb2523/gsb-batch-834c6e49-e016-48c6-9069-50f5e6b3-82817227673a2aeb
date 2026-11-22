@@ -29,8 +29,8 @@ export interface SpritesEach {
   color?: Uint32Array | number;
   /**
    * Frame per copy: an index into the `Frame[]` passed as `draw.sprites`' first argument (an index past the
-   * end throws). Frames on one image stay one draw call; frames across images draw one quad per copy (warned once
-   * in development).
+   * end throws). Frames on one image stay one draw call; frames across images stay instanced too, split into
+   * a new draw call whenever the eight texture units in a batch are taken.
    * With `stride`, an offset into each record.
    */
   frame?: ArrayLike<number> | number;
@@ -50,7 +50,7 @@ export interface CopySpec {
   /** Anchor as a fraction of each copy's frame size. */
   originX: number;
   originY: number;
-  /** Per-copy frames (`each.frame` indexes `frames`); `mixed` when they span more than one image. */
+  /** Per-copy frames (`each.frame` indexes `frames`); `mixed` when they span more than one image, which the WebGL2 backend batches in eight-texture-unit segments. */
   frames: readonly Frame[] | undefined;
   mixed: boolean;
   /** Shared scale, flips folded in. */

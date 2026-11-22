@@ -1,5 +1,11 @@
 # spryte
 
+## Unreleased
+
+- `draw.sprites` with per-copy frames (`each.frame`) spanning more than one atlas stays on the instanced path on WebGL2 instead of falling back to one quad per copy. Copies are split into batches of at most eight texture units, so a batch opens a new instanced call only when its eight units are taken; per-copy colour, frame UV and size match the single-atlas path and a `sprite()` loop pixel for pixel. The development warning for mixed atlases is gone.
+- `draw.replay` keeps a layer instanced on WebGL2 even when sprites were recorded under scale, rotation or skew. Each sprite's local transform is folded into its instance, so the layer no longer falls back to drawing those sprites one by one, while producing the same pixels (including pixel snapping).
+- Texture-unit state is reset after a replay, a multi-atlas per-copy batch and a shape flush, so the `lastSrc`/`last` texture caches can't read a unit another path rebound. After a WebGL context loss, both a replayed layer's GPU buffers and a custom per-copy shader program are rebuilt on their next use.
+
 ## 0.12.3
 
 ### Patch Changes

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { Matrix, TextureSource } from "../src/backend.js";
-import { Draw } from "../src/draw.js";
+import { copyAt, frameAt, type CopySpec } from "../src/copies.js";
+import { Draw, type Frame } from "../src/draw.js";
 import { blur, filter } from "../src/filters.js";
+import type { Layer } from "../src/layer.js";
 import { mesh } from "../src/mesh.js";
 import { Shader } from "../src/shader.js";
 import { ring, roundRect } from "../src/shapes.js";

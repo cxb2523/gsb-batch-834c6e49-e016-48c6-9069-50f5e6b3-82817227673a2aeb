@@ -126,7 +126,10 @@ describe("adversarial: hostile sprites() counts", () => {
     const color = new Uint32Array([0xff0000ff]);
     draw.sprites(image(), new Float32Array(8), 4, {}, { color });
     draw.end();
-    const upload = calls.find((c) => c.name === "bufferData" && c.args[1] === color);
+    // The colour upload is a view over the source array; its draw length (args[4]) must never pass the end of
+    // the source, even though `count` asks for four copies. Single-image calls upload from offset zero.
+    const upload = calls.find((c) => c.name === "bufferData" && c.args[1] instanceof Uint32Array);
+    expect(upload?.args[3]).toBe(0);
     expect(upload?.args[4]).toBeLessThanOrEqual(color.length);
   });
 

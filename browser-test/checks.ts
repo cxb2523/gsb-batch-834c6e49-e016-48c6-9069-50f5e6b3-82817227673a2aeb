@@ -221,7 +221,8 @@ for (const backend of ["webgl2", "2d"] as const) {
 }
 
 // Per-copy frame: sprites(frames, …, { frame }) must match a sprite() loop over the same frames. Frames of
-// different sizes on one image take the instanced path; a frame on a second image forces one quad per copy.
+// different sizes on one image take the instanced path; frames across images stay instanced too, split into
+// eight-texture-unit batches, and must still match the loop pixel for pixel.
 {
   const n = 20;
   const other = art();
@@ -246,6 +247,32 @@ for (const backend of ["webgl2", "2d"] as const) {
       const bulk = await render((draw) => draw.sprites(frames, pos, n, {}, each), backend);
       record(`sprites(each.frame) == sprite() loop: ${name} (${backend})`, loop, bulk);
     }
+}
+
+// The hard case for multi-atlas instancing: more than eight images, with a different colour and rotation on
+// every copy. The bulk call splits into eight-unit batches yet must equal drawing every sprite individually.
+{
+  const n = 20;
+  const atlases = Array.from({ length: 10 }, () => art());
+  const frames: Frame[] = atlases.map((image, i) => ({ image, x: i % 2, y: i % 3, w: 6, h: 5 }));
+  const index = Uint8Array.from({ length: n }, (_, i) => i % atlases.length);
+  const rotation = Float32Array.from({ length: n }, (_, i) => i * 0.31);
+  const scale = Float32Array.from({ length: n }, (_, i) => 0.75 + (i % 3) * 0.25);
+  const colors = Uint32Array.from({ length: n }, (_, i) => [0xffffffff, 0xff8080ff, 0x80ff80c0, 0x8080ff80][i % 4] as number);
+  const hex = (c: number) => `#${c.toString(16).padStart(8, "0")}`;
+  for (const backend of ["webgl2", "2d"] as const) {
+    const loop = await render((draw) => {
+      for (let i = 0; i < n; i++)
+        draw.sprite(frames[index[i] as number] as Frame, pos[i * 2] as number, pos[i * 2 + 1] as number, {
+          rotation: rotation[i] as number,
+          scaleX: scale[i] as number,
+          scaleY: scale[i] as number,
+          tint: hex(colors[i] as number),
+        });
+    }, backend);
+    const bulk = await render((draw) => draw.sprites(frames, pos, n, {}, { frame: index, rotation, scale, color: colors }), backend);
+    record(`sprites(each) across 10 atlases, per-copy colour + rotation == sprite() loop (${backend})`, loop, bulk);
+  }
 }
 
 // Interleaved records (each.stride): must match the same values passed as separate arrays, on both backends.
@@ -322,6 +349,43 @@ for (const backend of ["webgl2", "2d"] as const) {
     draw.withShader(s, () => draw.sprites(img, pos, n));
   });
   record("withShader + sprites() == withShader + sprite() loop (webgl2)", plainLoop, plainBulk);
+}
+
+// A layer recorded under rotation, scale and skew must replay (instanced on WebGL2) with the same pixels as
+// drawing the same sprites one by one under the replay transform.
+{
+  const content = (draw: Draw) => {
+    draw.push();
+    draw.translate(6, 3);
+    draw.rotate(0.4);
+    draw.scale(1.5, 0.8);
+    draw.sprite(img, 10, 8, { rotation: 0.3, scaleX: 1.25, origin: [0.25, 0.75] });
+    draw.pop();
+    draw.push();
+    draw.transform(1, 0.15, 0.2, 1, 12, 20); // skew
+    draw.sprite(img, 4, 4);
+    draw.pop();
+    draw.sprite(img, 30, 9, { tint: "#88f", alpha: 0.7 });
+  };
+  for (const backend of ["webgl2", "2d"] as const) {
+    // Build the layer in one renderer, then draw it two ways in fresh renderers.
+    const layerCanvas = document.createElement("canvas");
+    layerCanvas.width = W;
+    layerCanvas.height = H;
+    const layerDraw = createRenderer(layerCanvas, { backend, smooth: false });
+    await layerDraw.ready;
+    const layer = layerDraw.record(content);
+    layerDraw.dispose();
+    const direct = await render((draw) => {
+      draw.translate(2.5, 1);
+      content(draw);
+    }, backend);
+    const replayed = await render((draw) => {
+      draw.translate(2.5, 1);
+      draw.replay(layer);
+    }, backend);
+    record(`replay of a rotated, scaled and skewed layer == one-by-one sprites (${backend})`, direct, replayed);
+  }
 }
 
 // Custom shaders.

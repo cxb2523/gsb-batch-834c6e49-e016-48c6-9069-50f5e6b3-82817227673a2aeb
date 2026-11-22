@@ -53,7 +53,6 @@ const WHITE = 0xffffffff;
  */
 export class Draw {
   private warnedDetached = false;
-  private warnedMixed = false;
   /** Global alpha multiplier for subsequent draws. */
   alpha = 1;
   /**
@@ -342,8 +341,9 @@ export class Draw {
 
   /**
    * Draw a layer from `record()` under the current transform and `draw.alpha`, as if its sprites were drawn
-   * here one by one. On WebGL2 that's one draw call per eight images it uses; on Canvas 2D, and under a custom
-   * shader or `draw.alpha` below 1, its sprites are drawn again the usual way (the same pixels, without the saving).
+   * here one by one. On WebGL2 that's one draw call per eight images it uses — sprites recorded under scale,
+   * rotation or skew keep their own instanced transform — and on Canvas 2D, under a custom shader or
+   * `draw.alpha` below 1, its sprites are drawn again the usual way (the same pixels, without the saving).
    */
   replay(layer: Layer): void {
     if (this.rec) throw new Error("spryte: draw.replay() can't be recorded; record the sprites themselves");
@@ -493,12 +493,6 @@ export class Draw {
       if (each.frame !== undefined) {
         frames = all;
         for (let i = 1; i < all.length && !mixed; i++) mixed = (all[i] as Frame).image !== f.image;
-        if (mixed && !this.warnedMixed && typeof import.meta.env !== "undefined" && import.meta.env.DEV === true) {
-          this.warnedMixed = true;
-          console.warn(
-            "spryte: draw.sprites got frames from more than one image, so each copy draws as its own quad instead of one instanced call. Put the frames on one atlas to keep it one call",
-          );
-        }
       }
     } else {
       const one = frame as Frame | TextureSource;

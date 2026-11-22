@@ -491,7 +491,7 @@ describe("sprites with frames across images", () => {
     return { draw, copies, a: {} as TextureSource, b: {} as TextureSource };
   };
 
-  it("warns once per renderer in development", () => {
+  it("flags frames across images as mixed but no longer warns: the backend keeps them instanced", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { draw, copies, a, b } = setup();
     const frames = [
@@ -502,8 +502,7 @@ describe("sprites with frames across images", () => {
     draw.sprites(frames, new Float32Array(4), 2, {}, { frame: [1, 0] });
     expect(copies).toHaveBeenCalledTimes(2);
     expect(copies.mock.calls[0]?.[0].mixed).toBe(true);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]?.[0]).toMatch(/more than one image.*atlas/);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("stays quiet for frames on one image", () => {

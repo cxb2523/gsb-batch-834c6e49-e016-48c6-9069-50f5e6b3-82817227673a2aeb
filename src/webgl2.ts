@@ -1,5 +1,5 @@
 import type { Backend, BlendMode, ClipRect, Matrix, RawContext, TextureSource } from "./backend.js";
-import { type CopySpec, copyAt, frameAt, placeAt } from "./copies.js";
+import { type CopySpec, frameAt, placeAt } from "./copies.js";
 import type { Frame, SpriteDrawOptions } from "./draw.js";
 import type { Layer } from "./layer.js";
 import type { Shader } from "./shader.js";
@@ -12,7 +12,7 @@ const UNITS = 8;
 /** Added to an instance's texture unit: a sprite (`SPRITE`), and one whose position is already whole pixels (`PLACED`). */
 const SPRITE = 16;
 const PLACED = 32;
-/** A layer sprite (`draw.replay`) to round to whole pixels in the shader when the transform allows (`u_snapok`). */
+/** A recorded-layer instance (`draw.replay`) whose position the layer shader rounds to whole pixels. */
 const SNAP = 64;
 
 /**
@@ -30,7 +30,6 @@ layout(location=5) in vec4 a_color;  // normalised RGBA
 uniform vec2 u_view;
 uniform vec4 u_linear;               // the batch's transform, for sprites
 uniform vec2 u_mt;
-uniform float u_snapok;              // replay: 1 when the transform has no rotation or skew, so ${SNAP} sprites snap
 uniform vec3 u_texinfo[${UNITS}];    // 1 / width, 1 / height (negative for targets), v at the top row, per unit
 out highp vec2 v_uv;
 out highp vec2 v_local;
@@ -57,8 +56,6 @@ void main() {
     if ((flags & ${PLACED}) == 0) {
       vec2 off = -a_1.yz * size;
       e = M * (ab * off.x + cd * off.y + a_0.xy) + u_mt;
-      // The rule draw.sprite applies on the CPU for unrotated pixel art (Math.round == floor(x + 0.5)).
-      if ((flags & ${SNAP}) != 0 && u_snapok > 0.5) e = floor(e + 0.5);
     }
     p = (M * ab) * (size.x * a_corner.x) + (M * cd) * (size.y * a_corner.y) + e;
     vec3 t = u_texinfo[unit];
@@ -107,6 +104,9 @@ void main() {
 /**
  * Copies with per-copy scale, rotation and colour (`draw.sprites` with `each`). The same algebra as
  * `draw.sprite`, run per vertex; absent attributes read constant defaults (scale 1, rotation 0, white).
+ *
+ * Frames may span several images: `a_unit` picks one of `UNITS` textures and UVs are derived from the frame's
+ * pixel rect through `u_texinfo`, exactly as the sprite program does, so copies across atlases stay instanced.
  */
 const EACH_VERT = `#version 300 es
 layout(location=0) in vec2 a_corner;
@@ -114,8 +114,8 @@ layout(location=1) in vec2 a_pos;
 layout(location=2) in float a_scale;
 layout(location=3) in float a_rot;
 layout(location=4) in uint a_color;
-layout(location=5) in vec4 a_uv;    // this copy's frame in texture space
-layout(location=6) in vec2 a_size;  // this copy's frame size in pixels
+layout(location=5) in vec4 a_frame;  // this copy's frame in source pixels: x, y, w, h
+layout(location=6) in float a_unit; // texture unit, low 3 bits used
 uniform vec2 u_view;
 uniform vec4 u_linear;  // current transform, linear part
 uniform vec2 u_mt;      // current transform, translation
@@ -124,53 +124,51 @@ uniform vec2 u_scale;
 uniform float u_rot;
 uniform vec4 u_color;   // shared tint × alpha, straight
 uniform float u_snap;
+uniform vec3 u_texinfo[${UNITS}]; // 1 / width, 1 / height (negative for targets), v at the top row, per unit
 out highp vec2 v_uv;
 out highp vec2 v_local;
 out vec4 v_color;
+flat out int v_unit;
 void main() {
   v_local = a_corner;
+  int unit = int(a_unit + 0.5) & 7;
+  v_unit = unit;
   float r = u_rot + a_rot;
   float cs = cos(r);
   float sn = sin(r);
   vec2 s = u_scale * a_scale;
   vec2 ab = vec2(cs * s.x, sn * s.x);
   vec2 cd = vec2(-sn * s.y, cs * s.y);
-  vec2 offset = -u_origin * a_size;
+  vec2 size = a_frame.zw;
+  vec2 offset = -u_origin * size;
   vec2 l = ab * offset.x + cd * offset.y + a_pos;
   mat2 M = mat2(u_linear.xy, u_linear.zw);
   vec2 e = M * l + u_mt;
   // Like sprite(): unrotated copies land on whole pixels, decided per copy.
   if (u_snap > 0.5 && r == 0.0) e = floor(e + 0.5);
-  vec2 p = (M * ab) * (a_size.x * a_corner.x) + (M * cd) * (a_size.y * a_corner.y) + e;
+  vec2 p = (M * ab) * (size.x * a_corner.x) + (M * cd) * (size.y * a_corner.y) + e;
   vec2 clip = p / u_view * 2.0 - 1.0;
   gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
-  v_uv = mix(a_uv.xy, a_uv.zw, a_corner);
+  vec3 t = u_texinfo[unit];
+  v_uv = vec2((a_frame.x + a_corner.x * size.x) * t.x, t.z + (a_frame.y + a_corner.y * size.y) * t.y);
   vec4 each = vec4(float(a_color >> 24u), float((a_color >> 16u) & 255u), float((a_color >> 8u) & 255u), float(a_color & 255u)) / 255.0;
   vec4 c = u_color * each;
   v_color = vec4(c.rgb * c.a, c.a);
 }`;
 
-const EACH_FRAG = `#version 300 es
-precision mediump float;
-in highp vec2 v_uv;
-in vec4 v_color;
-uniform sampler2D u_tex;
-uniform float u_flash;
-out vec4 outColor;
-void main() {
-  vec4 t = texture(u_tex, v_uv) * v_color;
-  outColor = vec4(mix(t.rgb, vec3(t.a), u_flash), t.a);
-}`;
-
-/** The fragment stage around a custom `effect()` when it runs on per-copy sprites: one texture, flash uniform. */
 const EACH_FRAG_HEADER = `#version 300 es
 precision mediump float;
+// highp: mediump is fp16 on many mobile GPUs, too coarse to address texels in atlases past ~1024 px.
 in highp vec2 v_uv;
 in vec4 v_color;
-uniform sampler2D u_tex;
+flat in int v_unit;
+uniform sampler2D u_tex[${UNITS}];
 uniform float u_flash;
 out vec4 outColor;
-vec4 source(vec2 uv) { return texture(u_tex, uv); }
+vec4 source(vec2 uv) {
+  ${Array.from({ length: UNITS }, (_, i) => `if (v_unit == ${i}) return texture(u_tex[${i}], uv);`).join("\n  ")}
+  return vec4(1.0);
+}
 in highp vec2 v_local;
 vec2 frameUv() { return v_local; }
 `;
@@ -179,6 +177,71 @@ const EACH_FRAG_MAIN = `
 void main() {
   vec4 t = effect(v_color, v_uv);
   outColor = vec4(mix(t.rgb, vec3(t.a), u_flash), t.a);
+}`;
+
+const EACH_FRAG = `${EACH_FRAG_HEADER}vec4 effect(vec4 color, vec2 uv) { return source(uv) * color; }${EACH_FRAG_MAIN}`;
+
+/**
+ * A recorded layer (`draw.replay`) on the GPU. The replay transform comes through `u_linear`/`u_mt`; each
+ * instance also carries the transform it was recorded under. Two instance shapes share the main format:
+ *
+ * - a sprite (`SPRITE`): local x, y, rotation, scale, origin and frame, with the same algebra as `VERT`;
+ * - a baked quad (no flag): the sprite's local transform was folded into the finished unit-square matrix
+ *   `a, c, e / b, d, f` plus UVs, so scale, rotation and skew recorded inside the layer stay instanced.
+ *
+ * Snap decisions are baked per instance: `SNAP` marks exactly the sprites the one-by-one path would round.
+ */
+const LAYER_VERT = `#version 300 es
+layout(location=0) in vec2 a_corner;
+layout(location=1) in vec4 a_0;      // quad: a, c, e, b    sprite: x, y, rotation, scaleX
+layout(location=2) in vec4 a_1;      // quad: d, f, u0, v0  sprite: scaleY, originX, originY, flash
+layout(location=3) in vec4 a_2;      // quad: u1, v1, flash sprite: frame x, y, w, h (pixels)
+layout(location=4) in float a_flags; // texture unit, + ${SPRITE} for a sprite, + ${SNAP} to round after the replay transform
+layout(location=5) in vec4 a_color;  // normalised RGBA
+uniform vec2 u_view;
+uniform vec4 u_linear;               // the replay transform
+uniform vec2 u_mt;
+uniform vec3 u_texinfo[${UNITS}];    // 1 / width, 1 / height (negative for targets), v at the top row, per unit
+out highp vec2 v_uv;
+out highp vec2 v_local;
+out vec4 v_color;
+out float v_flash;
+flat out int v_unit;
+void main() {
+  v_local = a_corner;
+  int flags = int(a_flags + 0.5);
+  int unit = flags & 7;
+  v_unit = unit;
+  vec2 p;
+  if ((flags & ${SPRITE}) == 0) {
+    p = vec2(dot(a_0.xyz, vec3(a_corner, 1.0)), dot(vec3(a_0.w, a_1.xy), vec3(a_corner, 1.0)));
+    if ((flags & ${SNAP}) != 0) p = floor(p + 0.5);
+    mat2 M = mat2(u_linear.xy, u_linear.zw);
+    p = M * p + u_mt;
+    // UVs are stored in source pixels (x, y / x + w, y + h), converted through the unit's texinfo.
+    vec2 px = mix(a_1.zw, a_2.xy, a_corner);
+    vec3 t = u_texinfo[unit];
+    v_uv = vec2(px.x * t.x, t.z + px.y * t.y);
+    v_flash = a_2.z;
+  } else {
+    float cs = cos(a_0.z);
+    float sn = sin(a_0.z);
+    vec2 ab = vec2(cs, sn) * a_0.w;
+    vec2 cd = vec2(-sn, cs) * a_1.x;
+    vec2 size = a_2.zw;
+    mat2 M = mat2(u_linear.xy, u_linear.zw);
+    vec2 e = a_0.xy;
+    vec2 off = -a_1.yz * size;
+    e = M * (ab * off.x + cd * off.y + a_0.xy) + u_mt;
+    if ((flags & ${SNAP}) != 0) e = floor(e + 0.5);
+    p = (M * ab) * (size.x * a_corner.x) + (M * cd) * (size.y * a_corner.y) + e;
+    vec3 t = u_texinfo[unit];
+    v_uv = vec2((a_2.x + a_corner.x * size.x) * t.x, t.z + (a_2.y + a_corner.y * size.y) * t.y);
+    v_flash = a_1.w;
+  }
+  vec2 clip = p / u_view * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_color = vec4(a_color.rgb * a_color.a, a_color.a);
 }`;
 
 /**
@@ -214,12 +277,12 @@ interface ShapePipeline extends ProgramInfo {
 
 /** A per-copy program: the built-in one, or a custom shader's effect compiled against it. */
 interface EachProgram extends ProgramInfo {
-  at: Record<"linear" | "mt" | "origin" | "scale" | "rot" | "color" | "flash" | "snap", WebGLUniformLocation | null>;
+  at: Record<"linear" | "mt" | "origin" | "scale" | "rot" | "color" | "flash" | "snap" | "texinfo", WebGLUniformLocation | null>;
 }
 
 interface EachPipeline extends EachProgram {
   vao: WebGLVertexArrayObject;
-  /** Position, scale, rotation, colour and frame (uv + size) buffers (attribute locations 1–4, 5–6). */
+  /** Position, scale, rotation, colour, frame and unit buffers (attribute locations 1–6). */
   buffers: WebGLBuffer[];
 }
 
@@ -282,6 +345,7 @@ function eachProgram(gl: WebGL2RenderingContext, program: WebGLProgram): EachPro
       color: u("u_color"),
       flash: u("u_flash"),
       snap: u("u_snap"),
+      texinfo: u("u_texinfo[0]"),
     },
   };
 }
@@ -298,7 +362,6 @@ interface ProgramInfo {
 interface BatchProgram extends ProgramInfo {
   linear: WebGLUniformLocation | null;
   mt: WebGLUniformLocation | null;
-  snapok: WebGLUniformLocation | null;
   texinfo: WebGLUniformLocation | null;
 }
 
@@ -368,12 +431,15 @@ export class WebGL2Backend implements Backend {
   private quadBuffer!: WebGLBuffer;
   private copyPipe!: CopyPipeline;
   private each!: EachPipeline;
+  /** The program layer replays draw with: handles sprites and baked per-sprite local transforms. */
+  private layerPipe!: BatchProgram;
   /** Made on the first shape, so apps that draw none never build them. */
   private shapePipe: ShapePipeline | undefined;
   private shapes: ShapeBuffer | undefined;
   private stagingScale = new Float32Array(0);
   private stagingRot = new Float32Array(0);
   private stagingFrame = new Float32Array(0);
+  private stagingUnit = new Float32Array(0);
   private staging = new Float32Array(0);
   private readonly targets = new Map<RenderTarget, { fbo: WebGLFramebuffer; cached: CachedTexture }>();
   /** Where drawing goes: a render target, or null for the canvas. */
@@ -511,6 +577,7 @@ export class WebGL2Backend implements Backend {
     this.mipped = new WeakSet();
     this.copyPipe = this.copyPipeline(quad);
     this.each = this.eachPipeline(quad);
+    this.layerPipe = this.layerPipeline();
     this.shapePipe = undefined;
     gl.useProgram(program);
     gl.bindVertexArray(this.vao);
@@ -642,18 +709,17 @@ export class WebGL2Backend implements Backend {
     let built = this.layers.get(layer);
     if (!built) {
       const fresh = this.buildLayer(layer);
-      if (!fresh) return false;
       built = fresh;
       this.layers.set(layer, built);
     }
     // Whatever was queued before draws first, so the layer keeps its place in the draw order.
     this.flush();
     const gl = this.gl;
-    const p = this.active;
+    const p = this.layerPipe;
+    gl.useProgram(p.program);
     this.syncView(p);
     gl.uniform4f(p.linear, m[0], m[1], m[2], m[3]);
     gl.uniform2f(p.mt, m[4], m[5]);
-    gl.uniform1f(p.snapok, m[1] === 0 && m[2] === 0 ? 1 : 0);
     const info = this.texInfo;
     const resolved: CachedTexture[] = [];
     for (const seg of built.segments) {
@@ -675,23 +741,24 @@ export class WebGL2Backend implements Backend {
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, seg.count);
       this.submitted++;
     }
+    gl.useProgram(this.active.program);
     gl.bindVertexArray(this.vao);
-    // The units now hold the layer's textures: the next sprite resolves its own again.
-    this.lastSrc = null;
-    this.last = undefined;
-    gl.uniform1f(p.snapok, 0);
+    // The units now hold the layer's textures: the next sprite or batch resolves its own again.
+    this.resetUnitCache();
     return true;
   }
 
   /**
-   * Instances for every sprite in the layer, in the format `write()` uses but with positions kept local and
-   * `SNAP` set where `write()` would round, so the shader rounds after the replay transform. Undefined when a
-   * sprite was recorded under a scale, rotation or skew (`Draw` then replays the calls one by one).
+   * Instances for every sprite in the layer, in the shared instance format. A sprite recorded under an
+   * identity transform keeps the sprite instance shape (`SPRITE`), with positions kept local and `SNAP` set
+   * where `write()` would round. A sprite recorded under any linear part has that part folded into a finished
+   * unit-square quad instance (baked), so scale, rotation and skew inside the recording stay on the GPU:
+   * `replay()` never falls back to drawing sprites one by one.
    */
-  private buildLayer(layer: Layer): BuiltLayer | undefined {
+  private buildLayer(layer: Layer): BuiltLayer {
     const items = layer.items;
-    for (const it of items) if (it.m[0] !== 1 || it.m[1] !== 0 || it.m[2] !== 0 || it.m[3] !== 1) return undefined;
     const gl = this.gl;
+    const q: Matrix = [1, 0, 0, 1, 0, 0];
     const built: BuiltLayer = { segments: [] };
     let start = 0;
     while (start < items.length) {
@@ -721,19 +788,58 @@ export class WebGL2Backend implements Backend {
         const fr = it.frame;
         const r = o.rotation ?? 0;
         const f = i * (STRIDE / 4);
-        f32[f] = it.x + it.m[4];
-        f32[f + 1] = it.y + it.m[5];
-        f32[f + 2] = r;
-        f32[f + 3] = (o.scaleX ?? 1) * (o.flipX ? -1 : 1);
-        f32[f + 4] = (o.scaleY ?? 1) * (o.flipY ? -1 : 1);
-        f32[f + 5] = o.origin ? o.origin[0] : 0.5;
-        f32[f + 6] = o.origin ? o.origin[1] : 0.5;
-        f32[f + 7] = o.flash ?? 0;
-        f32[f + 8] = fr.x;
-        f32[f + 9] = fr.y;
-        f32[f + 10] = fr.w;
-        f32[f + 11] = fr.h;
-        f32[f + 12] = (units[i] as number) + SPRITE + (!o.smooth && r === 0 ? SNAP : 0);
+        const unit = (units[i] as number) + SPRITE;
+        const lm = it.m;
+        const linearOnly = lm[0] === 1 && lm[1] === 0 && lm[2] === 0 && lm[3] === 1;
+        if (linearOnly) {
+          // Same shape the sprite batch writes, but local to the layer: replay's transform applies on the GPU.
+          f32[f] = it.x + lm[4];
+          f32[f + 1] = it.y + lm[5];
+          f32[f + 2] = r;
+          f32[f + 3] = (o.scaleX ?? 1) * (o.flipX ? -1 : 1);
+          f32[f + 4] = (o.scaleY ?? 1) * (o.flipY ? -1 : 1);
+          f32[f + 5] = o.origin ? o.origin[0] : 0.5;
+          f32[f + 6] = o.origin ? o.origin[1] : 0.5;
+          f32[f + 7] = o.flash ?? 0;
+          f32[f + 8] = fr.x;
+          f32[f + 9] = fr.y;
+          f32[f + 10] = fr.w;
+          f32[f + 11] = fr.h;
+          f32[f + 12] = unit + (!o.smooth && r === 0 ? SNAP : 0);
+        } else {
+          // Fold the recorded transform into the finished quad matrix, exactly as the one-by-one path would.
+          placeAt(
+            lm,
+            fr.w,
+            fr.h,
+            it.x,
+            it.y,
+            o.origin ? o.origin[0] : 0.5,
+            o.origin ? o.origin[1] : 0.5,
+            (o.scaleX ?? 1) * (o.flipX ? -1 : 1),
+            (o.scaleY ?? 1) * (o.flipY ? -1 : 1),
+            r,
+            q,
+          );
+          const snap = !o.smooth && r === 0 && q[1] === 0 && q[2] === 0;
+          if (snap) {
+            q[4] = Math.round(q[4]);
+            q[5] = Math.round(q[5]);
+          }
+          f32[f] = q[0];
+          f32[f + 1] = q[2];
+          f32[f + 2] = q[4];
+          f32[f + 3] = q[1];
+          f32[f + 4] = q[3];
+          f32[f + 5] = q[5];
+          // UVs stay in source pixels: the layer shader converts them with the unit's texinfo at draw time.
+          f32[f + 6] = fr.x;
+          f32[f + 7] = fr.y;
+          f32[f + 8] = fr.x + fr.w;
+          f32[f + 9] = fr.y + fr.h;
+          f32[f + 10] = o.flash ?? 0;
+          f32[f + 12] = (units[i] as number) + (snap ? SNAP : 0);
+        }
         u32[f + 13] = it.color === 0xffffffff ? it.color : bytes(it.color);
       }
       const buffer = gl.createBuffer();
@@ -943,28 +1049,22 @@ export class WebGL2Backend implements Backend {
     this.submitted++;
     gl.useProgram(this.active.program);
     gl.bindVertexArray(this.vao);
+    // Unit 0 was just (re)bound for the copy program: the next batch resolves its own units again.
+    this.resetUnitCache();
   }
 
   copies(c: CopySpec): void {
     if (this.lost || c.count <= 0) return;
     if (c.mixed) {
-      // Frames across images need the sprite program's texture units: one quad per copy.
-      const q: Matrix = [1, 0, 0, 1, 0, 0];
-      for (let i = 0; i < c.count; i++) {
-        const f = frameAt(c, i);
-        if (f.image === this.target) throw new Error("spryte: can't draw a render target into itself");
-        const color = copyAt(c, i, q, f);
-        this.quad(q, f.image, f.x, f.y, f.w, f.h, color, c.flash, c.smooth);
-      }
+      this.copiesMixed(c);
       return;
     }
     const src = c.frame.image;
     if (src === this.target) throw new Error("spryte: can't draw a render target into itself");
+    // Draw order: everything queued so far goes first.
     this.flush();
     const gl = this.gl;
     const tex = src === this.lastSrc && this.last ? this.last : this.texture(src);
-    this.lastSrc = src;
-    this.last = tex;
     const p = this.each;
     const shader = this.shader;
     const prog: EachProgram = shader ? this.eachCustom(shader) : p;
@@ -973,6 +1073,91 @@ export class WebGL2Backend implements Backend {
     gl.bindVertexArray(p.vao);
     this.syncView(prog);
     if (shader) this.syncUniforms(shader, prog as EachCustom);
+    this.setEachUniforms(c, prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex.tex);
+    gl.bindSampler(0, this.samplerFor(tex.tex, c.smooth));
+    // The vertex shader derives every copy's UV from its frame rect through unit 0's texinfo.
+    const info = this.texInfo;
+    info[0] = tex.iw;
+    info[1] = tex.ih;
+    info[2] = tex.v0;
+    gl.uniform3fv(at.texinfo, info);
+    this.uploadEachAttributes(c, 0, c.count, [tex], [0]);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, c.count);
+    this.submitted++;
+    gl.useProgram(this.active.program);
+    gl.bindVertexArray(this.vao);
+    // The units were just (re)bound for this program: the next batch must resolve its own again.
+    this.resetUnitCache();
+  }
+
+  /**
+   * Per-copy sprites whose frames span more than one image. The copies stay instanced: they are split into
+   * segments of at most `UNITS` distinct images, each drawn with one instanced call and its own unit bindings.
+   * Segments break only between copies, so draw order is unchanged.
+   */
+  private copiesMixed(c: CopySpec): void {
+    this.flush();
+    const gl = this.gl;
+    const p = this.each;
+    const shader = this.shader;
+    const prog: EachProgram = shader ? this.eachCustom(shader) : p;
+    gl.useProgram(prog.program);
+    gl.bindVertexArray(p.vao);
+    this.syncView(prog);
+    if (shader) this.syncUniforms(shader, prog as EachCustom);
+    this.setEachUniforms(c, prog);
+    const n = c.count;
+    // In-order segmentation: copies keep their draw order, and a segment closes only when the next copy's
+    // image isn't bound to one of its units and all UNITS units are taken. An atlas seen again keeps its unit.
+    const unitOf = new Array<number>(n).fill(0);
+    const segments: { first: number; last: number; srcs: TextureSource[] }[] = [];
+    let srcs: TextureSource[] = [];
+    let first = 0;
+    for (let i = 0; i < n; i++) {
+      const src = frameAt(c, i).image;
+      if (src === this.target) throw new Error("spryte: can't draw a render target into itself");
+      let local = srcs.indexOf(src);
+      if (local < 0) {
+        if (srcs.length === UNITS) {
+          segments.push({ first, last: i, srcs });
+          srcs = [];
+          first = i;
+        }
+        local = srcs.push(src) - 1;
+      }
+      unitOf[i] = local;
+    }
+    segments.push({ first, last: n, srcs });
+    for (const seg of segments) {
+      // Resolve every texture before binding any: an upload binds its texture to unit 0, clobbering the last.
+      const texs = seg.srcs.map((src) => (src === this.lastSrc && this.last ? this.last : this.texture(src)));
+      for (let i = 0; i < texs.length; i++) {
+        const t = texs[i] as CachedTexture;
+        gl.activeTexture(gl.TEXTURE0 + i);
+        gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        gl.bindSampler(i, this.samplerFor(t.tex, c.smooth));
+        const info = this.texInfo;
+        info[i * 3] = t.iw;
+        info[i * 3 + 1] = t.ih;
+        info[i * 3 + 2] = t.v0;
+      }
+      gl.uniform3fv(prog.at.texinfo, this.texInfo);
+      this.uploadEachAttributes(c, seg.first, seg.last, texs, unitOf);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, seg.last - seg.first);
+      this.submitted++;
+    }
+    gl.useProgram(this.active.program);
+    gl.bindVertexArray(this.vao);
+    // The units now hold this call's textures: the next sprite or batch resolves its own again.
+    this.resetUnitCache();
+  }
+
+  /** The per-copy uniforms shared by every segment of one `copies()` call. */
+  private setEachUniforms(c: CopySpec, prog: EachProgram): void {
+    const gl = this.gl;
+    const at = prog.at;
     const m = c.m;
     gl.uniform4f(at.linear, m[0], m[1], m[2], m[3]);
     gl.uniform2f(at.mt, m[4], m[5]);
@@ -983,19 +1168,42 @@ export class WebGL2Backend implements Backend {
     gl.uniform4f(at.color, (col >>> 24) / 255, ((col >>> 16) & 0xff) / 255, ((col >>> 8) & 0xff) / 255, (col & 0xff) / 255);
     gl.uniform1f(at.flash, c.flash);
     gl.uniform1f(at.snap, c.snap ? 1 : 0);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, tex.tex);
-    gl.bindSampler(0, this.samplerFor(tex.tex, c.smooth));
-    const n = c.count;
+  }
+
+  /**
+   * Upload positions, per-copy scale/rotation/colour, and the frame/unit attributes for copies
+   * `[first, last)` of a `copies()` call. `units[i]` is the texture unit for global copy index i.
+   * Pointers are set on every call: a field can be its own array, an offset into interleaved records, or absent.
+   */
+  private uploadEachAttributes(c: CopySpec, first: number, last: number, texs: CachedTexture[], units: number[]): void {
+    const gl = this.gl;
+    const p = this.each;
+    const n = last - first;
     const e = c.each;
-    // Pointers are set on every call: a field can be its own array, an offset into interleaved records, or absent.
     const bytes = c.stride * 4;
     if (e.stride) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, c.positions as Float32Array, gl.STREAM_DRAW, 0, n * c.stride);
-      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, bytes, c.offset * 4);
+      // Interleaved records go up once; each segment reads its own slice through the instance offset.
+      if (first === 0) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, c.positions as Float32Array, gl.STREAM_DRAW, 0, c.count * c.stride);
+      }
+      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, bytes, (first * c.stride + c.offset) * 4);
       gl.enableVertexAttribArray(1);
-    } else this.attribute(1, 2, p.buffers[0] as WebGLBuffer, c.positions, n * 2, "staging");
+    } else {
+      // Separate arrays: upload just this segment's positions.
+      if (this.staging.length < n * 2) this.staging = new Float32Array(n * 2);
+      const out = this.staging;
+      for (let k = 0; k < n; k++) {
+        const i = first + k;
+        const p2 = i * 2;
+        out[k * 2] = c.positions[p2] as number;
+        out[k * 2 + 1] = c.positions[p2 + 1] as number;
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, out, gl.STREAM_DRAW, 0, n * 2);
+      gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(1);
+    }
     for (const [loc, field, rest, staging] of [
       [2, e.scale, 1, "stagingScale"],
       [3, e.rotation, 0, "stagingRot"],
@@ -1005,78 +1213,66 @@ export class WebGL2Backend implements Backend {
         gl.vertexAttrib1f(loc, rest);
       } else if (typeof field === "number") {
         gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
-        gl.vertexAttribPointer(loc, 1, gl.FLOAT, false, bytes, field * 4);
+        gl.vertexAttribPointer(loc, 1, gl.FLOAT, false, bytes, (first * c.stride + field) * 4);
         gl.enableVertexAttribArray(loc);
-      } else this.attribute(loc, 1, p.buffers[loc - 1] as WebGLBuffer, field, n, staging);
+      } else {
+        if (this[staging].length < n) this[staging] = new Float32Array(n);
+        const out = this[staging];
+        for (let k = 0; k < n; k++) out[k] = field[first + k] as number;
+        gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[loc - 1] as WebGLBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, out, gl.STREAM_DRAW, 0, n);
+        gl.vertexAttribPointer(loc, 1, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(loc);
+      }
     }
     const color = e.color;
     if (color === undefined) {
       gl.disableVertexAttribArray(4);
       gl.vertexAttribI4ui(4, 0xffffffff, 0, 0, 0);
+    } else if (typeof color === "number") {
+      // The record's bits at that offset are read as the packed colour, straight from the same upload.
+      gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
+      gl.vertexAttribIPointer(4, 1, gl.UNSIGNED_INT, bytes, (first * c.stride + color) * 4);
+      gl.enableVertexAttribArray(4);
     } else {
-      if (typeof color === "number") {
-        // The record's bits at that offset are read as the packed colour, straight from the same upload.
-        gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[0] as WebGLBuffer);
-        gl.vertexAttribIPointer(4, 1, gl.UNSIGNED_INT, bytes, color * 4);
-      } else {
-        gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[3] as WebGLBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, color, gl.STREAM_DRAW, 0, n);
-        gl.vertexAttribIPointer(4, 1, gl.UNSIGNED_INT, 0, 0);
-      }
+      // Separate colour array: upload only this segment's entries (the subarray starts at source offset 0).
+      gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[3] as WebGLBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, color.subarray(first, last), gl.STREAM_DRAW, 0, n);
+      gl.vertexAttribIPointer(4, 1, gl.UNSIGNED_INT, 0, 0);
       gl.enableVertexAttribArray(4);
     }
-    if (c.frames) {
-      if (this.stagingFrame.length < n * 6) this.stagingFrame = new Float32Array(n * 6);
-      const out = this.stagingFrame;
-      for (let i = 0; i < n; i++) {
-        const f = frameAt(c, i);
-        const o = i * 6;
-        out[o] = f.x * tex.iw;
-        out[o + 1] = tex.v0 + f.y * tex.ih;
-        out[o + 2] = (f.x + f.w) * tex.iw;
-        out[o + 3] = tex.v0 + (f.y + f.h) * tex.ih;
-        out[o + 4] = f.w;
-        out[o + 5] = f.h;
-      }
-      gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[4] as WebGLBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, out, gl.STREAM_DRAW, 0, n * 6);
-      gl.enableVertexAttribArray(5);
-      gl.enableVertexAttribArray(6);
-    } else {
-      const f = c.frame;
-      gl.disableVertexAttribArray(5);
-      gl.disableVertexAttribArray(6);
-      gl.vertexAttrib4f(5, f.x * tex.iw, tex.v0 + f.y * tex.ih, (f.x + f.w) * tex.iw, tex.v0 + (f.y + f.h) * tex.ih);
-      gl.vertexAttrib2f(6, f.w, f.h);
+    // Frame rect in source pixels (4 floats) and the texture unit (1 float). UVs are derived in the shader.
+    if (this.stagingFrame.length < n * 4) this.stagingFrame = new Float32Array(n * 4);
+    const frames = this.stagingFrame;
+    if (this.stagingUnit.length < n) this.stagingUnit = new Float32Array(n);
+    const unitVals = this.stagingUnit;
+    for (let k = 0; k < n; k++) {
+      const i = first + k;
+      const f = frameAt(c, i);
+      const o = k * 4;
+      frames[o] = f.x;
+      frames[o + 1] = f.y;
+      frames[o + 2] = f.w;
+      frames[o + 3] = f.h;
+      unitVals[k] = units[i] as number;
     }
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
-    this.submitted++;
-    gl.useProgram(this.active.program);
-    gl.bindVertexArray(this.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[4] as WebGLBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, frames, gl.STREAM_DRAW, 0, n * 4);
+    gl.vertexAttribPointer(5, 4, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(5);
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buffers[5] as WebGLBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, unitVals, gl.STREAM_DRAW, 0, n);
+    gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(6);
   }
 
-  /** Upload one float attribute: a Float32Array as is, anything else through a reused staging array. */
-  private attribute(
-    loc: number,
-    size: number,
-    buffer: WebGLBuffer,
-    data: ArrayLike<number>,
-    length: number,
-    staging: "staging" | "stagingScale" | "stagingRot",
-  ): void {
-    const gl = this.gl;
-    let out: Float32Array;
-    if (data instanceof Float32Array) out = data;
-    else {
-      if (this[staging].length < length) this[staging] = new Float32Array(length);
-      out = this[staging];
-      for (let i = 0; i < length; i++) out[i] = data[i] as number;
-    }
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, out, gl.STREAM_DRAW, 0, length);
-    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
-    gl.enableVertexAttribArray(loc);
+  /** Forget the last-bound source/unit caches after code outside the normal batch rebound texture units. */
+  private resetUnitCache(): void {
+    this.lastSrc = null;
+    this.last = undefined;
+    this.lastUnit = 0;
   }
+
 
   setBlend(mode: BlendMode | "mask"): void {
     if (mode === this.blend || this.lost) return;
@@ -1165,6 +1361,7 @@ export class WebGL2Backend implements Backend {
       gl.deleteProgram(this.each.program);
       gl.deleteVertexArray(this.each.vao);
       for (const b of this.each.buffers) gl.deleteBuffer(b);
+      gl.deleteProgram(this.layerPipe.program);
       if (this.shapePipe) {
         gl.deleteProgram(this.shapePipe.program);
         gl.deleteVertexArray(this.shapePipe.vao);
@@ -1279,7 +1476,7 @@ export class WebGL2Backend implements Backend {
     const gl = this.gl;
     const program = link(gl, EACH_VERT, EACH_FRAG);
     gl.useProgram(program);
-    gl.uniform1i(gl.getUniformLocation(program, "u_tex"), 0);
+    gl.uniform1iv(gl.getUniformLocation(program, "u_tex"), Array.from({ length: UNITS }, (_, i) => i));
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, quad);
@@ -1292,6 +1489,7 @@ export class WebGL2Backend implements Backend {
       [3, 1],
       [4, 1],
       [5, 4],
+      [6, 1],
     ] as const) {
       const b = gl.createBuffer();
       if (!b) throw new Error("WebGL2: could not create buffer");
@@ -1301,11 +1499,19 @@ export class WebGL2Backend implements Backend {
       else gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
       gl.vertexAttribDivisor(loc, 1);
     }
-    // The frame buffer interleaves uv (location 5) and size (location 6): 6 floats per copy.
-    gl.vertexAttribPointer(5, 4, gl.FLOAT, false, 24, 0);
-    gl.vertexAttribPointer(6, 2, gl.FLOAT, false, 24, 16);
-    gl.vertexAttribDivisor(6, 1);
     return { ...eachProgram(gl, program), vao, buffers };
+  }
+
+  /** The program `replay()` draws layers with: the sprite fragment stage and the layer vertex stage. */
+  private layerPipeline(): BatchProgram {
+    const gl = this.gl;
+    const program = link(gl, LAYER_VERT, FRAG, "layer");
+    gl.useProgram(program);
+    gl.uniform1iv(
+      gl.getUniformLocation(program, "u_tex"),
+      Array.from({ length: UNITS }, (_, i) => i),
+    );
+    return batchProgram(gl, program);
   }
 
   /** A custom shader's effect compiled against the per-copy vertex stage, on first use. */
@@ -1316,7 +1522,7 @@ export class WebGL2Backend implements Backend {
     // #line makes compile errors point at lines in the user's source.
     const program = link(gl, EACH_VERT, `${EACH_FRAG_HEADER}#line 1\n${shader.source}\n${EACH_FRAG_MAIN}`, "custom shader");
     gl.useProgram(program);
-    gl.uniform1i(gl.getUniformLocation(program, "u_tex"), 0);
+    gl.uniform1iv(gl.getUniformLocation(program, "u_tex"), Array.from({ length: UNITS }, (_, i) => i));
     p = { ...eachProgram(gl, program), locations: new Map() };
     this.eachCustoms.set(shader, p);
     return p;
@@ -1422,6 +1628,8 @@ export class WebGL2Backend implements Backend {
     }
     this.unitCount = 0;
     this.armed = false;
+    // The units were just (re)bound for the shape program: the next batch resolves its own units again.
+    this.resetUnitCache();
     gl.useProgram(p.program);
     gl.bindVertexArray(p.vao);
     this.syncView(p);
@@ -1641,7 +1849,6 @@ function batchProgram(gl: WebGL2RenderingContext, program: WebGLProgram): BatchP
     h: -1,
     linear: at("u_linear"),
     mt: at("u_mt"),
-    snapok: at("u_snapok"),
     texinfo: at("u_texinfo[0]"),
   };
 }
