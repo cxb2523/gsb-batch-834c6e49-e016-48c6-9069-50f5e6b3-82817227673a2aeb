@@ -4,7 +4,12 @@
 // reused, so a long run never creates new 3D objects (individual meshes that were never freed once crashed phones,
 // see enemies.js TEMPLATES). Fire goes from bright orange to dark red as it shrinks (normal blending: additive fire
 // turned white against the bright sky); debris and smoke shrink away.
-// High graphics quality (quality.js) adds smoke to explosions, more debris and longer trails.
+//
+// Graphics quality (quality.js) is read live, at spawn time, from the one shared Quality state — sky.js reads the
+// same state. High adds smoke to explosions, more debris and denser missile trails. A drop in the middle of a
+// flight therefore stops new smoke/extra debris/trails immediately, while particles already in the air simply live
+// out their (short) lives; choosing High again gives the next explosion the full look. Nothing here is rebuilt on a
+// quality change: the three InstancedMeshes and their capacities are created once (see stats()).
 //
 // Kept modest on purpose: no white flash, small short fireballs, and a steady muzzle glow instead of a flicker at the
 // fire rate (11 a second). Bright flashes, and anything flashing more than 3 times a second, can trigger
@@ -88,9 +93,10 @@ export class Effects {
   }
 
   update(dt, weapons = null) {
-    // smoke trails behind missiles (yours, and other players' in versus): they also show where a missile is coming from
+    // smoke trails behind missiles (yours, and other players' in versus): they also show where a missile is coming from.
+    // Read the level once per frame: a quality change takes effect on the next trail puff, not at the next rebuild.
     if (weapons) {
-      const every = Quality.high ? 0.03 : 0.06, life = Quality.high ? 0.9 : 0.55;
+      const hi = Quality.high, every = hi ? 0.03 : 0.06, life = hi ? 0.9 : 0.55;
       for (const list of [weapons.missiles, weapons.pvpMissiles]) {
         for (const m of list) {
           const t = (this.trailT.get(m) || 0) + dt;
@@ -138,7 +144,18 @@ export class Effects {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   }
 
+  // A new run, back to the hangar, or into an AI Ladder level: no particle (or a missile trail clock) may survive
+  // into the next run — leftover smoke would otherwise look like the new run's missiles are already smoking.
   clear() {
     for (const pool of [this.fire, this.debris, this.smoke]) { pool.list.length = 0; pool.mesh.count = 0; }
+    this.trailT = new WeakMap();       // every trail timer starts at zero for the next run's missiles
+  }
+
+  // Debug/test view of the pools (__sb.effects.stats()): each InstancedMesh is built once with `cap` slots; `live`
+  // is what the particle lists hold and `drawn` is what the mesh renders after the last step. Invariants:
+  // cap === instances (the buffer was allocated once) and drawn === live <= cap.
+  stats() {
+    const one = p => ({ cap: p.cap, live: p.list.length, drawn: p.mesh.count, instances: p.mesh.instanceMatrix.count });
+    return { level: Quality.level, fire: one(this.fire), debris: one(this.debris), smoke: one(this.smoke) };
   }
 }

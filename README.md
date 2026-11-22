@@ -149,9 +149,14 @@ Watch for the **PULL UP** warning.
 - **Sound** is made in the browser (nothing to download): engine, cannon, missiles, explosions, hits, power-ups,
   and a beep when a missile is homing on you in Versus. It starts with your first click or key press (browsers
   require that). **Sound: ON/OFF** in the hangar's top bar and on the pause screen.
-- **Graphics: Auto / High / Low** in the hangar. High adds a gradient sky, clouds, the sun, smoke from explosions
-  and longer missile trails. Auto uses High, measures the frame rate a few seconds into a flight, and switches this
-  device to Low if it runs under 45 fps or stutters. The pause screen shows the frame rate and what Auto picked.
+- **Graphics: Auto / High / Low** in the hangar. High adds a gradient sky, clouds, the sun, smoke from explosions,
+  more debris and denser missile trails. Auto uses High, measures the frame rate a few seconds into a flight, and
+  switches this device to Low if it runs under 45 fps or stutters. Only real flight frames are measured: the pause
+  menu and countdown, the results screen and a backgrounded tab are skipped, so a pause never counts as a slow
+  frame. The choice is one shared state for the sky and the effects: a mid-flight drop stops new smoke and the extra
+  debris at once, particles already in the air finish their short lives instead of vanishing, and choosing High
+  again gives the next explosion the full look. The pause screen shows the frame rate and the level actually in
+  force (e.g. `Auto (Low)`), not the saved setting.
 - Explosions, muzzle flashes and warnings are kept modest on purpose: no bright flashes, and nothing blinks more
   than twice a second (fast flashing can trigger photosensitive epilepsy).
 
@@ -324,9 +329,29 @@ js/leaderboard.js online leaderboard client
 js/weather.js     weather: particles, fog, wind, lightning
 js/maps.js        today's map, random maps
 js/config.js      every tunable number in one place
+tools/            headless checks (see below)
 ```
 
 No dependencies besides [three.js](https://threejs.org), loaded from a CDN. No build step.
+
+### Checking the graphics-quality state
+
+The graphics level is one shared state (`js/quality.js`) for the sky and the effects. Two checks, both run with
+Node (no packages to install):
+
+```bash
+# 1. Logic only: frame sampling (pause/results/background frames excluded), effect spawn rules, pools, clear()
+node tools/check-quality.cjs
+
+# 2. In a real browser: start the game, then drive it over the DevTools protocol
+python3 server.py 8765
+node tools/check-quality-browser.cjs http://127.0.0.1:8765/index.html
+```
+
+Check it by hand: start the server, run `window.__sbDebug = true` in the console and reload, then fly and use
+`__sb.effects.stats()` (capacity vs instances vs live particles, per pool) and `__sb.Quality` (`level`, `setting()`,
+`readout()`). Crash the plane a few times or call `__sb.testBoom(2)` to make explosions; the pool numbers should stay
+at `cap === instances`, and after a restart / hangar return / new AI Ladder level every `live` should be 0.
 
 ## Credits
 

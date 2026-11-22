@@ -402,8 +402,10 @@ function restart() {
   weapons.clear();
   drops.clear();
   fx.clear();
+  effects.clear();                // no particle or missile-trail clock from the last run in this one (effects.js)
   waves.reset();
   restoreTrees();                 // stand up the trees knocked over last run
+  Quality.resetSampling();        // this run is measured on its own frames only (a stale reading is dropped)
   takeOff();
   snapCamera = true;
   hud.message(`${planeName.toUpperCase()} · TAKE OFF`, 1.8);
@@ -653,6 +655,7 @@ function showPauseMenu() {
     : real ? `Wave ${waves.wave} · score ${score}` + (flightMap.daily && !unranked ? " · today's map (ranked)" : '')
     : testFlight ? 'Test flight' : 'Training';
   $('pausePerf').textContent = Quality.readout();
+  $('pausePerf').title = 'Measured while flying (pauses, results screens and background time are not counted)';
   $('pauseSound').textContent = `Sound: ${Sound.on() ? 'ON' : 'OFF'}`;
   $('pauseNote').textContent = ladder.active ? 'Restart starts this level over. End run goes back to the hangar (your ladder progress is kept).'
     : real ? 'Restart and End run need two clicks. Both count like being shot down: this run\'s score is saved.' : '';
@@ -690,9 +693,13 @@ function pauseEnd() {
   plane.deathCause = 'ENDED';
   endGame();
 }
-// the tab went into the background (or the phone was locked): come back to the pause menu, not mid-dogfight
+// the tab went into the background (or the phone was locked): come back to the pause menu, not mid-dogfight.
+// The quality check skips the whole time away as well (the loop does not run while hidden).
 if (typeof document.addEventListener === 'function') {
-  document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
+  document.addEventListener('visibilitychange', () => {
+    Quality.interrupt();
+    if (document.hidden) pauseGame();
+  });
 }
 
 /* ================= AI Ladder =================
@@ -815,6 +822,7 @@ function newLadderRound() {
   if (keep !== null) plane.missiles = keep;
   ladderShots += weapons.shotsFired; ladderHits += weapons.shotsHit;
   weapons.clear();
+  effects.clear();                // a new round starts clean: no smoke, debris or trail timers carried over
   weapons.missileMul = CFG.ladder.missileMul;
   snapCamera = true;
   spawnDuelist();
@@ -1187,7 +1195,9 @@ function watchDowns() {
 
 function loop(now) {
   View.check();                          // the page size changed without a resize event (iOS): fit the game again
-  if (mode === 'flight' && !paused && document.visibilityState !== 'hidden') Quality.sample(now - last);   // (quality.js)
+  // Auto's frame-rate check only ever sees real flight frames: never the pause menu/countdown, the results screen, or
+  // a background tab (a hidden tab stops requestAnimationFrame altogether, so visibilitychange marks the gap instead)
+  Quality.sample(now - last, mode === 'flight' && !paused && !gameOver && document.visibilityState !== 'hidden');
   const dt = Math.min((now - last) / 1000, 0.05);   // clamp, so switching tabs doesn't cause one huge frame step
   last = now;
   if (mode === 'hangar') {
@@ -1202,6 +1212,10 @@ function loop(now) {
         paused.count -= dt;
         document.getElementById('pauseCount').textContent = Math.max(1, Math.ceil(paused.count / (RESUME_COUNT / 3)));
         if (paused.count <= 0) hidePause();
+      } else {
+        // the menu open: Auto may arrive while it is open (the last sampled window), so keep the line live
+        const perf = document.getElementById('pausePerf');
+        if (perf.textContent !== Quality.readout()) perf.textContent = Quality.readout();
       }
     } else update(dt);
     const guest = coop.active && coop.isGuest, vs = coop.active && coop.versus;
@@ -1277,6 +1291,8 @@ if (DEBUG) window.__sb = {
   coop, net, lobby, ladder, startLadder, ladderHit, openLadder,
   get glInfo() { return renderer.info; },      // GPU memory: geometries and textures alive (leak checks)
   debugIncoming, camera, Quality, Sound, effects, getTrees,
+  // tests/debugging: drop a real explosion where the plane is, without waiting for an enemy to die
+  testBoom(size = 2) { boomAt(plane.pos.clone().add(new THREE.Vector3(0, 0, -60)), size, plane.forward().multiplyScalar(plane.speed)); },
   get duelist() { return duelist; },
   forceDeath() { plane.hp = 0; plane.alive = false; endGame(); },
   hit: (d, cause) => onPlayerHit(d, cause),
