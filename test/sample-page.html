@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Senku Autoplay — локальный стенд (офлайн)</title>
+<style>
+    body { background: #141414; color: #eee; font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; }
+    h1 { font-size: 18px; }
+    .hint { color: #999; max-width: 720px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+    button { background: #ff3b47; color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; font: inherit; cursor: pointer; }
+    button.secondary { background: #333; }
+    #player-slot { width: 640px; max-width: 100%; aspect-ratio: 16/9; background: #000; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+    #player-slot iframe { width: 100%; height: 100%; border: 0; }
+    #log { background: #0b0b0b; border: 1px solid #2a2a2a; border-radius: 8px; padding: 10px; height: 220px; overflow-y: auto; font: 12px/1.6 monospace; white-space: pre-wrap; }
+    #log .hb { color: #7fd67f; }
+    #log .warn { color: #ffb347; }
+    #session { color: #8ab4ff; font: 12px monospace; margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1>Локальный стенд Senku Ultimate Autoplay</h1>
+<p class="hint">
+    Страница имитирует <code>/watch/&lt;id&gt;?episode=N</code>: плеер — iframe с canvas-потоком
+    (работает без сети и без видеофайлов). Запуск: <code>node test/serve.js</code>,
+    затем открыть <code>http://localhost:8931/test/sample-page.html</code>.
+    Heartbeat перехватывается и пишется в лог вместо реального API.
+</p>
+
+<div class="controls">
+    <button id="btn-replace" class="secondary">🔄 Заменить iframe плеера</button>
+    <button id="btn-next" class="secondary">⏭ Следующая серия (новый плеер)</button>
+    <button id="btn-pause" class="secondary">⏸ Ручная пауза (кнопка панели)</button>
+    <button id="btn-fullscreen" class="secondary">⛶ Полный экран вкл/выкл</button>
+    <button id="btn-leave" class="secondary">🚪 Уйти со /watch</button>
+</div>
+
+<div id="session">session: —</div>
+<div id="player-slot"></div>
+<h2 style="font-size:14px;margin-top:16px;">Лог</h2>
+<div id="log"></div>
+
+<script>
+'use strict';
+
+// --- имитация адреса страницы просмотра ---
+let episode = 1;
+const ANIME_ID = 123;
+function setWatchUrl() {
+    history.replaceState(null, '', `/watch/${ANIME_ID}?episode=${episode}&season=1`);
+}
+setWatchUrl();
+
+// --- лог ---
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+    const line = document.createElement('div');
+    if (cls) line.className = cls;
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+// --- перехват heartbeat и сетевых запросов плагина (офлайн) ---
+const origFetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+    const u = String(url);
+    if (u.includes('/api/v2/watch/heartbeat')) {
+        log(`heartbeat → ${opts.body}`, 'hb');
+        return Promise.resolve(new Response('{}', { status: 200 }));
+    }
+    if (u.includes('favicon.ico')) return Promise.resolve(new Response('', { status: 200 }));
+    return origFetch(url, opts).catch(() => new Response('', { status: 404 }));
+};
+
+// --- фейковый плеер: iframe с canvas-потоком ---
+const slot = document.getElementById('player-slot');
+let playerSeq = 0;
+function buildPlayer() {
+    playerSeq++;
+    slot.innerHTML = '';
+    const iframe = document.createElement('iframe');
+    iframe.srcdoc = `
+        <!DOCTYPE html><html><body style="margin:0;background:#000">
+        <canvas id="c" width="640" height="360"></canvas>
+        <video id="v" controls style="width:100%;height:100%"></video>
+        <script>
+            const c = document.getElementById('c');
+            const x = c.getContext('2d');
+            setInterval(() => {
+                x.fillStyle = 'hsl(' + (Date.now() / 25 % 360) + ',60%,45%)';
+                x.fillRect(0, 0, 640, 360);
+                x.fillStyle = '#fff';
+                x.font = '28px sans-serif';
+                x.fillText('плеер #${playerSeq}  ' + new Date().toLocaleTimeString(), 20, 50);
+            }, 200);
+            const v = document.getElementById('v');
+            if (c.captureStream) v.srcObject = c.captureStream(10);
+        <\/script>
+        </body></html>`;
+    slot.appendChild(iframe);
+    log(`плеер #${playerSeq} создан (episode=${episode})`);
+    return iframe;
+}
+let currentIframe = buildPlayer();
+
+// --- кнопки стенда ---
+document.getElementById('btn-replace').onclick = () => {
+    log('заменяем iframe плеера (та же серия)...', 'warn');
+    currentIframe = buildPlayer();
+};
+document.getElementById('btn-next').onclick = () => {
+    episode++;
+    setWatchUrl();
+    log(`переход на серию ${episode}: новый плеер`, 'warn');
+    currentIframe = buildPlayer();
+};
+document.getElementById('btn-pause').onclick = () => {
+    const btn = document.querySelector('.senku-pause-btn');
+    if (btn) btn.click();
+    else log('кнопка панели не найдена', 'warn');
+};
+document.getElementById('btn-fullscreen').onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (currentIframe && currentIframe.requestFullscreen) currentIframe.requestFullscreen();
+};
+document.getElementById('btn-leave').onclick = () => {
+    history.replaceState(null, '', '/anime/123');
+    log('ушли со /watch — heartbeat и таймеры должны остановиться', 'warn');
+    setTimeout(() => { setWatchUrl(); log('вернулись на /watch'); }, 8000);
+};
+
+// --- состояние текущей сессии плагина ---
+const sessionEl = document.getElementById('session');
+setInterval(() => {
+    const s = window.__senku && window.__senku.getSession();
+    sessionEl.textContent = s
+        ? `session #${s.id}: episode=${s.episode}, manualPause=${s.manualPause}, wantPlaying=${s.wantPlaying}, heartbeat=${s.heartbeatTimer ? 'on' : 'off'}`
+        : 'session: — (нет)';
+}, 500);
+</script>
+
+<!-- сам userscript подключается как обычный скрипт -->
+<script src="../Senku Ultimate Autoplay.user.js"></script>
+</body>
+</html>

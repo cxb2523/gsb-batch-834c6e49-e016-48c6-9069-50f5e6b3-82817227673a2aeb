@@ -117,6 +117,17 @@ If you want to "kick" the script and check for updates right now:
 
 ---
 
+## Development: local tests and demo stand
+
+The `test/` directory contains offline checks of the "single playback session" invariants (player iframe replacement, manual pause before an episode switch, heartbeat switching, fullscreen and page unload). No network or external dependencies are needed — only Node.js:
+
+```bash
+node test/run-tests.js     # run scenarios against a fake DOM
+node test/serve.js         # demo stand: http://localhost:8931/test/sample-page.html
+```
+
+---
+
 ## Credits
 
 ### Senku Platform

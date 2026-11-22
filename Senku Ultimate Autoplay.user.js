@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Senku Ultimate Autoplay
 // @namespace    http://tampermonkey.net/
-// @version      3.6.6
+// @version      3.7.0
 // @description  Автозапуск, нативный переход, очередь, авто-восстановление после обрыва сети и сна, пауза кнопкой и пробелом, панель в полноэкранном режиме
 // @author       mikuro
 // @match        *://senku.one/*
@@ -86,18 +86,18 @@
 
     let needsUserClickToPlay = false;
     let userInteracted = false;
-    let heartbeatTimer = null;
 
-    // --- состояние восстановления ---
-    let wantPlaying = false;        // true = пользователь хочет смотреть (пауза не его)
-    let manualPause = false;        // [CHANGE] true = пользователь сам поставил паузу кнопкой/пробелом
+    // --- ТЕКУЩАЯ СЕССИЯ ВОСПРОИЗВЕДЕНИЯ ---
+    // [CHANGE] Всё, что привязано к конкретному элементу video и серии, живёт
+    // в одном объекте сессии: слушатели, таймеры, heartbeat, ручная пауза,
+    // состояние восстановления. Замена плеера (новый iframe/video), смена серии
+    // или уход со страницы /watch уничтожают сессию целиком (destroySession),
+    // после чего создаётся новая — с чистой ручной паузой и теми же
+    // настройками громкости/скорости/автозапуска.
+    let session = null;
+    let sessionSeq = 0;
+
     let lastUserActionAt = 0;       // время последнего действия пользователя
-    let lastProgressAt = 0;         // когда последний раз видео реально продвинулось
-    let recoverAttempts = 0;        // номер текущей попытки восстановления
-    let nextRecoverAt = 0;          // когда можно делать следующую попытку
-    let recovering = false;         // идёт ли асинхронная попытка
-    let lastTime = 0;
-    let lastVideoEl = null;
     let lastEpisodeKey = '';
     let transitionInProgress = false;
     let hasStartedCurrentVideo = false;
@@ -296,8 +296,7 @@
         target.style.backgroundSize = `${savedVolume * 100}% 100%`;
         localStorage.setItem(VOLUME_KEY, String(savedVolume));
 
-        const player = findPlayer();
-        const video = player ? player.video : null;
+        const video = getActiveVideo();
         if (video) {
             video.dataset.senkuProgrammaticVol = 'true';
             video.volume = savedVolume;
@@ -343,10 +342,8 @@
         localStorage.setItem(SPEED_KEY, String(savedSpeed));
         updateSpeedBtnText();
 
-        const player = findPlayer();
-        if (player && player.video) {
-            player.video.playbackRate = savedSpeed;
-        }
+        const video = getActiveVideo();
+        if (video) video.playbackRate = savedSpeed;
     });
 
     const iconQueue = document.createElementNS(SVG_NS, 'svg');
@@ -752,20 +749,29 @@
     }
 
     // --- 7. HEARTBEAT ---
+    const HEARTBEAT_MS = 15000;
+
     function getAnimeId() {
         const match = window.location.pathname.match(/\/watch\/(\d+)/);
         return match ? match[1] : '';
     }
 
-    async function sendHeartbeat(video, animeId, episode) {
+    /**
+     * [CHANGE] Heartbeat привязан к сессии: шлёт только её anime id, её серию
+     * и время её видео. Старая сессия физически не может отправить своё
+     * currentTime/duration в новую серию — её таймер остановлен в destroySession,
+     * а каждый тик дополнительно проверяет, что сессия всё ещё текущая.
+     */
+    async function sendHeartbeat(s) {
         try {
+            const { video } = s;
             const res = await fetch('/api/v2/watch/heartbeat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'include',
                 body: JSON.stringify({
-                    anime_id: animeId,
-                    episode: episode,
+                    anime_id: s.animeId,
+                    episode: s.episode,
                     time: Math.floor(video.currentTime) || 0,
                     duration: Number.isFinite(video.duration) ? Math.floor(video.duration) : 0
                 })
@@ -774,14 +780,172 @@
         } catch (e) {}
     }
 
-    function startHeartbeat(video, animeId, episode) {
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
-        sendHeartbeat(video, animeId, episode);
-        heartbeatTimer = setInterval(() => sendHeartbeat(video, animeId, episode), 15000);
+    function stopHeartbeat(s) {
+        if (s && s.heartbeatTimer) { clearInterval(s.heartbeatTimer); s.heartbeatTimer = null; }
     }
 
-    function stopHeartbeat() {
-        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    function startHeartbeat(s) {
+        if (!s || s.disposed || s.heartbeatTimer) return; // не больше одного таймера на сессию
+        sendHeartbeat(s);
+        s.heartbeatTimer = setInterval(() => {
+            // Тикаем, только пока это текущая сессия текущей серии текущего аниме
+            if (s.disposed || s !== session ||
+                s.animeId !== getAnimeId() ||
+                s.episode !== getCurrentEpisode({ frame: s.frame })) {
+                stopHeartbeat(s);
+                return;
+            }
+            sendHeartbeat(s);
+        }, HEARTBEAT_MS);
+    }
+
+    // --- 7.5 ЖИЗНЕННЫЙ ЦИКЛ СЕССИИ ---
+
+    /** [CHANGE] Слушатель, привязанный к сессии: снимается в destroySession. */
+    function listen(s, target, type, fn, opts) {
+        target.addEventListener(type, fn, opts);
+        s.listeners.push([target, type, fn, opts]);
+    }
+
+    /** [CHANGE] Таймер, привязанный к сессии: не срабатывает после её замены. */
+    function sessionTimeout(s, fn, ms) {
+        const id = setTimeout(() => {
+            if (s.disposed || s !== session) return;
+            fn();
+        }, ms);
+        s.timers.push(id);
+        return id;
+    }
+
+    /** [CHANGE] Видео текущей сессии; если сессии ещё нет — ищем плеер напрямую. */
+    function getActiveVideo() {
+        if (session && !session.disposed && session.video) return session.video;
+        const player = findPlayer();
+        return player ? player.video : null;
+    }
+
+    function createSession(player, animeId, episode) {
+        const s = {
+            id: ++sessionSeq,
+            video: player.video,
+            frame: player.frame,
+            doc: player.doc,
+            animeId,
+            episode,
+            disposed: false,
+            listeners: [],      // [target, type, fn, opts] — снимаются при destroy
+            timers: [],         // setTimeout id — чистятся при destroy
+            heartbeatTimer: null,
+            // Состояние восстановления — своё для каждой сессии
+            wantPlaying: true,   // новая сессия: пользователь хочет смотреть
+            manualPause: false,  // ручная пауза прошлой сессии/серии не действует
+            lastProgressAt: Date.now(),
+            lastTime: player.video.currentTime || 0,
+            recoverAttempts: 0,
+            nextRecoverAt: 0,
+            recovering: false,
+        };
+        hookSession(s);
+        return s;
+    }
+
+    /**
+     * [CHANGE] Полное освобождение сессии: heartbeat, таймеры и все слушатели
+     * старого видео останавливаются и снимаются. После этого объект сессии мёртв.
+     */
+    function destroySession() {
+        const s = session;
+        if (!s) return;
+        session = null;
+        s.disposed = true;
+        stopHeartbeat(s);
+        for (const id of s.timers) clearTimeout(id);
+        s.timers.length = 0;
+        for (const [target, type, fn, opts] of s.listeners) {
+            try { target.removeEventListener(type, fn, opts); } catch (e) {}
+        }
+        s.listeners.length = 0;
+    }
+
+    /**
+     * [CHANGE] Подключение сессии к видео: слушатели событий, фикс отката
+     * времени, синхронизация громкости, применение сохранённых громкости и
+     * скорости. Всё регистрируется через listen/sessionTimeout, чтобы
+     * destroySession освобождал ресурсы одним проходом.
+     */
+    function hookSession(s) {
+        const { video } = s;
+
+        // Сохранённые громкость и скорость применяем к новому видео сразу
+        video.dataset.senkuProgrammaticVol = 'true';
+        try {
+            video.volume = savedVolume;
+            video.muted = savedVolume === 0;
+        } catch (e) {}
+        sessionTimeout(s, () => { video.dataset.senkuProgrammaticVol = 'false'; }, 50);
+        applySpeed(video);
+
+        listen(s, video, 'play', () => {
+            if (s.manualPause) {
+                // Плеер сам не имеет права продолжить после паузы пользователя.
+                // Снимаем паузу, только если play пришёл сразу после действия пользователя.
+                if (Date.now() - lastUserActionAt < USER_ACTION_WINDOW) {
+                    s.manualPause = false;
+                    s.wantPlaying = true;
+                } else {
+                    video.pause();
+                    return;
+                }
+            } else {
+                s.wantPlaying = true;
+            }
+            updatePauseButton(false);
+        });
+
+        listen(s, video, 'playing', () => {
+            if (!s.manualPause) s.wantPlaying = true;
+        });
+
+        listen(s, video, 'pause', () => {
+            if (video.ended || video.seeking) return;
+            if (s.manualPause || Date.now() - lastUserActionAt < USER_ACTION_WINDOW) s.wantPlaying = false;
+            updatePauseButton(true);
+        });
+
+        listen(s, video, 'ended', () => { s.wantPlaying = false; });
+
+        // Фикс отката времени при паузе (к ручной паузе не применяем)
+        let lastValidTime = 0;
+        listen(s, video, 'timeupdate', () => {
+            if (!video.paused) lastValidTime = video.currentTime;
+        });
+        listen(s, video, 'pause', () => {
+            if (s.manualPause) return;
+            if (lastValidTime > 1 && !video.ended) {
+                const timeToRestore = lastValidTime;
+                const restore = () => {
+                    if (video.paused && video.currentTime < 1) {
+                        video.currentTime = timeToRestore;
+                    }
+                };
+                sessionTimeout(s, restore, 10);
+                sessionTimeout(s, restore, 100);
+                sessionTimeout(s, restore, 500);
+            }
+        });
+
+        // Пользователь крутит громкость в самом плеере — запоминаем
+        listen(s, video, 'volumechange', () => {
+            if (video.dataset.senkuProgrammaticVol === 'true') return;
+
+            const currentVol = video.muted ? 0 : video.volume;
+            if (Math.abs(currentVol - savedVolume) > 0.05) {
+                savedVolume = currentVol;
+                localStorage.setItem(VOLUME_KEY, String(savedVolume));
+                volSlider.value = String(savedVolume);
+                volSlider.style.backgroundSize = `${savedVolume * 100}% 100%`;
+            }
+        });
     }
 
     // --- 8. ОТСЛЕЖИВАНИЕ ДЕЙСТВИЙ, ПАУЗА, ПРОБЕЛ ---
@@ -808,33 +972,37 @@
             if (queueModal.contains(target)) return;
         }
 
-        const player = findPlayer();
-        if (!player) return;
+        const s = session;
+        if (!s || s.disposed) return;
 
         e.preventDefault();
         e.stopImmediatePropagation();
         if (tag === 'BUTTON' || tag === 'A') target.blur(); // иначе Space ещё раз нажмёт кнопку
-        togglePlayback(player);
+        togglePlayback();
     }
 
     /**
      * [CHANGE] Переключение паузы пользователем (кнопка или пробел).
-     * manualPause = true: скрипт не восстанавливает воспроизведение и не даёт плееру продолжить сам.
+     * Действует на текущую сессию: manualPause живёт внутри неё, поэтому
+     * после смены серии или пересоздания плеера ручная пауза не мешает
+     * автозапуску, а внутри сессии плеер не может сам сняться с паузы.
      */
-    function togglePlayback(player) {
-        const { video } = player;
+    function togglePlayback() {
+        const s = session;
+        if (!s || s.disposed) { updateStatus(t('searching'), 'error'); return; }
+        const { video } = s;
         markUserAction();
         if (video.paused) {
-            manualPause = false;
-            wantPlaying = true;
-            lastProgressAt = Date.now();
-            recoverAttempts = 0;
-            nextRecoverAt = 0;
+            s.manualPause = false;
+            s.wantPlaying = true;
+            s.lastProgressAt = Date.now();
+            s.recoverAttempts = 0;
+            s.nextRecoverAt = 0;
             tryPlay(video);
             updateStatus(t('resume'), 'active');
         } else {
-            manualPause = true;
-            wantPlaying = false;
+            s.manualPause = true;
+            s.wantPlaying = false;
             video.pause();
         }
         updatePauseButton(video.paused);
@@ -843,18 +1011,17 @@
     // [CHANGE] Иконка и подсказка кнопки паузы
     let lastPauseKey = '';
     function updatePauseButton(isPaused) {
-        const key = `${isPaused}|${manualPause}`;
+        const mp = session && !session.disposed ? session.manualPause : false;
+        const key = `${isPaused}|${mp}`;
         if (key === lastPauseKey) return;
         lastPauseKey = key;
         pauseBtn.replaceChildren(isPaused ? playIcon : pauseIcon);
         pauseBtn.title = isPaused ? t('playBtn') : t('pauseBtn');
-        pauseBtn.classList.toggle('active', manualPause);
+        pauseBtn.classList.toggle('active', mp);
     }
 
     pauseBtn.addEventListener('click', () => {
-        const player = findPlayer();
-        if (!player) { updateStatus(t('searching'), 'error'); return; }
-        togglePlayback(player);
+        togglePlayback();
         pauseBtn.blur();
     });
 
@@ -869,91 +1036,6 @@
         win.addEventListener('keydown', onKeyToggle, { capture: true });
         // [CHANGE] для iframe: вход/выход из полного экрана внутри плеера
         doc.addEventListener('fullscreenchange', syncPanelHost);
-    }
-
-    /**
-     * Пауза считается пользовательской, если она случилась сразу после действия
-     * пользователя ИЛИ пользователь поставил её кнопкой/пробелом (manualPause).
-     * Всё остальное (сон ноутбука, обрыв сети, сбой плеера) — не его пауза,
-     * и скрипт будет пытаться продолжить воспроизведение.
-     */
-    function hookVideo(video) {
-        if (video.dataset.senkuHooked === 'true') return;
-        video.dataset.senkuHooked = 'true';
-
-        video.addEventListener('play', () => {
-            if (manualPause) {
-                // [CHANGE] Плеер сам не имеет права продолжить после паузы пользователя.
-                // Снимаем паузу только если play пришёл сразу после действия пользователя (клик по видео).
-                if (Date.now() - lastUserActionAt < USER_ACTION_WINDOW) {
-                    manualPause = false;
-                    wantPlaying = true;
-                } else {
-                    video.pause();
-                    return;
-                }
-            } else {
-                wantPlaying = true;
-            }
-            updatePauseButton(false);
-        });
-
-        video.addEventListener('playing', () => {
-            if (!manualPause) wantPlaying = true;
-        });
-
-        video.addEventListener('pause', () => {
-            if (video.ended || video.seeking) return;
-            // [CHANGE] manualPause тоже делает паузу пользовательской
-            if (manualPause || Date.now() - lastUserActionAt < USER_ACTION_WINDOW) wantPlaying = false;
-            updatePauseButton(true);
-        });
-
-        video.addEventListener('ended', () => { wantPlaying = false; });
-    }
-
-    function applyPauseFix(video) {
-        if (video.dataset.senkuPauseFixed) return;
-        video.dataset.senkuPauseFixed = 'true';
-
-        let lastValidTime = 0;
-
-        video.addEventListener('timeupdate', () => {
-            if (!video.paused) lastValidTime = video.currentTime;
-        });
-
-        video.addEventListener('pause', () => {
-            // [CHANGE] при паузе пользователя время не откатываем
-            if (manualPause) return;
-            if (lastValidTime > 1 && !video.ended) {
-                const timeToRestore = lastValidTime;
-                const restore = () => {
-                    if (video.paused && video.currentTime < 1) {
-                        video.currentTime = timeToRestore;
-                    }
-                };
-                setTimeout(restore, 10);
-                setTimeout(restore, 100);
-                setTimeout(restore, 500);
-            }
-        });
-    }
-
-    function applyVolumeSync(video) {
-        if (video.dataset.senkuVolSynced) return;
-        video.dataset.senkuVolSynced = 'true';
-
-        video.addEventListener('volumechange', () => {
-            if (video.dataset.senkuProgrammaticVol === 'true') return;
-
-            const currentVol = video.muted ? 0 : video.volume;
-            if (Math.abs(currentVol - savedVolume) > 0.05) {
-                savedVolume = currentVol;
-                localStorage.setItem(VOLUME_KEY, String(savedVolume));
-                volSlider.value = String(savedVolume);
-                volSlider.style.backgroundSize = `${savedVolume * 100}% 100%`;
-            }
-        });
     }
 
     function applySpeed(video) {
@@ -1002,20 +1084,17 @@
         if (!needsUserClickToPlay) return;
         needsUserClickToPlay = false;
 
-        const player = findPlayer();
-        if (!player) return;
+        const video = getActiveVideo();
+        if (!video) return;
         try {
-            const video = player.video;
-            if (video) {
-                if (video.paused) video.play().catch(() => {});
-                if (video.muted) {
-                    video.dataset.senkuProgrammaticVol = 'true';
-                    video.muted = false;
-                    video.volume = savedVolume;
-                    video.dataset.senkuProgrammaticVol = 'false';
-                }
-                updateStatus(`▶️ ${t('startedClick')}`, 'active');
+            if (video.paused) video.play().catch(() => {});
+            if (video.muted) {
+                video.dataset.senkuProgrammaticVol = 'true';
+                video.muted = false;
+                video.volume = savedVolume;
+                video.dataset.senkuProgrammaticVol = 'false';
             }
+            updateStatus(`▶️ ${t('startedClick')}`, 'active');
         } catch (e) {}
     }, { capture: true });
 
@@ -1054,8 +1133,8 @@
     }
 
     /** Перезапуск источника: перезагрузка iframe плеера либо load() для нативного видео */
-    function reloadSource(player) {
-        const { video, frame } = player;
+    function reloadSource(s) {
+        const { video, frame } = s;
         if (frame && frame.src) {
             frame.src = frame.src;
             return;
@@ -1068,27 +1147,31 @@
         video.load();
     }
 
-    async function recover(player) {
-        recovering = true;
-        const { video, doc } = player;
+    /** [CHANGE] Восстановление работает в рамках сессии: если за время ожидания сессию заменили, выходим. */
+    async function recover(s) {
+        if (!s || s.disposed || s !== session) return;
+        s.recovering = true;
+        const { video, doc } = s;
         try {
             updateStatus(t('checkingNet'), 'error');
             const online = await probeNetwork(video);
 
+            if (s.disposed || s !== session) return; // сессию уже заменили — не трогаем новую
+
             if (!online) {
                 updateStatus(t('noNet'), 'error');
-                nextRecoverAt = Date.now() + 2000;
+                s.nextRecoverAt = Date.now() + 2000;
                 return;
             }
 
-            recoverAttempts++;
-            const n = recoverAttempts;
+            s.recoverAttempts++;
+            const n = s.recoverAttempts;
             updateStatus(`${t('recovering')} #${n}`, 'active');
 
             // Жёсткий перезапуск: ошибка медиа или каждые 3 неудачные попытки после четвёртой
             if (video.error || (n >= 4 && n % 3 === 0)) {
-                reloadSource(player);
-                nextRecoverAt = Date.now() + 12000;
+                reloadSource(s);
+                s.nextRecoverAt = Date.now() + 12000;
                 return;
             }
 
@@ -1107,12 +1190,12 @@
                 try { video.currentTime = Math.max(0, video.currentTime - 0.05); } catch (e) {}
             }
 
-            nextRecoverAt = Date.now() + Math.min(2500 + n * 1000, 10000);
+            s.nextRecoverAt = Date.now() + Math.min(2500 + n * 1000, 10000);
         } catch (e) {
             logError('Recovery', /** @type {Error} */ (e));
-            nextRecoverAt = Date.now() + 3000;
+            s.nextRecoverAt = Date.now() + 3000;
         } finally {
-            recovering = false;
+            s.recovering = false;
         }
     }
 
@@ -1145,11 +1228,11 @@
     }
 
     // Возврат сети, пробуждение экрана и фокус — сразу пробуем восстановиться
-    window.addEventListener('online', () => { nextRecoverAt = 0; });
+    window.addEventListener('online', () => { if (session) session.nextRecoverAt = 0; });
     window.addEventListener('offline', () => updateStatus(t('noNet'), 'error'));
-    window.addEventListener('focus', () => { nextRecoverAt = 0; });
+    window.addEventListener('focus', () => { if (session) session.nextRecoverAt = 0; });
     document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) nextRecoverAt = 0;
+        if (!document.hidden && session) session.nextRecoverAt = 0;
     });
 
     // --- 10. КОНЕЦ СЕРИИ ---
@@ -1253,26 +1336,27 @@
 
     // --- 11. ГЛАВНЫЙ ЦИКЛ ---
     function resetEpisodeState() {
-        wantPlaying = true;          // на новой серии хотим автозапуск
-        manualPause = false;         // [CHANGE] новая серия — пауза пользователя больше не действует
-        recoverAttempts = 0;
-        nextRecoverAt = 0;
-        lastProgressAt = Date.now();
-        lastTime = 0;
         hasStartedCurrentVideo = false;
         deadReported = false;          // [CHANGE]
         startWaitSince = Date.now();   // [CHANGE]
         transitionInProgress = false;
-        stopHeartbeat();
+        destroySession(); // [CHANGE] новая серия — новая сессия (heartbeat и таймеры старой остановлены)
     }
 
     function tick() {
         syncPanelHost(); // [CHANGE] панель должна переехать даже если плагин выключен
-        if (localStorage.getItem(STORAGE_KEY) === 'false') return;
-        if (!onWatchPage()) return;
+        if (localStorage.getItem(STORAGE_KEY) === 'false') {
+            destroySession(); // [CHANGE] плагин выключен — heartbeat и таймеры не работают
+            return;
+        }
+        if (!onWatchPage()) {
+            destroySession(); // [CHANGE] ушли со /watch — останавливаем heartbeat и таймеры
+            return;
+        }
 
         const player = findPlayer();
         if (!player) {
+            destroySession(); // [CHANGE] плеер исчез — освобождаем старую сессию
             updateStatus(t('searching'), 'error');
             checkNoEpisodes(null); // [CHANGE] плеера нет совсем: серий, возможно, нет
             return;
@@ -1288,38 +1372,40 @@
 
             hookUserActions(document);   // [CHANGE] клавиши на странице
             hookUserActions(doc);
-            hookVideo(video);
-            applyPauseFix(video);
-            applyVolumeSync(video);
-            applySpeed(video);
 
-            // Смена серии — полный сброс
+            // Смена серии — полный сброс (внутри destroySession + создание новой сессии ниже)
             const episodeKey = `${animeId}:${currentEp}`;
             if (episodeKey !== lastEpisodeKey) {
                 lastEpisodeKey = episodeKey;
                 resetEpisodeState();
             }
 
-            // Смена элемента video (например, после перезагрузки плеера) — только локальный сброс
-            if (video !== lastVideoEl) {
-                lastVideoEl = video;
-                lastTime = video.currentTime;
-                lastProgressAt = now;
-                nextRecoverAt = 0;
-                stopHeartbeat();
+            // [CHANGE] Смена элемента video (замена iframe, перезагрузка плеера)
+            // или новая серия — заменяем сессию целиком: старая освобождается,
+            // новая подключается с сохранёнными громкостью/скоростью и без
+            // ручной паузы прошлой сессии.
+            if (!session || session.video !== video) {
+                destroySession();
+                session = createSession(player, animeId, currentEp);
             }
+            const s = session;
+            s.animeId = animeId;
+            s.episode = currentEp;
+
+            applySpeed(video);
 
             // [CHANGE] Если пользователь на паузе, а плеер сам поехал — возвращаем паузу
-            if (manualPause && !video.paused) video.pause();
+            if (s.manualPause && !video.paused) video.pause();
             updatePauseButton(video.paused);
 
             if (video.currentTime > 2) hasStartedCurrentVideo = true;
             if (!hasStartedCurrentVideo && checkNoEpisodes(player)) return; // [CHANGE] тайтл без серий — не работаем с ним дальше
 
+            // [CHANGE] Heartbeat только текущей сессии, текущей серии и текущего anime id
             if (!video.paused && !video.ended && video.currentTime > 0 && animeId) {
-                if (!heartbeatTimer) startHeartbeat(video, animeId, currentEp);
+                startHeartbeat(s);
             } else {
-                stopHeartbeat();
+                stopHeartbeat(s);
             }
 
             // Конец серии
@@ -1329,35 +1415,35 @@
             }
 
             // Фиксация прогресса
-            if (!video.paused && Math.abs(video.currentTime - lastTime) > 0.05) {
-                lastTime = video.currentTime;
-                lastProgressAt = now;
-                recoverAttempts = 0;
+            if (!video.paused && Math.abs(video.currentTime - s.lastTime) > 0.05) {
+                s.lastTime = video.currentTime;
+                s.lastProgressAt = now;
+                s.recoverAttempts = 0;
             }
 
             // Пользователь сам поставил паузу (кнопкой, пробелом или кликом) — ничего не делаем
-            if (!wantPlaying) {
-                recoverAttempts = 0;
+            if (!s.wantPlaying) {
+                s.recoverAttempts = 0;
                 // [CHANGE] отдельная подпись для паузы, выбранной вручную
-                updateStatus(`${manualPause ? t('manualPause') : t('pause')} (${currentEp}/${totalEps})`, 'normal');
+                updateStatus(`${s.manualPause ? t('manualPause') : t('pause')} (${currentEp}/${totalEps})`, 'normal');
                 return;
             }
 
             // Всё идёт нормально
-            const stalledFor = now - lastProgressAt;
+            const stalledFor = now - s.lastProgressAt;
             if (!video.paused && !video.error && stalledFor < STALL_MS) {
                 updateStatus(`${t('watching')} ${currentEp}/${totalEps} | ${volText}`, 'normal');
                 return;
             }
 
             // Пауза не пользовательская / зависание / ошибка — восстанавливаем
-            if (recovering) {
-                updateStatus(`${t('recovering')} #${recoverAttempts}`, 'active');
+            if (s.recovering) {
+                updateStatus(`${t('recovering')} #${s.recoverAttempts}`, 'active');
                 return;
             }
 
             // Восстановление не помогает несколько попыток подряд — перезагружаем страницу
-            if (recoverAttempts >= RELOAD_AFTER_ATTEMPTS &&
+            if (s.recoverAttempts >= RELOAD_AFTER_ATTEMPTS &&
                 stalledFor >= RELOAD_AFTER_STALL_MS &&
                 navigator.onLine &&
                 canReloadPage()) {
@@ -1365,13 +1451,13 @@
                 return;
             }
 
-            if (now < nextRecoverAt) {
-                const wait = Math.ceil((nextRecoverAt - now) / 1000);
+            if (now < s.nextRecoverAt) {
+                const wait = Math.ceil((s.nextRecoverAt - now) / 1000);
                 updateStatus(`${t('reconnecting')} ${wait}c...`, 'error');
                 return;
             }
 
-            recover(player);
+            recover(s);
         } catch (e) {
             logError('Main automation loop', /** @type {Error} */ (e));
         }
@@ -1391,6 +1477,17 @@
         } catch (e) {}
         setInterval(fn, ms);
     }
+
+    // [CHANGE] Выгрузка страницы: останавливаем heartbeat и таймеры сессии
+    window.addEventListener('pagehide', destroySession);
+    window.addEventListener('beforeunload', destroySession);
+
+    // [CHANGE] Точка доступа для локальных офлайн-тестов (test/run-tests.js).
+    // Только чтение состояния и принудительный сброс; на логику не влияет.
+    window.__senku = {
+        getSession: () => session,
+        destroySession,
+    };
 
     startTicker(tick, 1000);
 })();
