@@ -30,6 +30,13 @@ export class ShadingUtils {
     return state;
   }
 
+  // Re-apply shading to an existing object.
+  //
+  // The duplicated vertex/index buffer layout is identical for every shading
+  // mode, so when a render buffer already exists we recompute normals in
+  // place through the adapter's single normal entry — no slot reallocation,
+  // no BufferGeometry replacement, no GPU resource churn. A full rebuild only
+  // happens when there is no usable render buffer yet.
   static rebuildShading(object) {
     const meshData = object.userData.meshData;
     if (!meshData) return;
@@ -37,10 +44,20 @@ export class ShadingUtils {
     const { mode, angle } = this.getShading(object);
     const sharps = SharpUtils.getSharpIds(object);
 
-    const { geometry, renderBuffer } = MeshRendererAdapter.toBufferGeometry(meshData, { mode, angle, sharps });
+    const renderBuffer = object.userData.renderBuffer;
+    const geometry = object.geometry;
 
-    object.geometry.dispose();
-    object.geometry = geometry;
-    object.userData.renderBuffer = renderBuffer;
+    const appliedInPlace =
+      renderBuffer &&
+      geometry?.attributes?.normal &&
+      MeshRendererAdapter.applyShading(meshData, renderBuffer, geometry, { mode, angle, sharps });
+
+    if (!appliedInPlace) {
+      const built = MeshRendererAdapter.toBufferGeometry(meshData, { mode, angle, sharps });
+      MeshRendererAdapter.replaceObjectGeometry(object, built.geometry, built.renderBuffer);
+    }
+
+    geometry?.computeBoundingBox?.();
+    geometry?.computeBoundingSphere?.();
   }
 }

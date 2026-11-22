@@ -172,12 +172,8 @@ export class PropertiesPanel {
     const sharps = object.userData.sharp;
     const { geometry, renderBuffer } = MeshRendererAdapter.toBufferGeometry(newMeshData, { mode, angle, sharps });
 
-    const oldGeometry = object.geometry;
-    object.geometry = geometry;
-    oldGeometry.dispose();
-
     object.userData.meshData = newMeshData;
-    object.userData.renderBuffer = renderBuffer;
+    MeshRendererAdapter.replaceObjectGeometry(object, geometry, renderBuffer);
 
     this.editor.signals.sceneGraphChanged.dispatch();
     this.editor.signals.historyChanged.dispatch();

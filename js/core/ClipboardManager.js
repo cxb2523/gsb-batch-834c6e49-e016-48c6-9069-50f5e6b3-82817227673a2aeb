@@ -121,6 +121,7 @@ export class ClipboardManager {
     const obj = new THREE.Mesh(geometry, material);
     obj.userData.meshData = meshData;
     obj.userData.renderBuffer = renderBuffer;
+    renderBuffer.bindObject(obj);
     obj.userData.shading = item.shading;
     obj.userData.shadingAngle = angle;
     obj.userData.seam = seams;

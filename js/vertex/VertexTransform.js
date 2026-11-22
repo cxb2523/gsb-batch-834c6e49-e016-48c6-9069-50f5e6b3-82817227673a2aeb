@@ -75,10 +75,28 @@ export class VertexTransform {
 
     positionAttr.needsUpdate = true;
 
+    // Triangulation validation first: a moved vertex can change a polygon's
+    // earcut triangle count, in which case the adapter performs an atomic
+    // full rebuild and we must refresh every local reference before touching
+    // attributes again.
+    let geometry = this.geometry;
+    let renderBuffer = this.renderBuffer;
     if (retriangulate) {
-      MeshRendererAdapter.retriangulateFaces(meshData, this.renderBuffer, this.geometry, affectedFaces);
+      const status = MeshRendererAdapter.retriangulateFaces(
+        meshData, renderBuffer, geometry, [...affectedFaces]
+      );
+      if (status === 'rebuilt') {
+        geometry = this.vertexEditor.geometry;
+        renderBuffer = this.vertexEditor.renderBuffer;
+      }
     }
-    MeshRendererAdapter.updateNormalsForAffectedFaces(meshData, this.renderBuffer, this.geometry, affectedFaces, affectedVertices);
+
+    // Positions invalidate cached face normals; the recompute entry rebuilds
+    // the affected entries through the shared normal pipeline.
+    renderBuffer.invalidateNormalCache();
+    MeshRendererAdapter.updateNormalsForAffectedFaces(
+      meshData, renderBuffer, geometry, affectedFaces, affectedVertices
+    );
 
     this.signals.vertexPositionsUpdated.dispatch(affectedVertices, affectedEdges, affectedFaces, meshData, this.object.matrixWorld);
   }

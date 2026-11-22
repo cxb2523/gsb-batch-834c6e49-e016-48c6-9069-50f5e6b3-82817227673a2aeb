@@ -101,6 +101,7 @@ export class Loader {
     mesh.receiveShadow = true;
     mesh.userData.meshData = meshData;
     mesh.userData.renderBuffer = renderBuffer;
+    renderBuffer.bindObject(mesh);
     mesh.userData.shading = mode;
     mesh.userData.shadingAngle = shadingAngle;
     mesh.userData.sharp = sharp;

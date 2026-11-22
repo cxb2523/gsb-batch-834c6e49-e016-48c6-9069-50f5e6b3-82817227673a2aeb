@@ -106,6 +106,9 @@ export default class SceneManager {
     if (object.userData.renderBuffer && !(object.userData.renderBuffer instanceof MeshRenderBuffer)) {
       MeshRenderBuffer.rehydrateRenderBuffer(object);
     }
+    // Re-link the render buffer to its host after hydration so an in-place
+    // rebuild can atomically swap the object's geometry.
+    object.userData.renderBuffer?.bindObject?.(object);
 
     if (object.userData?.isImageRef && object.material) {
       object.material.allowOverride = false;

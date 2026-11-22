@@ -75,6 +75,10 @@ export class VertexEditor {
     if (renderBuffer && !(renderBuffer instanceof MeshRenderBuffer)) {
       MeshRenderBuffer.rehydrateRenderBuffer(this.object);
     }
+
+    // Link the render buffer to its host so the adapter can atomically
+    // swap in a rebuilt geometry when triangle counts change.
+    this.object.userData.renderBuffer?.bindObject?.(this.object);
   }
 
   addFace(vertices) {
@@ -126,8 +130,8 @@ export class VertexEditor {
     if (!this.object || !delta) return;
 
     const meshData = this.meshData;
-    const renderBuffer = this.renderBuffer;
-    const geometry = this.geometry;
+    let renderBuffer = this.renderBuffer;
+    let geometry = this.geometry;
 
     const affectedFaces = new Set();
     const affectedVertices = new Set();
@@ -178,6 +182,17 @@ export class VertexEditor {
     geometry.attributes.position.needsUpdate = true;
     if (geometry.attributes.uv) geometry.attributes.uv.needsUpdate = true;
 
+    // Triangulation validation: any face whose triangle count no longer
+    // matches its stored layout triggers one atomic full rebuild. After a
+    // rebuild the local references must be refreshed.
+    const status = MeshRendererAdapter.retriangulateFaces(
+      meshData, renderBuffer, geometry, [...affectedFaces]
+    );
+    if (status === 'rebuilt') {
+      geometry = this.object.geometry;
+      renderBuffer = this.object.userData.renderBuffer;
+    }
+
     const box = new THREE.Box3();
     for (const id of meshData.vertices.keys()) {
       const slot = renderBuffer.vertexIdToBufferIndex.get(id)?.[0];
@@ -187,6 +202,9 @@ export class VertexEditor {
     geometry.boundingBox = box;
     geometry.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
 
+    // addFace already recomputed the new faces' normals; this covers the
+    // moved-but-not-rebuilt vertices and the faces around them, all through
+    // the same normal entry honoring normalMode/normalAngle.
     MeshRendererAdapter.updateNormalsForAffectedFaces(meshData, renderBuffer, geometry, affectedFaces, affectedVertices);
 
     this.signals.editSelectionRefresh.dispatch();

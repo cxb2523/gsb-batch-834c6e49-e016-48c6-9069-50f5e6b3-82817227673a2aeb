@@ -53,6 +53,7 @@ export class ObjectFactory {
     mesh.receiveShadow = true;
     mesh.userData.meshData = meshData;
     mesh.userData.renderBuffer = renderBuffer;
+    renderBuffer.bindObject(mesh);
     mesh.userData.shading = mode;
     mesh.userData.shadingAngle = angle;
     mesh.userData.sharp = sharps;

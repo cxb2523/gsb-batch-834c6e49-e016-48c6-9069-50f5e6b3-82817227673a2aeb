@@ -55,6 +55,7 @@ export class ObjectEditor {
         });
         clone.geometry = geometry;
         clone.userData.renderBuffer = renderBuffer;
+        renderBuffer.bindObject(clone);
       }
 
       const baseName = this.editor.nameManager.getBaseName(object.name);
@@ -109,6 +110,7 @@ export class ObjectEditor {
 
     mesh.userData.meshData = mergedMeshData;
     mesh.userData.renderBuffer = renderBuffer;
+    renderBuffer.bindObject(mesh);
     mesh.userData.shading = mode;
     mesh.userData.shadingAngle = angle;
     mesh.userData.seam = seams;
@@ -146,6 +148,7 @@ export class ObjectEditor {
 
     mesh.userData.meshData = meshData;
     mesh.userData.renderBuffer = renderBuffer;
+    renderBuffer.bindObject(mesh);
     mesh.userData.shading = mode;
     mesh.userData.shadingAngle = angle;
     mesh.userData.seam = seams;
