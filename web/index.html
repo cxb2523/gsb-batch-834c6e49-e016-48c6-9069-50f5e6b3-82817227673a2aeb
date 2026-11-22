@@ -55,6 +55,14 @@
     border:1px solid #2E6BFF;background:rgba(7,13,21,.82);color:#4DA6FF;cursor:pointer;
     font:12px Consolas,ui-monospace,monospace}
   #upload-again.on{display:block}
+  /* 流式解析：首批挂载后收起上传层，用左下浮动小条继续显示解析进度 */
+  #stream-badge{display:none;position:fixed;left:14px;bottom:72px;z-index:40;padding:6px 12px;
+    border:1px solid #2E6BFF;background:rgba(7,13,21,.85);color:#9fb6cb;
+    font:12px Consolas,ui-monospace,monospace;align-items:center;gap:10px}
+  #stream-badge.on{display:flex}
+  #stream-badge b{color:#4DA6FF;font-weight:600}
+  #stream-badge .sbar{width:120px;height:5px;background:#12202e;display:inline-block}
+  #stream-badge .sbar > i{display:block;height:100%;width:0;background:#4DA6FF;transition:width .15s linear}
 </style>
 </head>
 <body>
@@ -67,6 +75,7 @@
 </div>
 
 <button id="upload-again" type="button">换一个 .wrpl</button>
+<div id="stream-badge"><b id="stream-stage">解析中</b><span class="sbar"><i id="stream-fill"></i></span><span id="stream-pct">0%</span></div>
 
 <div id="upload" class="is-idle">
   <div class="card">
@@ -143,7 +152,63 @@
   var errHint = document.getElementById('err-hint');
   var retry = document.getElementById('err-retry');
   var again = document.getElementById('upload-again');
+  var badge = document.getElementById('stream-badge');
+  var badgeStage = document.getElementById('stream-stage');
+  var badgeFill = document.getElementById('stream-fill');
+  var badgePct = document.getElementById('stream-pct');
   var busy = false;
+
+  /* ---- 流式解析状态 ----
+   * parseSeq：每次 start 递增，过期解析的回调据此全部失效；
+   * streamMission：首批挂载中的 mission（也是最终 mission 的载体，分片直接合并进它）；
+   * fallbackMission：上一份「完整解析成功」的 mission，解析中途失败时回滚到它。 */
+  var parseSeq = 0;
+  var streamMission = null;
+  var firstMounted = false;
+  var fallbackMission = null;
+  var remountTimer = 0;
+
+  /** 取消在跑的解析：terminate 旧 worker（其 Promise 以 'cancelled' 拒绝，回调里静默丢弃）。 */
+  function cancelActiveParse() {
+    parseSeq++;
+    if (remountTimer) { clearTimeout(remountTimer); remountTimer = 0; }
+    if (window.WRPLParse && typeof WRPLParse.cancel === 'function') {
+      try { WRPLParse.cancel(); } catch (e) {}
+    }
+  }
+
+  function showStreamBadge() { badge.className = 'on'; }
+  function hideStreamBadge() { badge.className = ''; }
+  function updateStreamBadge(name, pct) {
+    badgeStage.textContent = name;
+    badgeFill.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+    badgePct.textContent = Math.round(pct) + '%';
+  }
+
+  /** 分片合并后按节奏重挂载（worker 的分片在解析末尾成串到达，350 ms 合帧 ≈ 一次重挂载）。 */
+  function scheduleStreamRemount(seq) {
+    if (seq !== parseSeq || !firstMounted || !streamMission) return;
+    if (remountTimer) return;
+    remountTimer = setTimeout(function () {
+      remountTimer = 0;
+      if (seq !== parseSeq || !firstMounted || !streamMission) return;
+      /* merge 模式：保留播放位置与播放/暂停；机位、倍速、标签/航迹开关
+       * 本来就在 mission.js 模块级保留，重复挂载不会重置任何用户已选项。 */
+      try { window.ACEUI.mount(streamMission, { merge: true }); } catch (e) {}
+    }, 350);
+  }
+
+  /** 解析中途失败：已挂载的可能是首批半成品 → 回退到上一份完整 mission；
+   *  没有上一份（且首批已挂载）→ 卸载到空状态。首批还没挂载时场景未被触碰，无需回退。 */
+  function rollbackToFallback() {
+    if (!firstMounted) return;
+    try {
+      if (fallbackMission) window.ACEUI.mount(fallbackMission);
+      else if (window.ACEUI && typeof window.ACEUI.unmount === 'function') window.ACEUI.unmount();
+    } catch (e) {}
+    streamMission = null;
+    firstMounted = false;
+  }
 
   /* 解析阶段 → 用户可读的阶段名（数值由 WRPLParse 的进度回调给） */
   var STAGES = {
@@ -183,6 +248,7 @@
     setStage(name, p.pct);
     setBar(p.pct);
     if (p.note) note.textContent = p.note;
+    if (badge.className === 'on') updateStreamBadge(name, p.pct);
   });
 
   function summarize(m) {
@@ -499,14 +565,20 @@
   }
 
   function start(file) {
-    if (busy) return;
     if (!file) return;
     if (!/\.(wrpl|bin)$/i.test(file.name || '')) {
       fail('无法读取这个文件', '请选择 War Thunder 的 .wrpl 回放文件（文件名：' +
         (file.name || '未知') + '）。', '');
       return;
     }
+    /* 重复拖入：先取消在跑的解析（terminate 旧 worker、释放分片缓冲）。
+     * 旧场景资源等新首批挂载时由 ACEUI.mount 释放（dispose），旧 mission 的引用
+     * 留在 fallbackMission 供失败回滚 —— 三者不叠加。 */
+    cancelActiveParse();
+    var seq = parseSeq;
     busy = true;
+    firstMounted = false;
+    streamMission = null;
     setState('is-busy');
     setIcon('\u2026');
     setStage('读取文件', 0);
@@ -515,36 +587,75 @@
     var t0 = performance.now();
     var fr = new FileReader();
     fr.onerror = function () {
+      if (seq !== parseSeq) return;
       fail('无法读取这个文件', '浏览器没能读完这个文件，请确认文件仍在原位置、且没有被其它程序占用。', '');
     };
     fr.onload = function () {
+      if (seq !== parseSeq) return;
       var buf = fr.result;
       setStage('解压包流', 1);
       setBar(1);
       note.textContent = '开始解析（' + (buf.byteLength / 1048576).toFixed(2) + ' MB）…';
-      WRPLParse.parse(buf, { fileName: file.name }).then(async function (mission) {
+      WRPLParse.parse(buf, {
+        fileName: file.name,
+        /* 验收钩子（?debugfail=1）：模拟「首批已挂载、后续解析失败」的回滚路径 */
+        debugFailAfterFirstBatch: /[?&]debugfail=1(?:&|$)/.test(location.search || ''),
+        onFirst: function (m) {
+          if (seq !== parseSeq) return;
+          if (!(window.ACEUI && typeof window.ACEUI.mount === 'function')) {
+            fail('解析失败', '页面缺少 ACEUI.mount（mission.js 没加载成功），解析已完成但无法渲染。', '');
+            return;
+          }
+          streamMission = m;
+          /* 首批可挂载：mount 内部先 dispose 旧场景再 init 新场景 */
+          var ok0 = window.ACEUI.mount(m);
+          if (!ok0) { streamMission = null; return; }
+          firstMounted = true;
+          showStreamBadge();
+          box.classList.add('hidden');          // 收起上传层：边解析边播
+          console.log('[stream] 首批已挂载：%d 条空中航迹 / 窗口 %s s（后续分片继续合并）',
+            (m.units || []).length,
+            (m.meta && m.meta.window && m.meta.window.t1 != null) ? m.meta.window.t1.toFixed(1) : '?');
+        },
+        onPart: function () { scheduleStreamRemount(seq); }
+      }).then(async function (mission) {
+        if (seq !== parseSeq) return;
+        var m = streamMission || mission;
         var dt = ((performance.now() - t0) / 1000).toFixed(2);
-        try { await loadTerrainIfAny(mission); } catch (e) { /* 地形拿不到不影响播放 */ }
-        try { await loadAirfieldsCatalogueIfAny(mission); } catch (e) { /* 目录拿不到不影响播放 */ }
-        try { await loadTablesIfAny(mission); } catch (e2) { /* 表拿不到就用内嵌兜底 */ }
+        try { await loadTerrainIfAny(m); } catch (e) { /* 地形拿不到不影响播放 */ }
+        try { await loadAirfieldsCatalogueIfAny(m); } catch (e) { /* 目录拿不到不影响播放 */ }
+        try { await loadTablesIfAny(m); } catch (e2) { /* 表拿不到就用内嵌兜底 */ }
+        if (seq !== parseSeq) return;
         if (!(window.ACEUI && typeof window.ACEUI.mount === 'function')) {
           fail('解析失败', '页面缺少 ACEUI.mount（mission.js 没加载成功），解析已完成但无法渲染。', '');
           return;
         }
-        var ok = window.ACEUI.mount(mission);
+        var ok = window.ACEUI.mount(m, firstMounted ? { merge: true } : undefined);
         if (!ok) {
           fail('解析失败', 'ACEUI.mount 拒绝了这份数据（结构不符）。', '');
           return;
         }
+        updateStreamBadge('完成', 100);
+        setTimeout(hideStreamBadge, 800);
+        fallbackMission = m;        // 成为下一次解析失败时的回滚目标；更旧的引用在此释放
+        busy = false;
         setState('is-done');
+        if (firstMounted) box.classList.add('hidden');   // 流式：不再弹出上传层遮挡场景
         setIcon('\u2713');
         setStage('完成', 100);
         setBar(100);
-        note.textContent = '完成：' + summarize(mission) + '（' + dt + ' s）';
+        note.textContent = '完成：' + summarize(m) + '（' + dt + ' s）';
         again.className = 'on';
-        window.__WRPL_LAST = mission;      // 便于自验/排查
-        setTimeout(function () { box.className = 'is-done hidden'; }, 600);
+        firstMounted = false;
+        streamMission = null;
+        window.__WRPL_LAST = m;      // 便于自验/排查
+        setTimeout(function () { if (box.className === 'is-done') box.className = 'is-done hidden'; }, 600);
       }).catch(function (ex) {
+        if (seq !== parseSeq) return;
+        if (ex && ex.code === 'cancelled') return;   // 被更新的文件取代：静默
+        hideStreamBadge();
+        rollbackToFallback();
+        busy = false;
         if (ex && ex.code === 'unsupported-format') {
           failUnsupported(ex.tech || '');
         } else {
@@ -575,11 +686,15 @@
   });
   window.addEventListener('drop', function (e) {
     e.preventDefault();
-    if (busy) return;
+    /* 解析中也允许换文件：start 里会先取消旧解析（terminate 旧 worker） */
     var dt = e.dataTransfer;
     if (dt && dt.files && dt.files.length) start(dt.files[0]);
   });
   function reset() {
+    cancelActiveParse();            // 在跑的解析一并取消（worker terminate）
+    streamMission = null;
+    firstMounted = false;
+    hideStreamBadge();
     setState('is-idle');
     setIcon('\u25c6');
     setStage('等待文件', 0);

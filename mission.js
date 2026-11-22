@@ -1281,8 +1281,16 @@
   // 用法：解析完上传的 .wrpl 后调用 ACEUI.mount(missionData)（结构同契约 §2）。
   // 会重置时钟与场景绑定，但保留用户的呼号/显示设置（localStorage），只在"用户没自定义过"时
   // 按新数据的真实队友数重算默认呼号。
-  function mount(data) {
+  // opts.merge = true（流式分片合并后的重复挂载）：在上一句的基础上再保留
+  // 播放位置 met 与播放/暂停状态 —— 机位、倍速、标签/航迹等开关本来就在模块级保留，
+  // 重复挂载不会重置任何用户已选项。
+  function mount(data, opts) {
     if (!isObj(data)) return false;
+    var merge = !!(opts && opts.merge);
+    var keepMet = merge ? met : 0;
+    var keepPlaying = merge ? playing : false;
+    // 换数据先释放旧场景资源（WebGL 缓冲 / 标签层 / 控制器监听），不得叠加
+    if (SCENE && typeof SCENE.dispose === 'function') { try { SCENE.dispose(); } catch (e0) {} }
     window.ACE_MISSION = data;
     DATA = null; META = {};
     T0 = 0; DUR = 0; OWN = null; UNITS = []; EVENTS = []; KILLS = []; NAMES = {};
@@ -1297,12 +1305,35 @@
     if (!hasStoredIdentity) identity.squad = defaultSquadNames();
     resolveSquadKeys();
     rankUnits();
-    playing = DUR > 0;
+    if (merge) {
+      met = clamp(keepMet, 0, DUR > 0 ? DUR : 0);
+      playing = keepPlaying && DUR > 0;
+    } else {
+      playing = DUR > 0;
+    }
     if (!ct.ticks) buildControls(); else { buildTicks(); syncControls(); }
     buildHelp();
     toggleHelp(false);
     toggleIdentityPanel(false);
     initScene();
+    renderOnce();
+    return true;
+  }
+
+  // 卸载：解析中途失败且没有上一份完整数据可回退时调用 —— 释放场景资源、
+  // 清掉半份数据，页面回到"无数据"的可用状态（控制条/读数照常工作）。
+  function unmount() {
+    if (SCENE && typeof SCENE.dispose === 'function') { try { SCENE.dispose(); } catch (e0) {} }
+    SCENE = null; sceneBroken = false; sceneInitError = null;
+    try { window.ACE_MISSION = undefined; } catch (e1) {}
+    DATA = null; META = {};
+    T0 = 0; DUR = 0; OWN = null; UNITS = []; EVENTS = []; KILLS = []; NAMES = {};
+    RANKED = []; SQUAD_MEMBER_KEYS = []; SQUAD_ALL_KEYS = []; squadKeys = [];
+    met = 0; playing = false; acc = 0; lastTs = 0; dragging = false;
+    lastOwnRef = { x: 0, y: 0, has: false };
+    WARN = WARN.filter(function (w) { return w.indexOf('localStorage') >= 0; });
+    warn('数据已卸载：解析失败，场景已回退到空状态');
+    if (ct.ticks) { buildTicks(); syncControls(); }
     renderOnce();
     return true;
   }
@@ -1360,6 +1391,7 @@
     squadSourceLine: squadSourceLine,
     sourceLine: sourceLine,
     mount: mount,
+    unmount: unmount,
 
     get options() {
       return {

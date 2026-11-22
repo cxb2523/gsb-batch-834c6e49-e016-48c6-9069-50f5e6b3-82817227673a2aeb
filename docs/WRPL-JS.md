@@ -1,6 +1,8 @@
 # WRPL-JS：浏览器内解析 .wrpl（移植范围 · 对比结果 · 未做项）
 
-> 说明：文中 `web/dev/` 下的自测页为开发期产物，未随仓库提供。
+> 说明：文中 `web/dev/` 下的早期自测页为开发期产物，未随仓库提供；
+> 流式解析（首批挂载/分片合并/回滚/取消）的改动与验收见 [STREAMING-PARSE.md](STREAMING-PARSE.md)
+> （`web/dev/stream-test.html` 在工作区可用，按 .gitignore 约定不入库）。
 
 > 产物：`web/index.html`（上传页）、`web/wrpl-parse.js`、
 > `web/vendor/fzstd.min.js`（+ `fzstd.LICENSE.txt`、`README.md`）。

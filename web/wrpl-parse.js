@@ -3007,18 +3007,68 @@
              __attitude: store.__attitude };
   }
 
+  /** 把一条分片合并进目标对象（store 或流式 mission）。
+   *  own 分 4 片发（t0/hz/n、x/y/z、ias/tas/mach/hdg、其余通道），必须**合并**而不是覆盖；
+   *  units 分片是追加，但流式时首批已有一版临时 units：首个正式分片要**替换**它（st.unitsReplaced）；
+   *  流式时 terrain/names 由页面按地图名加载，worker 的占位（null/{}）不覆盖页面结果。 */
+  function mergePartInto(target, key, data, st) {
+    if (key === 'own') {
+      /* 流式：首批已有一版临时 own（可能带 preSpawnCount 等首批特有键），
+       * 首个正式分片先整体替换再按键合并，避免残留首批的键 */
+      if (st && !st.ownReplaced) { target.own = {}; st.ownReplaced = true; }
+      target.own = Object.assign(target.own || {}, data);
+    } else if (key === 'units') {
+      if (st && !st.unitsReplaced) { target.units = data.slice(); st.unitsReplaced = true; }
+      else target.units = (target.units || []).concat(data);
+    } else if (key === '__attitude') {
+      /* 横滚序列按 uid 分片发（可能上百 KB/片），这里按 uid 合并 */
+      var att = target.__attitude || (target.__attitude = { units: {} });
+      if (data.note) att.note = data.note;
+      if (data.secPerTick != null) att.secPerTick = data.secPerTick;
+      if (data.tick0 != null) att.tick0 = data.tick0;
+      if (data.dt != null) att.dt = data.dt;
+      Object.keys(data.units || {}).forEach(function (k) { att.units[k] = data.units[k]; });
+    } else if ((key === 'terrain' || key === 'names') && st && st.streaming) {
+      return;   /* 流式：地形/名称归页面所有，忽略 worker 的占位分片 */
+    } else {
+      target[key] = data;
+    }
+  }
+
+  /* 当前在跑的 worker 解析（用于「换入新回放时先取消旧的」）。 */
+  var _activeParseCancel = null;
+
+  /** 取消正在进行的 worker 解析：terminate worker，并以 code='cancelled' 拒绝其 Promise。
+   *  没有在跑的解析时是空操作。主线程回退路径无法中途取消（同步分片执行），不受影响。 */
+  function cancelActiveParse() {
+    if (_activeParseCancel) {
+      var f = _activeParseCancel;
+      _activeParseCancel = null;
+      try { f(); } catch (e) {}
+    }
+  }
+
   function parseInWorker(arrayBuffer, opts, pathNote) {
     return new Promise(function (resolve, reject) {
       var worker = null, done = false, store = recvPartStore();
+      var streaming = typeof opts.onFirst === 'function';
+      var streamMission = null;                        /* 流式：首批对象即最终 mission 的载体 */
+      var streamSt = { unitsReplaced: false, ownReplaced: false, streaming: true };
       var debugObj = (opts.debug && typeof opts.debug === 'object') ? opts.debug : null;
 
       function cleanup() {
+        if (_activeParseCancel === myCancel) _activeParseCancel = null;
         if (worker) {
           try { worker.onmessage = null; worker.onerror = null; worker.terminate(); } catch (e) {}
           worker = null;
         }
       }
       function fail(err) { if (done) return; done = true; cleanup(); reject(err); }
+      /* 换入新回放时 WRPLParse.cancel() 会调这里：terminate worker 并以 'cancelled' 拒绝，
+       * 调用方据此静默丢弃本次解析（不渲染成错误）。 */
+      var myCancel = function () {
+        fail(Object.assign(new Error('解析已取消：换入了新的回放文件'), { code: 'cancelled' }));
+      };
 
       var wurl = workerScriptURL();
       var _t0 = Date.now(), _tReady = 0, _tSent = 0, _timing = null;
@@ -3035,6 +3085,8 @@
         fail(Object.assign(new Error('Worker 未在 2 s 内就绪'),
                            { code: 'worker-unavailable' }));
       }, 2000);
+
+      _activeParseCancel = myCancel;
 
       /* 必须主动握手：worker 收到 {cmd:'ready'} 才会回一条 ready（此前漏了这一步，
        * 导致一直等到 2 s 超时再回退主线程 —— 端到端从 1.6 s 变成 3.7 s）。 */
@@ -3064,7 +3116,8 @@
           // 转交所有权：主线程这份 ArrayBuffer 立刻 detached，主线程堆不背它
           try {
             worker.postMessage({ cmd: 'parse', buf: arrayBuffer, fileName: opts.fileName,
-                                 yieldEvery: opts.yieldEvery,
+                                 yieldEvery: opts.yieldEvery, stream: streaming,
+                                 debugFailAfterFirstBatch: !!opts.debugFailAfterFirstBatch,
                                  wantDebug: !!debugObj }, [arrayBuffer]);
             _tSent = Date.now();
           } catch (e) {
@@ -3078,21 +3131,29 @@
           if (typeof m.workerHeapMB === 'number') _workerHeapPeakMB = m.workerHeapMB;
           return;
         }
-        if (m.type === 'part') {
-          /* own 是分 4 片发的（t0/hz/n、x/y/z、ias/tas/mach/hdg、其余通道），
-           * 必须**合并**而不是覆盖 —— 覆盖会只剩最后一片，本机静默消失。 */
-          if (m.key === 'own') store.own = Object.assign(store.own || {}, m.data);
-          else if (m.key === 'units') store.units = store.units.concat(m.data);
-          else if (m.key === '__attitude') {
-            /* 横滚序列按 uid 分片发（可能上百 KB/片），这里按 uid 合并 */
-            var att = store.__attitude || (store.__attitude = { units: {} });
-            if (m.data.note) att.note = m.data.note;
-            if (m.data.secPerTick != null) att.secPerTick = m.data.secPerTick;
-            if (m.data.tick0 != null) att.tick0 = m.data.tick0;
-            if (m.data.dt != null) att.dt = m.data.dt;
-            Object.keys(m.data.units || {}).forEach(function (k) { att.units[k] = m.data.units[k]; });
+        if (m.type === 'first') {
+          /* 流式首批：worker 在解出时间轴 + 本机 + 首批空中单位后立刻发来。
+           * 这份对象就是最终 mission 的载体：后续分片直接合并进它。 */
+          if (streaming && !streamMission && !done) {
+            streamMission = m.data;
+            try { opts.onFirst(streamMission); } catch (e0) {}
           }
-          else store[m.key] = m.data;
+          return;
+        }
+        if (m.type === 'part') {
+          if (streamMission) {
+            /* 流式：分片合并进已挂载的同一份 mission，并通知调用方（页面按节奏重挂载） */
+            mergePartInto(streamMission, m.key, m.data, streamSt);
+            if (m.key === '__attitude') {
+              var att2 = streamMission.__attitude;
+              if (att2 && att2.units && Object.keys(att2.units).length) global.ACE_ATTITUDE = att2;
+            }
+            if (typeof opts.onPart === 'function') {
+              try { opts.onPart(m.key, streamMission); } catch (e1) {}
+            }
+          } else {
+            mergePartInto(store, m.key, m.data, null);
+          }
           return;
         }
         if (m.type === 'debug') {
@@ -3104,7 +3165,8 @@
           if (done) return;
           done = true;
           if (typeof m.workerHeapPeakMB === 'number') _workerHeapPeakMB = m.workerHeapPeakMB;
-          var mission = assembleMission(store);
+          var mission = streamMission || assembleMission(store);
+          store = null;                  // 释放分片缓冲（流式时分片直接进了 mission，无 store）
           cleanup();                     // terminate()：worker isolate 连同其中间数组一起回收
           mission.meta.limits.push(pathNote);
           mission.meta.provenance.push('解析路径：Web Worker（wrpl-worker.js，主线程只收分片结果）');
@@ -3137,10 +3199,20 @@
 
   var _workerHeapPeakMB = null;
 
+  /** meta.grid / meta.units 的内容（首批与最终 meta 共用；每次返回新对象，互不串改）。 */
+  function metaGrid() {
+    return { stepX: 6500, stepY: 6500, note: '显示约定；本局地图网格 6500 m（开发期从地图信息核对）' };
+  }
+  function metaUnitsTable() {
+    return { pos: 'm', alt: 'm', hdg: 'deg', roll: 'deg', pitch: 'deg', aoa: 'deg', g: 'g',
+             vy: 'm/s', ias: 'm/s', tas: 'm/s', mach: 'Ma', fuel: 'kg', ammo: 'rounds', throttle: '%' };
+  }
+
   /**
    * 主线程解析（回退路径）。
    * @param {ArrayBuffer|Uint8Array} arrayBuffer
-   * @param {object} [opts] fileName / yieldEvery / debug / force
+   * @param {object} [opts] fileName / yieldEvery / debug / force /
+   *   firstBatch（流式：首批可挂载时回调一次）/ debugFailAfterFirstBatch（验收钩子）
    */
   async function parseMain(arrayBuffer, opts) {
     initStats();
@@ -3270,8 +3342,128 @@
     }
     propsSamples.sort(function (a, b) { return a.ms - b.ms; });
     var ownProps = buildOwnProps(propsSamples);
-    emit('props', 46, '本机属性表 ' + propsSamples.length + ' 行');
+    emit('props', 44, '本机属性表 ' + propsSamples.length + ' 行');
     await sleep0();
+
+    /* 以下四段（结算 BLK / 本机认领 / 时间轴 / y 翻转 + 显示名表）只依赖
+     * 头部、包帧、FM 航迹与本机属性表，与击杀/ECS 扫描互不依赖。
+     * 流式首批需要它们的结果，故提到击杀/ECS 之前计算；最终产物逐项不变。 */
+
+    // ---- 结算 BLK（玩家表 / 作者 / squadId）
+    emit('blk', 46, '解析结算 BLK');
+    var results = {}, blkMeta = null;
+    if (info.resultsOffset) {
+      var blk = parseFatBlk(d.subarray(info.resultsOffset));
+      results = blk.tree;
+      blkMeta = blk.meta;
+    }
+    var players = mergePlayers(results);
+    var playerVeh = playerVehicles(results);
+    await sleep0();
+
+    // ---- 本机 uid：用本机高度剖面与各航迹做相关（纯回放判据）
+    var playerName = results.author || '';
+    var authorId = String(results.authorUserId || '');
+    var authorRow = players.filter(function (x) { return String(x.userId) === authorId; })[0] || null;
+    var authorVeh = (playerVeh.filter(function (x) { return String(x.userId) === authorId; })[0] || {}).primaryCraft || null;
+
+    var axisProbe = new Axis(SEC_PER_TICK, tick0, Math.max(tickLast, 0), 256);
+    var unitRowsByUid = {}, trackUnits = tracksUnits.map(function (u) {
+      return { entityId: u.entityId, uid: u.uid, samples: u.samples, entityIndex: 0 };
+    });
+    trackUnits.forEach(function (u) {
+      unitRowsByUid[u.uid] = unitRowsByUid[u.uid] || [];
+      unitSamples(u).forEach(function (r) { unitRowsByUid[u.uid].push(r); });
+    });
+    var ownPick = pickOwnUnit(trackUnits, authorVeh, ownProps, axisProbe, uidMapProbe());
+    function uidMapProbe() { return {}; }
+    var ownUid = ownPick.uid;
+    emit('own', 48, '本机 uid=' + ownUid + '（' + ownPick.how + '）');
+    await sleep0();
+
+    // ---- 时间轴
+    var endMarkerMs = null;
+    pk.forEach(function (p) { if (p.ptype === 0) endMarkerMs = p.ms; });
+    var endMarkerRaw = endMarkerMs === null ? null : endMarkerMs * TICK_PER_MS;
+    var axis = new Axis(SEC_PER_TICK, tick0,
+                        Math.max.apply(null, [tickLast].concat(endMarkerRaw === null ? [] : [endMarkerRaw])), 256);
+    var allTicks = [];
+    tracksUnits.forEach(function (u) { u.samples.forEach(function (s) { allTicks.push(s[0]); }); });
+    // 注意：不要用 Math.min.apply(null, arr) —— 采样数上万后参数个数超限会栈溢出
+    // （旧版本大回放实测：RangeError: Maximum call stack size exceeded）。用循环。
+    var tickLo = axis.tick0, tickHi = axis.tick0;
+    if (allTicks.length) {
+      tickLo = allTicks[0]; tickHi = allTicks[0];
+      for (var ti = 1; ti < allTicks.length; ti++) {
+        if (allTicks[ti] < tickLo) tickLo = allTicks[ti];
+        if (allTicks[ti] > tickHi) tickHi = allTicks[ti];
+      }
+    }
+    var t1 = Math.max(0.0, (tickHi - axis.tick0) * axis.sec_per_tick);
+    if (endMarkerRaw !== null) t1 = Math.max(t1, axis.sec(endMarkerRaw));
+    var window_ = { t0: 0.0, t1: rnd(t1, 3), duration: rnd(t1, 3) };
+
+    var yv = decideYFlip(unitRowsByUid, ownUid, axisFromClockSeries(ownProps.hdg_deg, axis), axis);
+    var ysign = yv.flip ? -1.0 : 1.0;
+
+    // 显示名表 / 隐藏表（静态表，首批与最终共用同一份内容）
+    var displayNames = {}, hiddenAll = {};
+    HIDDEN_TEMPLATES.concat(HIDDEN_EXTRA).forEach(function (k) { hiddenAll[k] = 1; });
+    Object.keys(DISPLAY_NAMES).forEach(function (k) {
+      if (DISPLAY_NAMES[k] === '') hiddenAll[k] = 1;
+      else displayNames[k] = DISPLAY_NAMES[k];
+    });
+
+    // ---- 流式首批（可选）：时间轴 + 本机 + 首批空中单位立刻可挂载；
+    // 身份/阵营/事件/导弹/地形/名称/姿态随后续分片合并进同一份 mission。
+    // 只有调用方给了 opts.firstBatch 才组装（不流式时零额外开销）。
+    if (typeof opts.firstBatch === 'function') {
+      try {
+        var fbOwnIds = {};
+        (ownPick.segments || []).forEach(function (s) { fbOwnIds[s.entityId] = 1; });
+        var fbOwn = buildOwn({ units: tracksUnits }, axis, window_.t1,
+                             ownPick.segments || [], ownProps, ysign);
+        var fbUnits = buildUnits({ units: tracksUnits }, axis, fbOwnIds, ysign,
+                                 {}, {}, {}, displayNames, [], hiddenAll, ownUid).units;
+        var fbMeta = {
+          source: 'wrpl',
+          markerNames: [],
+          sideSource: '首批：阵营/身份尚未判定（击杀关系与 ECS 映射在后续分片）',
+          replayFile: opts.fileName || null,
+          replayHeader: hdr,
+          player: {
+            name: playerName, vehicle: authorVeh,
+            vehicleName: authorVeh ? (DISPLAY_NAMES[authorVeh] || String(authorVeh).toUpperCase()) : null
+          },
+          matchResults: null, squad: null,
+          replayTicks: { tick0: axis.tick0, tickLast: axis.tick_last,
+                         secPerTick: axis.sec_per_tick, packets: pk.length, killPackets: 0 },
+          window: window_,
+          grid: metaGrid(),
+          units: metaUnitsTable(),
+          counts: { ownSamples: fbOwn.own.n, trackCount: fbUnits.length,
+                    airTracks: fbUnits.length, groundTracks: 0, kills: 0, shots: 0,
+                    runways: 0, airfields: 0, missiles: 0, events: 0 },
+          devValidation: null,
+          vehicleRoster: {},
+          provenance: ['流式首批：FM 航迹 + 本机属性表 + 结算 BLK（击杀/ECS/地面/事件仍在解析）'],
+          limits: ['首批数据（流式）：时间轴 + 本机 + 空中航迹已可播；身份/阵营/事件/导弹/地形/姿态' +
+                   '随后续分片合并进同一份 mission，最终以完整解析为准。']
+        };
+        opts.firstBatch({ meta: fbMeta, own: fbOwn.own, units: fbUnits,
+                          events: [], shots: [], missiles: [], runways: [], airfields: [],
+                          terrain: null, names: {}, __attitude: null });
+        emit('units', 50, '首批 ' + fbUnits.length + ' 条空中航迹已可挂载（流式）');
+      } catch (eFb) {
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[wrpl] 首批组装失败（不影响后续完整解析）：', eFb);
+        }
+      }
+      /* 验收钩子：模拟「首批已挂载、后续解析失败」的回滚路径（仅测试用） */
+      if (opts.debugFailAfterFirstBatch) {
+        throw new Error('debug：按 opts.debugFailAfterFirstBatch 注入的首批后失败（验收用）');
+      }
+    }
 
     // ---- 击杀 / 伤害包
     var kills = [], criticals = [], severes = [], failures = [];
@@ -3430,42 +3622,10 @@
     var groundSync = parseGroundSync(payload, pk);
     var groundBind = bindGroundTracks(groundRows, groundSync);
     var weaponPos = parseWeaponSync(payload, pk);
-    emit('ecs', 73, '弹药同步 ' + weaponPos.stats.rockets + ' 个导弹实体 / ' +
+    emit('ecs', 72, '弹药同步 ' + weaponPos.stats.rockets + ' 个导弹实体 / ' +
                     weaponPos.stats.bombs + ' 个炸弹实体（' + weaponPos.stats.errors + ' 包失败）');
-    emit('ecs', 72, '地面同步 ' + groundSync.stats.uids + ' uid / ' +
+    emit('ecs', 73, '地面同步 ' + groundSync.stats.uids + ' uid / ' +
                     groundSync.stats.samples + ' 采样 → 绑定 ' + groundBind.matched + ' 个 ECS 点');
-    await sleep0();
-
-    // ---- 结算 BLK（玩家表 / 作者 / squadId）
-    emit('blk', 74, '解析结算 BLK');
-    var results = {}, blkMeta = null;
-    if (info.resultsOffset) {
-      var blk = parseFatBlk(d.subarray(info.resultsOffset));
-      results = blk.tree;
-      blkMeta = blk.meta;
-    }
-    var players = mergePlayers(results);
-    var playerVeh = playerVehicles(results);
-    await sleep0();
-
-    // ---- 本机 uid：用本机高度剖面与各航迹做相关（纯回放判据）
-    var playerName = results.author || '';
-    var authorId = String(results.authorUserId || '');
-    var authorRow = players.filter(function (x) { return String(x.userId) === authorId; })[0] || null;
-    var authorVeh = (playerVeh.filter(function (x) { return String(x.userId) === authorId; })[0] || {}).primaryCraft || null;
-
-    var axisProbe = new Axis(SEC_PER_TICK, tick0, Math.max(tickLast, 0), 256);
-    var unitRowsByUid = {}, trackUnits = tracksUnits.map(function (u) {
-      return { entityId: u.entityId, uid: u.uid, samples: u.samples, entityIndex: 0 };
-    });
-    trackUnits.forEach(function (u) {
-      unitRowsByUid[u.uid] = unitRowsByUid[u.uid] || [];
-      unitSamples(u).forEach(function (r) { unitRowsByUid[u.uid].push(r); });
-    });
-    var ownPick = pickOwnUnit(trackUnits, authorVeh, ownProps, axisProbe, uidMapProbe());
-    function uidMapProbe() { return {}; }
-    var ownUid = ownPick.uid;
-    emit('own', 78, '本机 uid=' + ownUid + '（' + ownPick.how + '）');
     await sleep0();
 
     // ---- 玩家槽位（ptype=4 MPI 0xF02D）→ 玩家名字/队伍/氏族
@@ -3529,31 +3689,6 @@
                      ' / enemy ' + Object.keys(sideFinalMap).filter(function (k) { return sideFinalMap[k] === 'enemy'; }).length);
     await sleep0();
 
-    // ---- 时间轴
-    var endMarkerMs = null;
-    pk.forEach(function (p) { if (p.ptype === 0) endMarkerMs = p.ms; });
-    var endMarkerRaw = endMarkerMs === null ? null : endMarkerMs * TICK_PER_MS;
-    var axis = new Axis(SEC_PER_TICK, tick0,
-                        Math.max.apply(null, [tickLast].concat(endMarkerRaw === null ? [] : [endMarkerRaw])), 256);
-    var allTicks = [];
-    tracksUnits.forEach(function (u) { u.samples.forEach(function (s) { allTicks.push(s[0]); }); });
-    // 注意：不要用 Math.min.apply(null, arr) —— 采样数上万后参数个数超限会栈溢出
-    // （旧版本大回放实测：RangeError: Maximum call stack size exceeded）。用循环。
-    var tickLo = axis.tick0, tickHi = axis.tick0;
-    if (allTicks.length) {
-      tickLo = allTicks[0]; tickHi = allTicks[0];
-      for (var ti = 1; ti < allTicks.length; ti++) {
-        if (allTicks[ti] < tickLo) tickLo = allTicks[ti];
-        if (allTicks[ti] > tickHi) tickHi = allTicks[ti];
-      }
-    }
-    var t1 = Math.max(0.0, (tickHi - axis.tick0) * axis.sec_per_tick);
-    if (endMarkerRaw !== null) t1 = Math.max(t1, axis.sec(endMarkerRaw));
-    var window_ = { t0: 0.0, t1: rnd(t1, 3), duration: rnd(t1, 3) };
-
-    var yv = decideYFlip(unitRowsByUid, ownUid, axisFromClockSeries(ownProps.hdg_deg, axis), axis);
-    var ysign = yv.flip ? -1.0 : 1.0;
-
     // 导弹弹道（只取 class 0；弹体不画，场景里做白色虚线）
     var missiles = [];
     Object.keys(weaponPos.rockets).forEach(function (ent) {
@@ -3576,13 +3711,7 @@
     });
     missiles.sort(function (a, b) { return (a.t0 - b.t0) || (a.entity - b.entity); });
 
-    // ---- units（空中）+ 地面
-    var displayNames = {}, hiddenAll = {};
-    HIDDEN_TEMPLATES.concat(HIDDEN_EXTRA).forEach(function (k) { hiddenAll[k] = 1; });
-    Object.keys(DISPLAY_NAMES).forEach(function (k) {
-      if (DISPLAY_NAMES[k] === '') hiddenAll[k] = 1;
-      else displayNames[k] = DISPLAY_NAMES[k];
-    });
+    // ---- units（空中）+ 地面（displayNames/hiddenAll 已在首批前备好）
     var vHints = {};
     kills.forEach(function (k) {
       var f = k.fields || {};
@@ -3827,9 +3956,8 @@
       replayTicks: { tick0: axis.tick0, tickLast: axis.tick_last, secPerTick: axis.sec_per_tick,
                      packets: pk.length, killPackets: kills.length },
       window: window_,
-      grid: { stepX: 6500, stepY: 6500, note: '显示约定；本局地图网格 6500 m（开发期从地图信息核对）' },
-      units: { pos: 'm', alt: 'm', hdg: 'deg', roll: 'deg', pitch: 'deg', aoa: 'deg', g: 'g',
-               vy: 'm/s', ias: 'm/s', tas: 'm/s', mach: 'Ma', fuel: 'kg', ammo: 'rounds', throttle: '%' },
+      grid: metaGrid(),
+      units: metaUnitsTable(),
       counts: counts,
       devValidation: {
         ownMaxErrM: null, ownRmsErrM: null, ownSamplesCompared: propsSamples.length,
@@ -3910,11 +4038,19 @@
    * 对外入口（接口不变）：优先走 Web Worker，把解析挪出主线程；
    * Worker 不可用或建不起来时**自动退回主线程**，结果一致、只是主线程会卡。
    * opts.force = 'main' | 'worker' 可强制某条路径（用于对拍/性能测量）。
+   * opts.onFirst(mission) / opts.onPart(key, mission)：流式回调 —— 首批可挂载时
+   * 先回调一次（该对象即最终 mission 的载体），后续分片合并进同一份对象。
    */
   async function parse(arrayBuffer, opts) {
     opts = opts || {};
     var force = opts.force || null;
     global.ACE_ATTITUDE = null;                 // 每次解析从空开始（不累计）
+    /* 主线程路径（回退/强制）的流式首批：与 worker 的 {type:'first'} 等效 */
+    var mOpts = opts;
+    if (typeof opts.onFirst === 'function' && !opts.firstBatch) {
+      mOpts = Object.assign({}, opts);
+      mOpts.firstBatch = function (m) { try { opts.onFirst(m); } catch (e0) {} };
+    }
     // 已经在 Worker 里（wrpl-worker.js）就不要再套一层：直接主线程路径跑完再回传结果
     var insideWorker = (typeof importScripts === 'function') || (typeof document === 'undefined');
     if (force !== 'main' && !insideWorker && workerSupported()) {
@@ -3928,7 +4064,7 @@
             !(arrayBuffer instanceof Uint8Array) && arrayBuffer.byteLength) {
           // 只有在「建不起来」时才回退；Worker 里真正的解析错误原样抛出（避免解析两遍）
           if (opts.debug) opts.debug.workerFallback = String(e && e.message || e);
-          var m2 = await parseMain(arrayBuffer, opts);
+          var m2 = await parseMain(arrayBuffer, mOpts);
           m2.meta.limits.push('解析路径：主线程回退（Worker 不可用：' + (e && e.message || e) + '）');
           m2.meta.provenance.push('解析路径：主线程回退（Worker 不可用）');
           publishAttitude(m2);
@@ -3938,7 +4074,7 @@
       }
     }
     if (opts.debug) opts.debug.workerFallback = force === 'main' ? 'force=main' : 'not supported';
-    var mMain = await parseMain(arrayBuffer, opts);
+    var mMain = await parseMain(arrayBuffer, mOpts);
     /* 两条路径的 meta 结构保持一致：主线程路径没有 worker 堆峰值，显式给 null */
     if (mMain && mMain.meta && !('__workerHeapPeakMB' in mMain.meta)) {
       mMain.meta.__workerHeapPeakMB = null;
@@ -4087,9 +4223,12 @@
   global.WRPLParse = {
     parse: parse,
     progress: progress,
-    version: '1.0.0-browser',
+    cancel: cancelActiveParse,   /* 换入新回放前调用：terminate 在跑的 worker 并以 'cancelled' 拒绝 */
+    version: '1.1.0-browser-streaming',
     _internal: { parsePackets: parsePackets, parseFm: parseFm, readVlqSize: readVlqSize,
                  initStats: initStats, parseMain: parseMain, buildAttitude: buildAttitude,
+                 mergePartInto: mergePartInto, recvPartStore: recvPartStore,
+                 assembleMission: assembleMission,
                  parseGroundSync: parseGroundSync, bindGroundTracks: bindGroundTracks,
                  buildGroundUnits: buildGroundUnits, groundTrackArrays: groundTrackArrays,
                  groundIdentity: groundIdentity, EcsParser: EcsParser, parseSlotPlayers: parseSlotPlayers, parseWeaponSync: parseWeaponSync,

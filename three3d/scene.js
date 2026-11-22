@@ -1014,6 +1014,48 @@ function setCamera(mode) {
 }
 function setOption(k, v) { if (k in state.opts) { state.opts[k] = v; } }
 
+/* 释放本模块持有的全部场景资源：换回放/重新挂载前必须调用，不得叠加。
+ * - 几何/材质/纹理 dispose（GPU 缓冲），renderer.dispose() 释放渲染器内部缓存；
+ * - OrbitControls.dispose() 摘掉它挂在 canvas 上的指针监听（每次 init 都会新建一个）；
+ * - 标签层 DOM 移除（init 里也有兜底清理，双保险）；
+ * 不 forceContextLoss：同一 canvas 的 GL context 会被下一个 renderer 复用，
+ * 强制丢失会让同 canvas 的新 renderer 拿到已丢失的 context。 */
+function dispose() {
+  try { if (state.controls) { state.controls.dispose(); } } catch (e) {}
+  try {
+    if (state.scene) {
+      state.scene.traverse((o) => {
+        if (o.geometry) { try { o.geometry.dispose(); } catch (e) {} }
+        if (o.material) {
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          for (const mt of mats) {
+            if (!mt) { continue; }
+            for (const k in mt) {
+              const v = mt[k];
+              if (v && v.isTexture) { try { v.dispose(); } catch (e) {} }
+            }
+            try { mt.dispose(); } catch (e) {}
+          }
+        }
+      });
+    }
+  } catch (e) {}
+  try { if (state.renderer) { state.renderer.dispose(); } } catch (e) {}
+  try {
+    if (state.labelBox && state.labelBox.parentNode) {
+      state.labelBox.parentNode.removeChild(state.labelBox);
+    }
+  } catch (e) {}
+  state.ready = false;
+  state.renderer = null; state.scene = null; state.camera = null; state.controls = null;
+  state.meta = null; state.units = []; state.own = null;
+  state.kills = []; state.runways = []; state.ground = []; state.shots = [];
+  state.labels = []; state.labelBox = null;
+  state.landFill = null; state.terrainInfo = null; state.missiles = null;
+  state.drops = null; state.bounds = null; state.ownGaps = []; state.airfields = null;
+  state._gClusterOf = null;
+}
+
 /* ------------------------------------------------------------- 每帧 */
 const _v = new THREE.Vector3(), _q = new THREE.Quaternion();
 const _upAxis = new THREE.Vector3(0, 1, 0);
@@ -1841,7 +1883,7 @@ function render(st) {
 }
 
 const API = {
-  init: init, render: render, setCamera: setCamera, setOption: setOption,
+  init: init, render: render, setCamera: setCamera, setOption: setOption, dispose: dispose,
   getReady: () => state.ready,
   getStats: () => Object.assign({}, state.stats, { t: state.t, ready: state.ready, camMode: state.camMode })
 };

@@ -3,7 +3,10 @@
  * ---------------------------------------------------------------------
  * 主线程（wrpl-parse.js 的 parseInWorker）发来的消息：
  *   { cmd: 'ready' }                      → 回 { type: 'ready' }
- *   { cmd: 'parse', buf, fileName, ... }  → 回若干 { type: 'progress' | 'part' | 'debug' }
+ *   { cmd: 'parse', buf, fileName, stream, ... }
+ *                                       → stream 时先回 { type: 'first', data }（首批可挂载：
+ *                                         时间轴 + 本机 + 首批空中单位，解出即发，不等全部解析完）
+ *                                       → 再回若干 { type: 'progress' | 'part' | 'debug' }
  *                                           最后 { type: 'done', parts } 或 { type: 'error' }
  * `buf` 是 **Transferable**（主线程 postMessage 时转交所有权）：
  * 主线程那边这个 ArrayBuffer 立刻 detached，主线程堆不背这份数据。
@@ -110,6 +113,15 @@ self.onmessage = function (ev) {
   var dbg = msg.wantDebug ? {} : null;
   var opts = { fileName: msg.fileName, yieldEvery: msg.yieldEvery };
   if (dbg) opts.debug = dbg;
+  /* 流式：parseMain 在解出「时间轴 + 本机 + 首批空中单位」时回调 firstBatch，
+   * 这里立刻转发主线程挂载；后续分片仍按 sendMission 的方式到达。 */
+  if (msg.stream) {
+    opts.firstBatch = function (m) {
+      self.postMessage({ type: 'first', data: m });
+    };
+    /* 验收钩子：模拟「首批已挂载、后续解析失败」（web/index.html ?debugfail=1） */
+    if (msg.debugFailAfterFirstBatch) opts.debugFailAfterFirstBatch = true;
+  }
   /* 调 parseMain（原始解析）而不是公开的 parse：
    * 公开 parse 会把 __attitude 摘下来挂到 window.ACE_ATTITUDE，而 worker 里没有 window，
    * 结果就再也发不回主线程了（主线程那边 ACE_ATTITUDE 会是 0 个 uid）。 */
