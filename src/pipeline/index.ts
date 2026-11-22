@@ -1037,8 +1037,11 @@ export class Pipeline implements PromiseLike<Pipeline> {
   }
 
   // Switch the input to a new stream (e.g. camera switch) WITHOUT changing the
-  // output track. Call it BEFORE stopping the old camera. Only the video track
-  // is switched; audio stays as configured at construction.
+  // output track. Call it BEFORE stopping the old camera. Both tracks are
+  // followed: the video track drives the effects, and — with audio: 'denoise'
+  // — the audio track is handed to the denoiser (mic switch / unplug, or a
+  // device whose sample rate changed), which rebuilds its source node and keeps
+  // the output on the new mic only. The output tracks themselves don't change.
   setInputStream(stream: MediaStream): Promise<void> {
     return quiet(this.switchInput(stream).catch((err) => { throw this.reportControlError('setInputStream', err) }))
   }
@@ -1054,6 +1057,13 @@ export class Pipeline implements PromiseLike<Pipeline> {
     this.inputStream = stream
     this.watchInputTrack()
     this.meter.reset()
+
+    // Follow the new mic (if there is one) — independent of the video path, and
+    // not awaited: the denoise swap primes the new source for a few ms before
+    // crossfading, and the camera switch shouldn't wait on audio. It never
+    // rejects (failures fail open to the original audio, reported via onError).
+    const nextAudio = stream.getAudioTracks()[0]
+    if (nextAudio && this.denoiser) void this.denoiser.setInputTrack(nextAudio)
 
     // Main-side raw passthrough (if active) follows the new camera.
     const mainRaw = this.status === 'recovering'

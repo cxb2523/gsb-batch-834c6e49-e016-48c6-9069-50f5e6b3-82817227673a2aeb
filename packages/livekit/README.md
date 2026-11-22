@@ -21,6 +21,6 @@ await cameraTrack.setProcessor(LongpipeProcessor({ background: 'blur', touchup: 
 await micTrack.setProcessor(DenoiseProcessor())
 ```
 
-`BackgroundBlur(radius?)`, `VirtualBackground(url)` and `BackgroundProcessor({ mode })` mirror `@livekit/track-processors`, so switching is an import change. `processor.pipeline` is the underlying [`EffectsPipeline`](https://longpipe.dev/docs/api) (`setTouchup`, `getStats`, `ready`…). Camera switches keep the same processed track.
+`BackgroundBlur(radius?)`, `VirtualBackground(url)` and `BackgroundProcessor({ mode })` mirror `@livekit/track-processors`, so switching is an import change. `processor.pipeline` is the underlying [`EffectsPipeline`](https://longpipe.dev/docs/api) (`setTouchup`, `getStats`, `ready`…). Camera switches keep the same processed track; a replaced **mic** (`restart()` with a new audio track) keeps the same denoiser and output track too — only the source is rebuilt, so the call never mixes or carries the old mic.
 
 Docs: [longpipe.dev/docs/livekit](https://longpipe.dev/docs/livekit) · Example: [examples/livekit](https://github.com/sb2702/longpipe/tree/main/examples/livekit) · MIT

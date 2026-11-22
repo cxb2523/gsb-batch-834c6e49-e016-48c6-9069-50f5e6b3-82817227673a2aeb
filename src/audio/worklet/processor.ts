@@ -9,7 +9,13 @@
 // When the AudioContext can't run at 48 kHz, two stateful rubato resamplers
 // (exposed by the DFN wasm) bridge device-rate ⇄ 48 kHz around the net. They
 // engage only when sampleRate ≠ 48000 and the kernel exposes them (DFN does;
-// rnnoise doesn't — at non-48k on rnnoise we error rather than corrupt).
+// rnnoise doesn't — at non-48k on rnnoise we fall back to dry passthrough and
+// say why, rather than running the net on samples at the wrong rate).
+//
+// The input source can be replaced while the graph stays up (mic switch, a
+// device that resamples itself): the main thread sends `reset`, which drops the
+// buffered input/output samples and rebuilds the resampler state, so nothing
+// from the old source or rate is mixed into the new one.
 //
 // Bundled to a self-contained ESM by the inline-worklet tsup plugin and loaded
 // via Blob URL + audioWorklet.addModule (see ../worklet_inline.ts).
@@ -43,7 +49,11 @@ class DenoiseProcessor extends AudioWorkletProcessor {
 
   // Resampling (engaged only when sampleRate ≠ 48000 and the wasm supports it).
   private resample = false
+  // Non-48k context and this kernel has no resampler: run as dry passthrough
+  // (original audio, never samples at the wrong rate) and tell the main thread.
+  private unsupportedRate = false
   private rsPush: ((rs: number, inPtr: number, n: number, outPtr: number, cap: number) => number) | null = null
+  private rsCreate: ((from: number, to: number) => number) | null = null
   private inRs = 0
   private outRs = 0
   private rsDevInPtr = 0   // device-rate input scratch (one quantum)
@@ -65,6 +75,9 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   private outWrite = 0
   private outCount = 0
   private primed = false
+  // Set by reset: until the ring re-primes, process() passes the input through
+  // dry so an input swap has no silent hole (and never plays old samples).
+  private repriming = false
 
   private now: (() => number) | null
   private times = new Float32Array(256)
@@ -102,16 +115,18 @@ class DenoiseProcessor extends AudioWorkletProcessor {
 
       // Non-48k → wire the resamplers if this wasm provides them.
       if (sampleRate !== SAMPLE_RATE) {
-        const rsCreate = ex['df_resampler_create']
+        this.rsCreate = (ex['df_resampler_create'] as typeof this.rsCreate) ?? null
         this.rsPush = (ex['df_resampler_push'] as typeof this.rsPush) ?? null
-        if (rsCreate && this.rsPush) {
-          this.resample = true
-          this.inRs = rsCreate(sampleRate, SAMPLE_RATE)      // device → 48k
-          this.outRs = rsCreate(SAMPLE_RATE, sampleRate)     // 48k → device
+        if (this.rsCreate && this.rsPush) {
           this.rsDevInPtr = malloc(256 * 4)
           this.rsOutPtr = malloc(RS_CAP * 4)
+          this.setUpResamplers()
         } else {
-          this.post({ type: 'error', message: `${init.model} can't resample ${sampleRate}→48000 Hz; needs a 48 kHz AudioContext` })
+          // No resampler in this kernel: dry passthrough (original audio at the
+          // device rate) beats running the net on wrong-rate samples. The main
+          // thread turns this into onError + a passthrough graph.
+          this.unsupportedRate = true
+          this.post({ type: 'error', message: `${init.model} can't resample ${sampleRate}→48000 Hz; passing the original audio through (needs a 48 kHz AudioContext)` })
         }
       }
     } catch (err) {
@@ -125,12 +140,16 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (e: MessageEvent<ToWorklet>) => {
       const d = e.data
       if (d.type === 'enabled') this.enabled = d.value
+      else if (d.type === 'reset') this.reset()
       else if (d.type === 'config') {
         if (this.setBeta && d.postFilterBeta != null) this.setBeta(this.state, d.postFilterBeta)
         if (this.setGruLeak && d.gruLeak != null) this.setGruLeak(this.state, d.gruLeak)
       }
     }
-    this.post({ type: 'ready' })
+    this.post({ type: 'ready', resample: this.resample })
+    // Report early, so callers see the resolved model/rate without waiting ~0.5 s
+    // for the first periodic report (the hop timings are null until then).
+    if (this.state !== 0) this.reportStats()
   }
 
   private instantiate(bytes: ArrayBuffer): WasmExports {
@@ -159,6 +178,31 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   private post(msg: FromWorklet): void { this.port.postMessage(msg) }
+
+  // Bind fresh resampler state for the current device rate. Called at init and
+  // again on `reset` (a new input may arrive at a different rate); the old
+  // resampler state is what keeps a partial input burst and its filter history,
+  // so it must not survive an input swap.
+  private setUpResamplers(): void {
+    if (!this.rsCreate) return
+    this.inRs = this.rsCreate(sampleRate, SAMPLE_RATE)      // device → 48k
+    this.outRs = this.rsCreate(SAMPLE_RATE, sampleRate)     // 48k → device
+    this.resample = true
+  }
+
+  // The input source was replaced: drop everything buffered from the old
+  // source and rebuild the resampler state, so no sample from the old input
+  // (or its old rate) is mixed into the new one. The output ring restarts
+  // 'unprimed', so the next hop is primed from the new input only.
+  private reset(): void {
+    this.inFill = 0
+    this.outRead = 0
+    this.outWrite = 0
+    this.outCount = 0
+    this.primed = false
+    this.repriming = true
+    if (this.resample) this.setUpResamplers()
+  }
 
   // Last line of defence: a non-finite sample must never reach the output (one
   // NaN poisons every downstream node and the encoder). Replaced by silence.
@@ -232,9 +276,10 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     if (!outCh) return true
     const n = outCh.length
 
-    if (!inCh || !this.enabled || this.state === 0) {
-      // Dry passthrough when bypassed OR when the kernel failed to start
-      // (state 0): fail open with the original audio, never silence.
+    if (!inCh || !this.enabled || this.state === 0 || this.unsupportedRate) {
+      // Dry passthrough when bypassed, when the kernel failed to start
+      // (state 0), or when the context rate can't be bridged: fail open with
+      // the original audio, never silence and never wrong-rate samples.
       if (inCh) outCh.set(inCh)
       else outCh.fill(0)
       return true
@@ -254,12 +299,29 @@ class DenoiseProcessor extends AudioWorkletProcessor {
       this.feed48k(inCh, n)
     }
 
-    // Prime one hop, plus one more quantum, before draining. Hops land every
-    // 3.75 quanta (at 48 kHz), so draining from the quantum the first hop lands
-    // in underran once, three quanta later (128 samples of silence mid-onset).
+    // Prime enough hops to absorb the mismatch between hop rate and quantum
+    // rate. A hop is produced every 480 input samples but the ring is drained
+    // 128 at a time, so their phases drift: at a quantum boundary the ring can
+    // hold as little as (hops × HOP) mod 128 of the headroom it had. Two hops
+    // leave ≥ 2·HOP − 128 = 832 samples of slack — several quanta — so draining
+    // never underruns (the old "one hop" primed at exactly 480 and underran 32–96
+    // samples every few quanta, which is what produced the audible dropouts).
+    const PRIME_TARGET = 2 * HOP
     if (!this.primed) {
-      if (this.outCount >= HOP) this.primed = true
-      outCh.fill(0)
+      if (this.outCount >= PRIME_TARGET) {
+        this.primed = true
+        this.repriming = false
+      } else if (!this.repriming) {
+        // First start: stay silent until the ring has enough hops (nothing has
+        // been played yet, so there is nothing to pass through).
+        outCh.fill(0)
+        return true
+      }
+      // A re-prime after a reset falls through to the dry passthrough below, so
+      // the input swap has no silent hole.
+    }
+    if (!this.primed) {
+      outCh.set(inCh)
       return true
     }
     if (this.outCount >= n) {
@@ -269,7 +331,20 @@ class DenoiseProcessor extends AudioWorkletProcessor {
         this.outCount--
       }
     } else {
-      outCh.fill(0)
+      // Underrun: the resampler can deliver fewer output samples than a quantum
+      // (a device↔48 kHz ratio leaves a partial quantum), and a paused/loaded
+      // render thread can starve the ring. Filling silence here was the audible
+      // dropout — pass the current input through for the remaining samples
+      // instead (never silence, never stale samples). Debug builds report it, so
+      // a too-small priming headroom shows up as telemetry, not as a mystery.
+      const have = this.outCount
+      for (let i = 0; i < have; i++) {
+        outCh[i] = this.outRing[this.outRead]
+        this.outRead = (this.outRead + 1) % this.outRing.length
+      }
+      this.outCount = 0
+      outCh.set(inCh.subarray(0, n - have), have)
+      if (this.debug) this.post({ type: 'underrun', missing: n - have })
     }
     return true
   }

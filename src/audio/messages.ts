@@ -8,14 +8,23 @@ import type { DenoiseModel } from './kernels'
 export type ToWorklet =
   | { type: 'config'; postFilterBeta?: number; gruLeak?: number }
   | { type: 'enabled'; value: boolean }   // false = dry passthrough (cheap A/B / bypass)
+  // The input source was replaced (mic switch / track replacement): drop every
+  // buffered sample and rebuild the resampler state, so no sample from the old
+  // input (or its old rate) can leak into the new stream.
+  | { type: 'reset' }
 
 // Processor → main thread.
 export type FromWorklet =
-  | { type: 'ready' }
+  // `resample` says whether this kernel can bridge device-rate ⇄ 48 kHz; false
+  // means a non-48k context makes it fall back to dry passthrough.
+  | { type: 'ready'; resample?: boolean }
   | { type: 'stats'; stats: AudioStats }
   // fatal = the kernel can't run at all (wasm compile/instantiate failed);
   // the processor passes input through and main drops it from the graph.
   | { type: 'error'; message: string; fatal?: boolean }
+  // Debug only: the output ring ran dry (the processor bridged with the input
+  // directly). Not an error — a signal that the priming headroom is too small.
+  | { type: 'underrun'; missing: number }
 
 // Per-hop telemetry, surfaced via EffectsPipeline.getAudioStats().
 export interface AudioStats {

@@ -158,6 +158,15 @@ export class LongpipeDenoiseProcessor implements TrackProcessor<Track.Kind.Audio
 
   async restart({ track, localTrack }: AudioProcessorOptions): Promise<void> {
     this.local = localTrack ?? this.local
+    // A replaced mic (device switch / unmute): keep the same denoiser and output
+    // track, rebuild only the source and reset the resampler state. Falls back
+    // to a full rebuild when the denoiser is gone (destroyed / graph lost).
+    const d = this._denoiser
+    if (d) {
+      await d.setInputTrack(track)
+      this.processedTrack = d.outputTrack
+      return
+    }
     this.build(track)
   }
 

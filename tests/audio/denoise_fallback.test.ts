@@ -57,6 +57,11 @@ describe('suspended AudioContext (autoplay policy)', () => {
     cleanup.push(() => p.destroy(), cam.stop, tone.stop)
     const d = (p as unknown as { denoiser: AudioDenoiser & { ctx: AudioContext } }).denoiser
     const denoisedTrack = p.stream.getAudioTracks()[0]
+    // Another test file running in parallel may already have unlocked audio for
+    // this page (sticky activation propagates to same-origin iframes), in which
+    // case the context starts running. Suspend it explicitly so this test always
+    // exercises the "context can't run" path, whichever order the files run in.
+    if (d.state === 'running') await d.ctx.suspend()
     const e = await log.waitFor('audio-suspended', 3000)
     expect(e.fatal).toBe(false)
     expect(d.state).toBe('suspended')
