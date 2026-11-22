@@ -153,12 +153,16 @@ function restoreAudioSettings() {
   DOM.player.muted = getMuted();
 }
 
+const sessionGuard = NeovidCore.createSessionGuard();
+let detachMediaListeners = null;
+
 const state = {
   currentVideo: null,
   currentVideoType: "url",
   currentSubtitle: "",
   currentSubtitleType: "url",
   currentTitle: "",
+  currentEntryId: null,
   videoLastTime: null,
   totalWatchTime: getWatchTime(),
   accumulatedWatchTime: 0
@@ -253,9 +257,52 @@ function truncateTitle(title, maxLength = CONFIG.LIMITS.TITLE_MAX_LENGTH) {
   return title.length > maxLength ? title.slice(0, maxLength - 3) + "..." : title;
 }
 
+function clearSubtitleTracks() {
+  // Disable any still-showing text tracks, then remove the <track> elements
+  // so no subtitle from a previous session can linger on screen.
+  for (let i = 0; i < DOM.player.textTracks.length; i++) {
+    DOM.player.textTracks[i].mode = "disabled";
+  }
+  DOM.player.querySelectorAll("track").forEach(track => track.remove());
+}
+
+function attachMediaListeners(gen) {
+  // Every callback is bound to this session's generation; events arriving
+  // after a newer session started (queued timeupdate/loadedmetadata/ended)
+  // are discarded and must not write progress, watch time or skip state.
+  const onTimeUpdate = NeovidCore.guardCallback(sessionGuard, gen, () => {
+    updateProgress();
+    updateWatchTime();
+    handleSkipButton();
+  });
+  const onLoadedMetadata = NeovidCore.guardCallback(sessionGuard, gen, loadPlayerTime);
+  const onEnded = NeovidCore.guardCallback(sessionGuard, gen, () => {
+    DOM.skipButton.style.display = "none";
+  });
+  DOM.player.addEventListener("timeupdate", onTimeUpdate);
+  DOM.player.addEventListener("loadedmetadata", onLoadedMetadata);
+  DOM.player.addEventListener("ended", onEnded);
+  return () => {
+    DOM.player.removeEventListener("timeupdate", onTimeUpdate);
+    DOM.player.removeEventListener("loadedmetadata", onLoadedMetadata);
+    DOM.player.removeEventListener("ended", onEnded);
+  };
+}
+
 function playVideo(video, subtitle = "", title = null, videoType = "url", subtitleType = "url") {
+  // A source switch is a session switch: bump the generation first so any
+  // stale async callback from the previous session becomes a no-op.
+  const gen = sessionGuard.begin();
+
+  if (detachMediaListeners) {
+    detachMediaListeners();
+    detachMediaListeners = null;
+  }
   revokeCurrentMedia();
+  clearSubtitleTracks();
   DOM.player.innerHTML = "";
+  DOM.skipButton.style.display = "none";
+  state.videoLastTime = null;
 
   const sourceElement = document.createElement("source");
   sourceElement.src = video;
@@ -269,8 +316,10 @@ function playVideo(video, subtitle = "", title = null, videoType = "url", subtit
     track.label = "English";
     track.default = true;
     DOM.player.appendChild(track);
-    DOM.player.textTracks[0].mode = "showing";
+    track.track.mode = "showing";
   }
+
+  detachMediaListeners = attachMediaListeners(gen);
 
   DOM.player.load();
   DOM.player.play().catch(() => {});
@@ -280,35 +329,31 @@ function playVideo(video, subtitle = "", title = null, videoType = "url", subtit
   state.currentTitle = title || (videoType==="url"? video.split("/").pop(): title);
   state.currentSubtitle = subtitle;
   state.currentSubtitleType = subtitleType;
+  state.currentEntryId = NeovidCore.getEntryId({
+    title: state.currentTitle,
+    video,
+    videoType
+  });
   updateDownloadButtons();
 }
 
 
 function saveRecent(title, video, videoType, subtitle="", subtitleType="url") {
-  let recent = getRecent();
-  let progress = 0;
-  const idx = recent.findIndex(item => item.title===title);
-  if(idx!==-1) {
-    progress = recent[idx].progress;
-  }
-
-  recent = recent.filter(item => !(item.title===title));
-
-  recent.unshift({title, video, videoType, subtitle, subtitleType, progress});
-  if(recent.length>CONFIG.LIMITS.RECENT_SIZE) recent = recent.slice(0,CONFIG.LIMITS.RECENT_SIZE);
-
+  const recent = NeovidCore.upsertRecent(
+    getRecent(),
+    { title, video, videoType, subtitle, subtitleType },
+    CONFIG.LIMITS.RECENT_SIZE
+  );
   setRecent(recent);
   renderRecent();
 }
 
-function removeRecent(title) {
+function removeRecent(id) {
   showConfirm(CONFIG.MESSAGES.CONFIRM_REMOVE, {
     confirmText: "Remove"
   }).then((result) => {
       if (result.isConfirmed) {
-        let recent = getRecent();
-        recent = recent.filter(item => !(item.title===title));
-        setRecent(recent);
+        setRecent(NeovidCore.removeRecentById(getRecent(), id));
         renderRecent();
       }
     });
@@ -325,10 +370,10 @@ function removeAllVideos() {
 }
 
 function updateProgress() {
-  if(!state.currentVideo || !DOM.player.duration) return;
+  if(!state.currentEntryId || !DOM.player.duration) return;
   const percent = Math.min(100, Math.round((DOM.player.currentTime/DOM.player.duration)*100));
   let recent = getRecent();
-  const idx = recent.findIndex(item => item.video===state.currentVideo);
+  const idx = NeovidCore.findRecentIndex(recent, state.currentEntryId);
   if(idx!==-1) {
     recent[idx].progress = percent;
     setRecent(recent);
@@ -337,13 +382,13 @@ function updateProgress() {
 }
 
 function loadPlayerTime() {
-  if(!state.currentVideo || !DOM.player.duration) return;
+  if(!state.currentEntryId || !DOM.player.duration) return;
   let recent = getRecent();
-  const idx = recent.findIndex(item => item.video===state.currentVideo);
+  const idx = NeovidCore.findRecentIndex(recent, state.currentEntryId);
   if(idx!==-1) {
     const currentTime = (recent[idx].progress / 100) * DOM.player.duration
     DOM.player.currentTime = currentTime;
-    
+
   }
 }
 
@@ -385,7 +430,7 @@ function createRecentItem(item, maxLimit) {
 
 function attachRecentEvents(item, spanTitle, spanRemove) {
   spanRemove.addEventListener("click", () => {
-    removeRecent(item.title);
+    removeRecent(NeovidCore.getEntryId(item));
   });
 
   spanTitle.addEventListener("click", () => {
@@ -511,15 +556,17 @@ DOM.watchLaterButton.addEventListener("click", () => {
     data.subtitleSrc,
     data.subtitleType
   );
+  // The stored blob: URL is only an identifier and is never loaded again
+  // (local entries must be reselected to play), so release it immediately.
+  if (data.videoType === "local") {
+    URL.revokeObjectURL(data.videoSrc);
+  }
+  if (data.subtitleType === "local" && data.subtitleSrc) {
+    URL.revokeObjectURL(data.subtitleSrc);
+  }
   showAlert(CONFIG.MESSAGES.WATCH_LATER_ADDED, {icon: "success"});
 });
 
-DOM.player.addEventListener("timeupdate", () => {
-  updateProgress();
-  updateWatchTime();
-  handleSkipButton();
-});
-DOM.player.addEventListener("loadedmetadata", loadPlayerTime);
 window.addEventListener("DOMContentLoaded", () => {
   DOM.watchTime.textContent = formatTime(state.totalWatchTime);
   loadFromQuery();
@@ -527,9 +574,6 @@ window.addEventListener("DOMContentLoaded", () => {
   updateDownloadButtons();
   updateResumeButton();
   restoreAudioSettings();
-});
-DOM.player.addEventListener("ended", () => {
-  DOM.skipButton.style.display = "none";
 });
 DOM.player.addEventListener("volumechange", () => {
   setVolume(DOM.player.volume);
@@ -594,22 +638,11 @@ DOM.recentFile.addEventListener("change", () => {
   reader.onload = () => {
     try {
       const parsed = JSON.parse(reader.result);
-      if (!Array.isArray(parsed)) throw new Error();
-      const isValid = parsed.every(item =>
-        item &&
-        typeof item === "object" &&
-        typeof item.title === "string" &&
-        typeof item.video === "string" &&
-        (item.videoType === "url" || item.videoType === "local") &&
-        (item.subtitle === "" || typeof item.subtitle === "string") &&
-        (item.subtitleType === "url" || item.subtitleType === "local") &&
-        typeof item.progress === "number" &&
-        item.progress >= 0 &&
-        item.progress <= 100
-      );
-      if (!isValid) throw new Error();
-      setRecent(parsed);
+      const normalized = NeovidCore.normalizeImport(parsed, CONFIG.LIMITS.RECENT_SIZE);
+      if (!normalized) throw new Error();
+      setRecent(normalized);
       renderRecent();
+      updateResumeButton();
       showAlert(CONFIG.MESSAGES.IMPORT_SUCCESS, {icon: "success"});
     } catch {
       showAlert(CONFIG.MESSAGES.IMPORT_ERROR, {icon: "error"});

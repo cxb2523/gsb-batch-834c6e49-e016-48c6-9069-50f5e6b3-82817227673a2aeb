@@ -3,6 +3,7 @@ const appShell = [
   "./",
   "index.html",
   "style.css",
+  "player-core.js",
   "script.js",
   "site.webmanifest",
   "assets/apple-touch-icon.png",
