@@ -398,14 +398,16 @@ def insert_beside(tree: Tree, target: Hashable, key: Hashable, aspects: dict) ->
             insert_beside(tree[2], target, key, aspects))
 
 
-def adapt(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
-          width: float, height: float) -> tuple[Tree, dict] | None:
-    """Turn the previous layout into one over ``keys`` with minimal disruption.
+def adapt_pairs(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
+                width: float, height: float):
+    """Like :func:`adapt`, but also report which newcomer takes over each
+    departed cell (``(gone_key, successor_key)``), so the caller can hand the
+    old cell's player straight to its replacement.
 
-    Each departed tile is taken over by the newcomer closest in shape, with
-    its cell stretched to match the old cell so neighbours stay put.  Any
-    remaining departures are removed and remaining newcomers split the
-    biggest tiles.  Returns ``(tree, stretch)``.
+    Matching uses the tree-space cell shape (video aspect times its stretch);
+    keeping that fixed means re-placing the swapped tree reproduces every
+    untouched rectangle.  For pixel-exact reuse without re-placement see
+    :func:`takeover_layout`.
     """
     if prev is None or prev.tree is None:
         return None
@@ -414,6 +416,7 @@ def adapt(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
     new = [k for k in keys if k not in set(old)]
     stretch = {k: v for k, v in prev.stretch.items() if k in aspects}
     tree = prev.tree
+    pairs: list[tuple[Hashable, Hashable]] = []
     for g in list(gone):
         if not new:
             break
@@ -421,6 +424,7 @@ def adapt(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
         best = min(new, key=lambda n: abs(math.log(aspects[n] / old_cell)))
         tree = replace_leaf(tree, g, best)
         stretch[best] = min(STRETCHES, key=lambda f: abs(math.log(aspects[best] * f / old_cell)))
+        pairs.append((g, best))
         new.remove(best)
         gone.remove(g)
     for g in gone:
@@ -433,7 +437,64 @@ def adapt(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
         rects = place(tree, shapes, width, height)
         biggest = max(rects, key=lambda k: rects[k].area)
         tree = insert_beside(tree, biggest, n, shapes)
-    return tree, {k: v for k, v in stretch.items() if v != 1.0}
+    return tree, {k: v for k, v in stretch.items() if v != 1.0}, pairs
+
+
+def adapt(prev: "Layout", keys: Sequence[Hashable], aspects: dict,
+          width: float, height: float) -> tuple[Tree, dict] | None:
+    """Turn the previous layout into one over ``keys`` with minimal disruption.
+
+    Each departed tile is taken over by the newcomer closest in shape, with
+    its cell stretched to match the old cell so neighbours stay put.  Any
+    remaining departures are removed and remaining newcomers split the
+    biggest tiles.  Returns ``(tree, stretch)``.
+    """
+    out = adapt_pairs(prev, keys, aspects, width, height)
+    if out is None:
+        return None
+    tree, stretch, _pairs = out
+    return tree, stretch
+
+
+def takeover_layout(prev: "Layout", pairs: Sequence[tuple[Hashable, Hashable]],
+                    aspects: dict, width: float, height: float) -> "Layout | None":
+    """Build a layout where each newcomer in ``pairs`` inherits its departed
+    cell, keeping every other rectangle pixel-identical to ``prev``.
+
+    The previous tree only has its leaves swapped; the newcomer's cell is then
+    stretched to the *exact* rectangle its predecessor occupied (recorded in
+    ``prev.rects``), so neighbours never move and the wall keeps its border.
+    """
+    if prev is None or prev.tree is None:
+        return None
+    tree = prev.tree
+    stretch = {k: v for k, v in prev.stretch.items() if k in aspects}
+    placed = prev.rects or {}
+    # Give each newcomer the precise on-screen shape of the cell it inherits.
+    cell_shapes = dict(placed)
+    for gone_key, new_key in pairs:
+        old_rect = placed.get(gone_key)
+        tree = replace_leaf(tree, gone_key, new_key)
+        if old_rect is not None and old_rect.h:
+            cell_shapes[new_key] = Rect(old_rect.x, old_rect.y, old_rect.w, old_rect.h)
+            target = old_rect.w / old_rect.h
+            stretch[new_key] = min(STRETCHES,
+                                   key=lambda f: abs(math.log(aspects[new_key] * f / target)))
+    rects: dict = {}
+    for key in leaves(tree):
+        if key in cell_shapes:
+            rects[key] = cell_shapes[key]       # inherited, down to the pixel
+        else:
+            rects[key] = placed[key]
+    # Cell coverage is computed against each cell's real on-screen shape.
+    cell_asp = {k: (r.w / r.h if r.h else aspects[k]) for k, r in rects.items()}
+    covers = {k: coverage(cell_asp[k], aspects[k], prev.crop) for k in rects}
+    fracs = {k: (rects[k].area / (width * height)) * covers[k] for k in rects}
+    return Layout(tree=tree, rects=rects, fill=sum(fracs.values()),
+                  min_area=min(fracs.values()) if fracs else 1.0,
+                  stretch={k: v for k, v in stretch.items() if v != 1.0},
+                  aspects=aspects, valid=True, width=width, height=height,
+                  crop=prev.crop, widen=prev.widen)
 
 
 # --------------------------------------------------------------------------

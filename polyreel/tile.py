@@ -16,6 +16,9 @@ from .mpvlib import mpv
 from .perf import Sample
 from .profiler import PROFILER
 
+# Tests run without libmpv; keep a stand-in for the one error type we match.
+_OverflowError = getattr(mpv, "EventOverflowError", type("EventOverflowError", (Exception,), {}))
+
 ANIM_MS = 260
 # Properties watched continuously; they change rarely.  Position and
 # dropped-frame counts change with nearly every frame, and a Python callback
@@ -61,6 +64,7 @@ class VideoTile(QWidget):
     shape_changed = Signal(object, float)
     ready = Signal(object)          # the player has started
     retired = Signal(object)        # the player has been shut down
+    stopped = Signal(object)        # the player has carried out a stop
     _player_started = Signal()      # internal: from the starter thread
 
     def __init__(self, parent: QWidget, hwdec: str = "auto-safe") -> None:
@@ -93,6 +97,7 @@ class VideoTile(QWidget):
                        "frame-drop-count": 0, "decoder-frame-drop-count": 0,
                        "container-fps": None}
         self._file = 0           # bumped per file, so late answers about the last one are ignored
+        self._file_open = False  # a file is loaded (or loading) and has not been stopped
         self._poll_sent = 0.0    # when the last poll went out
         self._poll_out = False   # a poll is waiting for its answer
         self.polled_at = 0.0     # when the last answer about this file arrived
@@ -186,6 +191,8 @@ class VideoTile(QWidget):
                 if kwargs.get("callback"):
                     kwargs["callback"](None, None)
             self._stops_done = self._stops_sent
+            self._file_open = False
+            self.stopped.emit(self)
             if self.item is not None:
                 self.failed.emit(self, "player could not start")
         else:
@@ -296,7 +303,7 @@ class VideoTile(QWidget):
 
     def _on_poll(self, file: int, error, result) -> None:   # event thread
         self._poll_out = False
-        if isinstance(error, mpv.EventOverflowError):
+        if isinstance(error, _OverflowError):
             PROFILER.log("player", f"#{self.num} message queue overflowed")
         if error is not None or file != self._file or not isinstance(result, str):
             return
@@ -318,6 +325,13 @@ class VideoTile(QWidget):
         self._command("set", name, str(value))
 
     def load(self, item, start: float = 0.0, loop: bool = False, hwdec: str | None = None) -> None:
+        # A reused player must have fully stopped its old file first: loading
+        # while a stop is still in flight (or before the previous file was
+        # stopped at all) would interleave the two files and leave the old
+        # file's counters, duration and volume on this one.
+        if self._file_open or not self.is_stopped:
+            raise RuntimeError(f"player #{self.num} cannot load: previous file has not stopped")
+        self._file_open = True
         self.item = item
         self._active = False
         self._paused = False
@@ -325,40 +339,63 @@ class VideoTile(QWidget):
             self._set("hwdec", hwdec)
         self._set("start", f"{start:.3f}" if start > 0 else "none")
         self._set("loop-file", "inf" if loop else "no")
-        self.set_volume(100)  # a reused tile starts at full volume again
+        # Start every file from a clean slate: nothing of the previous file's
+        # volume, mute, duration or dropped-frame counters carries over.
         self.keep_sound = False
+        self.user_muted = False
+        self._muted = True
+        self.set_volume(100)
+        self.set_muted(True)
         self._set("pause", False)
         self._file += 1
+        self._poll_sent = 0.0
+        self._poll_out = False
         self.polled_at = 0.0
         self._load_sent = time.monotonic()
         self._media_logged = False
-        self._state.update({"time-pos": 0.0, "duration": item.duration or 0.0,
-                            "frame-drop-count": 0, "decoder-frame-drop-count": 0})
+        self._state.update({"time-pos": 0.0, "duration": 0.0, "volume": 100.0,
+                            "frame-drop-count": 0, "decoder-frame-drop-count": 0,
+                            "container-fps": None})
         self._command("loadfile", item.path)
 
-    def stop(self) -> None:
+    def stop(self, hide: bool = True) -> None:
+        """Release the current file.  Idempotent: a stop already in flight, or
+        a completed stop with no file loaded since, does nothing, so the same
+        player can never be released twice.  With ``hide=False`` the last frame
+        stays visible in the cell until the successor takes it over."""
+        if self._stops_sent > self._stops_done:
+            return                       # a stop is still being carried out
+        if not self._file_open and self.item is None:
+            return                       # already stopped, nothing loaded since
+        self._file_open = False
         self.item = None
         self._active = False
         if self._anim:
             self._anim.stop()
         self._file += 1
+        self._poll_out = False
         self.polled_at = 0.0                  # nothing left over from the last file
-        self._state["time-pos"] = 0.0
+        self._state.update({"time-pos": 0.0, "duration": 0.0,
+                            "frame-drop-count": 0, "decoder-frame-drop-count": 0,
+                            "container-fps": None})
         self._load_sent = 0.0
         self._stop_sent = time.monotonic()
         self._stops_sent += 1
         n = self._stops_sent
         self._command("stop", callback=lambda e, r: self._stop_done(n, e))
-        self.hide()
+        if hide:
+            self.hide()
 
     def _stop_done(self, n: int, error) -> None:   # event thread
         # python-mpv reports a message-queue overflow to every waiting
         # command; that isn't the answer, which still follows.
-        if not isinstance(error, mpv.EventOverflowError):
+        if not isinstance(error, _OverflowError):
             self._stops_done = max(self._stops_done, n)
             took = time.monotonic() - self._stop_sent
             if took > 0.2:
                 PROFILER.log("player", f"#{self.num} took {took:.2f}s to stop")
+            if n == self._stops_sent:
+                self.stopped.emit(self)
 
     @property
     def load_started(self) -> float:
@@ -388,6 +425,7 @@ class VideoTile(QWidget):
 
     def shutdown(self, wait: float = 2.0) -> None:
         """Stop the player for good (any thread)."""
+        self._file_open = False
         self.item = None
         self._started.wait(wait)
         t0 = time.monotonic()

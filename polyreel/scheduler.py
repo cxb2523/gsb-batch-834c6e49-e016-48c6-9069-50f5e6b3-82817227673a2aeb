@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 
 from . import layout
-from .layout import Layout, solve
+from .layout import Layout, takeover_layout, solve
 from .playlist import Item
 
 DEFAULT_ASPECT = 16 / 9
@@ -24,6 +25,19 @@ class Plan:
     demote: list[Item] = field(default_factory=list)  # playing -> queue (no longer fit)
     layout: Layout = field(default_factory=lambda: Layout(tree=None))
     more: bool = False   # stopped early: plan again to fill the remaining slots
+
+
+@dataclass
+class HandoverPlan:
+    """A stable cell takeover without a full re-solve.
+
+    ``takeovers`` pairs each ended item with the queued item that inherits its
+    cell, in take-over order; ``layout`` is the previous arrangement with only
+    those leaves swapped.  ``None`` from :func:`handover` means the limits
+    would be broken and the caller must fall back to a full :func:`plan`.
+    """
+    takeovers: list[tuple[Item, Item]] = field(default_factory=list)
+    layout: Layout | None = None
 
 
 def _items(items: list[Item]) -> list[tuple[int, float]]:
@@ -121,3 +135,86 @@ def _most_that_fit(current: list[Item], extra: list[Item], width: float, height:
         else:
             hi = mid - 1
     return lo if lo or current else min(1, len(extra))
+
+
+def _candidate_pool(queued: list[Item], lookahead: int) -> list[Item]:
+    """Playable queued items, honoring strict queue order (lookahead == 1):
+    then an unprobed head blocks everything behind it."""
+    if lookahead <= 1:
+        pool = []
+        for it in queued:
+            if not it.probed:
+                break
+            if not it.error:
+                pool.append(it)
+        return pool
+    return [it for it in queued if it.probed and not it.error]
+
+
+def handover(playing: list[Item], queued: list[Item], ended: list[Item],
+             width: float, height: float, max_streams: int, min_area: float,
+             prev: Layout | None, lookahead: int = 1, crop: float = 0.0) -> HandoverPlan | None:
+    """Try to replace every ended video in place, keeping the old arrangement.
+
+    Each ended cell is inherited by the available queued video whose shape is
+    closest to that cell.  The arrangement is built with :func:`layout.adapt`,
+    so every tile that is not replaced keeps its exact rectangle.  If no
+    successor exists, the concurrency cap would be exceeded, or the adapted
+    arrangement violates the smallest-size limit, ``None`` is returned and the
+    caller re-solves the whole wall with :func:`plan`.
+    """
+    if prev is None or prev.tree is None or not ended:
+        return None
+    max_streams = max(1, max_streams)
+    ended_ids = {it.id for it in ended}
+    survivors = [it for it in playing if it.id not in ended_ids]
+    # Never more videos than the cap, and never more cells than there are now.
+    slots = min(len(ended_ids), max_streams - len(survivors))
+    if slots <= 0:
+        return None
+    pool = _candidate_pool(queued, lookahead)
+    if len(pool) < slots:
+        return None                       # an empty cell would remain: re-solve
+    # Strict mode takes the head(s) of the queue.  Looser modes may reach past
+    # them for a shape that fits the free cell better, so offer the look-ahead
+    # window (at least one candidate per slot).
+    window = max(slots, lookahead) if lookahead > 1 else slots
+    candidates = pool[:window]
+    aspects = {it.id: it.aspect or DEFAULT_ASPECT for it in survivors + candidates}
+    # Choose each successor by the cell's real on-screen shape (including the
+    # previous layout's widening), so a portrait cell keeps a portrait video.
+    placed = prev.rects or {}
+    available = list(candidates)
+    pairs: list[tuple[int, int]] = []
+    for old in ended:
+        if len(pairs) >= slots or not available:
+            break
+        old_rect = placed.get(old.id)
+        cell = (old_rect.w / old_rect.h if old_rect is not None and old_rect.h
+                else (old.aspect or DEFAULT_ASPECT))
+        best = min(available, key=lambda it: abs(math.log((it.aspect or DEFAULT_ASPECT) / cell)))
+        pairs.append((old.id, best.id))
+        available.remove(best)
+    chosen = [n for _g, n in pairs]
+    if len(set(chosen)) != slots:
+        return None
+    # Build a pixel-stable layout over exactly the survivors and successors.
+    final_keys = [it.id for it in survivors] + chosen
+    final_aspects = {k: aspects[k] for k in final_keys}
+    out_layout = takeover_layout(prev, pairs, final_aspects, width, height)
+    if out_layout is None or set(out_layout.rects) != set(final_keys):
+        return None
+    if out_layout.min_area + 1e-9 < min_area:
+        return None                       # a cell would be too small: re-solve
+    by_id_local = {it.id: it for it in playing + queued}
+    takeovers: list[tuple[Item, Item]] = []
+    used: set[int] = set()
+    for old_id, new_id in pairs:
+        old, new = by_id_local.get(old_id), by_id_local.get(new_id)
+        if old is None or new is None or new.id in used:
+            return None
+        takeovers.append((old, new))
+        used.add(new.id)
+    if len(takeovers) != slots:
+        return None
+    return HandoverPlan(takeovers=takeovers, layout=out_layout)

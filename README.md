@@ -152,7 +152,11 @@ To start over as on a new computer, delete Polyreel's settings
 ```
 polyreel/
   layout.py     aspect-preserving packing (pure Python, unit tested)
-  scheduler.py  which videos start / wait / get bumped (pure Python, unit tested)
+  scheduler.py  which videos start / wait / get bumped, and stable cell
+                takeovers when a video ends (pure Python, unit tested)
+  handoff.py    cell/player lifecycle for a takeover: one owner per cell,
+                loadfile only after the reused player reports stopped
+                (pure Python, unit tested with injected fake players)
   playlist.py   played / playing / queued lists
   perf.py       frame-drop monitor, traffic-light levels, benchmark plan
   profiler.py   optional performance log for troubleshooting
@@ -160,7 +164,7 @@ polyreel/
   probe.py      background probing of each file's shape and length
   ui.py         playlist drawer, traffic light and close-button widgets
   app.py        main window tying it together
-tests/          pytest suite for the pure-Python parts
+tests/          pytest suite for the pure-Python parts and the takeover flow
 ```
 
 Run the tests with `pip install pytest && python -m pytest`.

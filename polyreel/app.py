@@ -16,11 +16,12 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow,
                                QMenu, QMessageBox, QSystemTrayIcon, QToolTip, QWidget)
 
 from . import layout as L
+from .handoff import Handoff
 from .perf import IDLE, BenchmarkPlan, DropCurve, PerfMonitor, frames_lost
 from .playlist import PLAYABLE_EXTENSIONS, Item, Playlists, expand_paths
 from .profiler import PROFILER, log_folder, system_info
 from .probe import NOT_VIDEO, Prober
-from .scheduler import DEFAULT_ASPECT, plan
+from .scheduler import DEFAULT_ASPECT, handover, plan
 from .settings import SOUND_MODES, BenchmarkResultsDialog, Settings, SettingsDialog
 from .tile import VideoTile, take_retiring
 from .ui import BAR_HEIGHT, CloseButton, Drawer, TileControls, TrafficLight, light_icon
@@ -95,13 +96,17 @@ class MainWindow(QMainWindow):
         self.stage = Stage(self)
         self.setCentralWidget(self.stage)
 
-        self.tiles: dict[int, VideoTile] = {}   # item id -> tile
-        self.pool: list[VideoTile] = []         # idle tiles ready for reuse
+        # Tile lifecycle is owned by the handover coordinator: active cells,
+        # reserved cells (their player is stopping while a successor waits),
+        # the stopping queue and the reusable stopped-player pool.
+        self.handoff = Handoff()
         self.all_tiles: list[VideoTile] = []
+        self._tile_factory = self._new_tile
         self.layout_: L.Layout | None = None
         self.focus_tile: VideoTile | None = None
         self.paused_all = False
         self.bench: BenchState | None = None
+        self._ended: list[Item] = []          # files whose cells await a takeover
 
         self.message = QLabel(self.stage)
         self.message.setAttribute(Qt.WA_DontCreateNativeAncestors)
@@ -145,10 +150,11 @@ class MainWindow(QMainWindow):
         self._planned.connect(self._apply_plan)
         self._beat_timer = QTimer(self, interval=100)   # performance log: is the window responsive?
         self._beat_timer.timeout.connect(PROFILER.beat)
-        self._to_load: list[tuple[VideoTile, Item]] = []   # placed, waiting to start
-        self._loading: list[VideoTile] = []                # opening, not yet playing
+        # Tiles whose file is opening (loadfile sent, not playing yet); they
+        # keep a load slot until playing or START_GIVE_UP seconds pass.
+        self._loading: list[VideoTile] = []
         self._load_timer = QTimer(self, interval=50)
-        self._load_timer.timeout.connect(self._load_next)
+        self._load_timer.timeout.connect(self._load_tick)
 
         self.tray: QSystemTrayIcon | None = None
         self._setup_tray()
@@ -327,17 +333,28 @@ class MainWindow(QMainWindow):
     def schedule(self) -> None:
         """Bump what no longer fits, start what does, and lay everything out.
 
-        Working out the plan can take a moment with a big wall, so it runs on
-        a background thread and is applied when ready (unless things changed
+        When one or more videos have just ended, first try a stable takeover:
+        the next queued videos inherit the ended players' cells, zoom and
+        position straight away (the previous arrangement is only edited where
+        the cells change hands).  Only if that would break the smallest-size
+        limit or the concurrency cap do we fall back to a full re-solve.
+
+        Working out a full plan can take a moment with a big wall, so it runs
+        on a background thread and is applied when ready (unless things changed
         in the meantime, in which case it is worked out again)."""
         if self.bench or self.focus_tile or self._results_open or self._bench_pending:
+            return
+        if self._try_fast_handover():
             return
         if self._planning:
             self._replan = True
             return
         s = self.settings
         w, h = self.stage_size()
-        args = (list(self.pl.playing), list(self.pl.queued), w, h, s.max_streams, s.min_area, s.lookahead)
+        # Ended items keep their cell until the takeover settles; the planner
+        # only decides the fate of the videos still actually playing.
+        playing = [it for it in self.pl.playing if it not in self._ended]
+        args = (playing, list(self.pl.queued), w, h, s.max_streams, s.min_area, s.lookahead)
         kwargs = dict(prev=self.layout_, crop=s.crop)
         inputs = self._plan_inputs()
         self._planning, self._replan = True, False
@@ -357,10 +374,58 @@ class MainWindow(QMainWindow):
             self._planned.emit((p, inputs))
         threading.Thread(target=work, daemon=True, name="plan").start()
 
+    def _try_fast_handover(self) -> bool:
+        """Stable takeover path.  Returns True if the wall was handled without
+        a full re-solve (even if the successor is still waiting for its player
+        to stop); False if a full plan is needed."""
+        if not self._ended or self._planning:
+            return False
+        s = self.settings
+        w, h = self.stage_size()
+        hp = handover(list(self.pl.playing), list(self.pl.queued), list(self._ended),
+                      w, h, s.max_streams, s.min_area, self.layout_, s.lookahead, s.crop)
+        if hp is None:
+            return False
+        self.handoff.begin_plan()
+        takeovers = []
+        for old, new in hp.takeovers:
+            tile = self.handoff.take_reserved(old.id)
+            if tile is None:                 # its cell was lost meanwhile: re-solve
+                self.handoff.finish_plan(self.handoff.active)
+                return False
+            takeovers.append((tile, old, new))
+        # Commit the whole batch at once so a cell is never owned twice.
+        for tile, old, new in takeovers:
+            self.pl.finish(old)
+            self.pl.start(new)
+            # The successor inherits the cell now; its loadfile waits in a job
+            # until the reused player reports it has stopped.
+            self.handoff.takeover(tile, new, new.resume_pos)
+            if old in self._ended:
+                self._ended.remove(old)
+        self.layout_ = hp.layout
+        self.handoff.finish_plan(self.handoff.active)
+        self._apply_layout(animate=True)
+        self._load_tick()
+        PROFILER.log("wall", f"stable takeover: {len(takeovers)} cell(s) reused")
+        self._after_plan()
+        return True
+
+    def _after_plan(self) -> None:
+        """Bookkeeping shared by the fast path and a full plan being applied."""
+        s = self.settings
+        # Endless playback: once nothing is left to start, replay what has played.
+        if (s.endless and self.pl.played
+                and not any(it.probed and not it.error for it in self.pl.queued)):
+            if self.pl.recycle_played():
+                self.schedule_soon()
+        self._update_message()
+
     def _plan_inputs(self) -> tuple:
         """What a plan depends on, to tell whether it is still current."""
         s = self.settings
-        return (tuple(it.id for it in self.pl.playing), tuple(it.id for it in self.pl.queued),
+        return (tuple(it.id for it in self.pl.playing if it not in self._ended),
+                tuple(it.id for it in self.pl.queued),
                 self.stage_size(), s.max_streams, s.min_area, s.lookahead, s.crop)
 
     def _apply_plan(self, result: tuple) -> None:
@@ -375,75 +440,110 @@ class MainWindow(QMainWindow):
             self.schedule_soon()
             return
         s = self.settings
+        self.handoff.begin_plan()
+        # Videos the fast path could not take over: the re-plan decided the
+        # wall without them, so close out their cells and release the players.
+        for it in list(self._ended):
+            tile = self.handoff.take_reserved(it.id)
+            if tile is not None:
+                self.handoff.settle(tile)
+            self.pl.finish(it)
+            if it in self._ended:
+                self._ended.remove(it)
         for it in p.demote:
-            tile = self.tiles.pop(it.id)
-            pos = tile.position()
-            self._release(tile)
+            # Keep the exact playback position so it resumes there when the
+            # wall has room for it again.
+            tile = self.handoff.owner.get(it.id)
+            pos = tile.position() if tile is not None else it.resume_pos
+            self.handoff.cancel_item(it)
             self.pl.demote(it, pos)
         for it in p.start:
             self.pl.start(it)
-            tile = self._acquire()
-            self.tiles[it.id] = tile
+            tile = self.handoff.acquire(self._tile_factory)
+            self.handoff.place(tile, it, it.resume_pos)
             tile.user_muted = s.sound == "silent"   # new videos start muted in silent mode
-            self._to_load.append((tile, it))
-        self._load_next()
         self.layout_ = p.layout
+        self.handoff.finish_plan(self.handoff.active)
         self._apply_layout(animate=True)
+        self._load_tick()
 
-        # Endless playback: once nothing is left to start, replay what has played.
-        if (s.endless and self.pl.played
-                and not any(it.probed and not it.error for it in self.pl.queued)):
-            if self.pl.recycle_played():
-                self.schedule_soon()
         if p.more:
             self.schedule_soon()
-        self._update_message()
+        self._after_plan()
 
-    def _load_next(self) -> None:
-        """Start placed videos a few at a time.  Opening a file (and setting
-        up its decoder) takes a moment, and opening dozens at once makes
-        every one wait for the slowest, especially from a slow disk; this
-        way the first ones appear straight away and the rest follow."""
+    def _load_tick(self) -> None:
+        """Start placed videos a few at a time, but only once the player
+        destined for each cell has reported that it has stopped.  Opening a
+        file (and setting up its decoder) takes a moment, and opening dozens
+        at once makes every one wait for the slowest, especially from a slow
+        disk; this way the first ones appear straight away and the rest follow
+        once their players are free."""
         now = time.monotonic()
         self._loading = [t for t in self._loading if t.item is not None and not t.is_playing
                          and now - t.load_started < START_GIVE_UP]
         if self.bench or self.focus_tile or self._results_open:
             self._load_timer.start()
             return
+        self.handoff.promote_pool()
         started = []
-        while self._to_load and len(self._loading) < START_PARALLEL:
-            tile, it = self._to_load.pop(0)
-            if self.tiles.get(it.id) is not tile:
-                continue                  # skipped or bumped before it started
-            tile.load(it, start=it.resume_pos, hwdec=self.settings.hwdec)
+        while len(self._loading) < START_PARALLEL:
+            job = self.handoff.take_job()
+            if job is None:
+                break
+            tile, it = job.tile, job.item
+            # take_job already verified the player stopped; loading here also
+            # clears the previous file's duration, drop counters and volume.
+            tile.load(it, start=job.start, hwdec=self.settings.hwdec)
             tile.set_paused(self.paused_all)
             self._loading.append(tile)
             started.append(tile)
         if started:
             PROFILER.log("wall", f"starting {len(started)} video(s) "
                                  f"(players #{', #'.join(str(t.num) for t in started)}); "
-                                 f"{len(self._loading)} opening, {len(self._to_load)} waiting")
-        if self._to_load:
-            self._load_timer.start()
+                                 f"{len(self._loading)} opening, {len(self.handoff.jobs)} waiting")
+        if self.handoff.jobs:
+            self._load_timer.start()        # a player is still stopping
         else:
             self._load_timer.stop()
 
-    def _acquire(self) -> VideoTile:
-        if self.pool:
-            return self.pool.pop()
+    def _new_tile(self) -> VideoTile:
         tile = VideoTile(self.stage, hwdec=self.settings.hwdec)
         tile.double_clicked.connect(self._tile_double_clicked)
         tile.right_clicked.connect(lambda t: self.show_menu(QCursor.pos(), t))
         tile.finished.connect(self._tile_finished)
         tile.failed.connect(self._tile_failed)
         tile.shape_changed.connect(self._tile_shape)
+        tile.stopped.connect(self._tile_stopped)
         self.all_tiles.append(tile)
         return tile
 
+    def _tile_stopped(self, tile: VideoTile) -> None:
+        """A player finished stopping: its successor may now load, and any
+        detached player rejoins the reusable pool."""
+        self.handoff.promote_pool()
+        self._load_tick()
+
     def _release(self, tile: VideoTile) -> None:
-        tile.stop()
+        """Detach a tile from its cell and return it to the pool once its
+        player has really stopped (idempotent: never twice)."""
+        self.handoff.settle(tile)
         tile.set_muted(True)
-        self.pool.append(tile)
+
+    @property
+    def tiles(self) -> dict[int, VideoTile]:
+        """Item id -> tile currently owning that cell (including reserved
+        cells whose player is stopping and ones awaiting their first load)."""
+        return {item.id: tile for tile, item in self.handoff.active.items()}
+
+    def _tile_item(self, tile: VideoTile) -> Item | None:
+        """The item whose cell ``tile`` holds, even while its player is
+        stopping and the tile itself has already released the file."""
+        item = tile.item
+        return item if item is not None else self.handoff.item_for(tile)
+
+    @property
+    def pool(self) -> list[VideoTile]:
+        return self.handoff.pool
 
     def _rect_for(self, r: L.Rect, sx: float = 1.0, sy: float = 1.0) -> QRect:
         g = self.settings.gap / 2
@@ -467,7 +567,8 @@ class MainWindow(QMainWindow):
 
     def _place_tile(self, tile: VideoTile, rect: QRect, animate: bool) -> None:
         """Move a tile and zoom its video to fill the cell (within the crop limit)."""
-        aspect = tile.item.aspect if tile.item and tile.item.aspect else None
+        item = self._tile_item(tile)
+        aspect = item.aspect if item and item.aspect else None
         if aspect:
             tile.set_zoom(L.zoom(rect.width() / max(1, rect.height()), aspect, self.settings.crop))
         tile.move_to(rect, animate)
@@ -483,6 +584,19 @@ class MainWindow(QMainWindow):
         self._place_overlays()
 
     # ------------------------------------------------------------- tile events
+    def _end_item(self, tile: VideoTile, item: Item) -> None:
+        """A file leaves its cell (finished or skipped).  The tile keeps the
+        cell, its zoom and position while the player stops; the next scheduled
+        video takes that cell over instead of the wall being re-solved.  The
+        item stays nominally "playing" until the takeover (or the fallback
+        re-plan) so the scheduler still knows which cell it held."""
+        if self.handoff.active.get(tile) is not item:
+            return                       # already superseded: ignore late reports
+        self.handoff.release_cell(tile, item)
+        if item not in self._ended:
+            self._ended.append(item)
+        self.schedule_soon()
+
     def _tile_finished(self, tile: VideoTile) -> None:
         if self.bench or tile.item is None:
             return
@@ -490,10 +604,7 @@ class MainWindow(QMainWindow):
         if tile is self.focus_tile:
             self.exit_focus(finished=True)
             return
-        self.tiles.pop(item.id, None)
-        self._release(tile)
-        self.pl.finish(item)
-        self.schedule_soon()
+        self._end_item(tile, item)
 
     def _tile_failed(self, tile: VideoTile, message: str) -> None:
         if self.bench or tile.item is None:
@@ -502,10 +613,8 @@ class MainWindow(QMainWindow):
         if tile is self.focus_tile:
             self.focus_tile = None
             self._resume_others()
-        self.tiles.pop(item.id, None)
-        self._release(tile)
-        self.pl.finish(item, error=message)
-        self.schedule_soon()
+        item.error = message
+        self._end_item(tile, item)
 
     def _tile_shape(self, tile: VideoTile, aspect: float) -> None:
         it = tile.item
@@ -538,11 +647,11 @@ class MainWindow(QMainWindow):
         if tile is None:
             return
         self.focus_tile = None
-        if finished:
+        if finished and tile.item is not None:
             item = tile.item
-            self.tiles.pop(item.id, None)
-            self._release(tile)
             self.pl.finish(item)
+            # Same stable path as a wall video: keep the cell for its successor.
+            self._end_item(tile, item)
         self._resume_others()
         self._apply_layout(animate=True)
         self.schedule_soon()
@@ -592,24 +701,27 @@ class MainWindow(QMainWindow):
         if self.focus_tile:
             return self.focus_tile
         pos = self.stage.mapFromGlobal(QCursor.pos())
-        for t in self.tiles.values():
+        for t in self.handoff.active:
             if t.isVisible() and t.geometry().contains(pos):
                 return t
         return None
 
     def skip_under_cursor(self) -> None:
         t = self.tile_under_cursor()
-        if t and t.item:
-            self._skip_id(t.item.id)
+        item = self._tile_item(t) if t else None
+        if item is not None:
+            self._skip_id(item.id)
 
     def _skip_id(self, item_id: int) -> None:
-        tile = self.tiles.get(item_id)
+        tile = self.handoff.tile_for(item_id)
         if tile is None:
             return
         if tile is self.focus_tile:
             self.exit_focus(finished=True)
-        else:
-            self._tile_finished(tile)
+            return
+        if tile in self.handoff.reserved:
+            return                  # already ending: a second skip does nothing
+        self._tile_finished(tile)
 
     def _requeue(self, item_id: int, front: bool) -> None:
         it = self.pl.find(item_id)
@@ -626,20 +738,32 @@ class MainWindow(QMainWindow):
     def _remove_ids(self, ids: list[int]) -> None:
         for i in ids:
             it = self.pl.find(i)
-            if it:
-                self.pl.remove(it)
+            if not it:
+                continue
+            tile = self.handoff.tile_for(i)
+            if tile is not None:
+                # Pull its cell and free the player.  A reserved (ending) tile's
+                # item is still nominally playing, so drop that bookkeeping too.
+                if it in self._ended:
+                    self._ended.remove(it)
+                self.handoff.settle(tile)
+                if it in self.pl.playing:
+                    self.pl.playing.remove(it)
+            self.pl.remove(it)
         self._update_message()
+        self.schedule_soon()
 
     def show_menu(self, global_pos, tile: VideoTile | None) -> None:
         m = QMenu(self)
-        if tile is not None and tile.item is not None:
-            title = m.addAction(tile.item.name)
+        item = self._tile_item(tile) if tile is not None else None
+        if tile is not None and item is not None:
+            title = m.addAction(item.name)
             title.setEnabled(False)
             if tile is self.focus_tile:
                 m.addAction("Back to the wall", lambda: self.exit_focus(False))
             else:
                 m.addAction("Focus (fill window)", lambda: self.enter_focus(tile))
-            m.addAction("Skip", lambda: self._skip_id(tile.item.id))
+            m.addAction("Skip", lambda: self._skip_id(item.id))
             m.addSeparator()
         m.addAction("Add files…", self.add_files_dialog)
         m.addAction("Add folder…", self.add_folder_dialog)
@@ -784,7 +908,7 @@ class MainWindow(QMainWindow):
     def _show_close(self, tile: VideoTile | None) -> None:
         """Put the "X" in the top-right corner of the video under the mouse."""
         btn = self.close_btn
-        if tile is None or tile.item is None:
+        if tile is None or self._tile_item(tile) is None:
             if not btn.underMouse():
                 btn.hide()
                 self._close_target = None
@@ -803,7 +927,7 @@ class MainWindow(QMainWindow):
     def _show_controls(self, tile: VideoTile | None) -> None:
         """Seek bar and volume along the bottom of the video under the mouse."""
         c = self.controls
-        if tile is None or tile.item is None:
+        if tile is None or self._tile_item(tile) is None:
             if not c.underMouse() and not c.busy:
                 c.hide()
                 self._controls_target = None
@@ -844,12 +968,12 @@ class MainWindow(QMainWindow):
         if tile is not None:
             tile.set_paused(not tile.paused)
 
-    @staticmethod
-    def _video_rect(tile: VideoTile) -> QRect:
+    def _video_rect(self, tile: VideoTile) -> QRect:
         """The part of a tile the picture covers: the fitted video, enlarged
         by the tile's zoom and clipped to the tile."""
         g = tile.geometry()
-        a = tile.item.aspect if tile.item and tile.item.aspect else g.width() / max(1, g.height())
+        item = self._tile_item(tile)
+        a = item.aspect if item and item.aspect else g.width() / max(1, g.height())
         if g.width() / max(1, g.height()) > a:
             w, h = g.height() * a, g.height()
         else:
@@ -862,8 +986,9 @@ class MainWindow(QMainWindow):
         tile = self._close_target
         self.close_btn.hide()
         self._close_target = None
-        if tile is not None and tile.item is not None:
-            self._skip_id(tile.item.id)
+        item = self._tile_item(tile) if tile is not None else None
+        if item is not None:
+            self._skip_id(item.id)
 
     def _lists_changed(self) -> None:
         if not self._lists_timer.isActive():
@@ -898,7 +1023,7 @@ class MainWindow(QMainWindow):
         self.light.set_status(status, tip, self.perf.ratio)
         if PROFILER.enabled:
             PROFILER.snapshot(players=len(self.all_tiles), spare=len(self.pool), wall=len(self.tiles),
-                              starting=len(self._to_load) + len(self._loading),
+                              starting=len(self.handoff.jobs) + len(self._loading),
                               bench=self.bench.plan.current if self.bench else "-",
                               light=status, lost=f"{self.perf.ratio * 100:.1f}%", measured=self.perf.streams)
         if self.tray:
@@ -956,6 +1081,7 @@ class MainWindow(QMainWindow):
         self._update_message()
 
         def check() -> None:
+            self.handoff.promote_pool()       # stopped bench players rejoin the pool
             waiting = [t for t in b.draining if not t.is_stopped]
             took = time.monotonic() - b.wait_start
             if waiting and took < BENCH_DRAIN_WAIT:
@@ -979,6 +1105,7 @@ class MainWindow(QMainWindow):
 
     def _trim_pool(self, keep: int) -> None:
         """Shut down spare players beyond ``keep`` (in the background)."""
+        self.handoff.promote_pool()
         while len(self.pool) > max(0, keep):
             tile = self.pool.pop(0)
             self.all_tiles.remove(tile)
@@ -993,7 +1120,7 @@ class MainWindow(QMainWindow):
         k = b.plan.current
         for _ in range(min(4, k - len(b.tiles))):
             i = len(b.tiles)
-            tile = self._acquire()
+            tile = self.handoff.acquire(self._tile_factory)
             tile.load(b.sources[i % len(b.sources)], loop=True, hwdec=self.settings.hwdec)
             tile.set_muted(True)
             b.tiles.append(tile)
@@ -1151,6 +1278,8 @@ class MainWindow(QMainWindow):
         PROFILER.quiet()               # the window is going: no freeze reports from here on
         self._cursor_timer.stop()
         self._perf_timer.stop()
+        self._load_timer.stop()
+        self._schedule_timer.stop()
         # Disappear at once; shutting the players down can take a moment.
         self.hide()
         if self.tray:
