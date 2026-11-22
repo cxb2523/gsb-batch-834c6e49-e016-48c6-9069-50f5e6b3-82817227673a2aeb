@@ -73,7 +73,7 @@ export class AIController {
       input.throttle = 0.2;
       input.steer = Math.sin(this.recoverTimer * 9) * 0.8;
       if (car.stuckTimer > 3.2) {
-        car.resetToTrack(env);
+        car.resetToTrack(env); // inert while the car's classification is frozen
         this.recoverTimer = 0;
       }
       return input;

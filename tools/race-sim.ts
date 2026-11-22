@@ -164,13 +164,28 @@ check('no missed-checkpoint spam', notices.filter((n) => n === 'MISSED CHECKPOIN
 
 // ---- field spread --------------------------------------------------------
 {
-  const finishes = director.cars.filter((c) => c.finished).map((c) => c.finishTime);
+  // The flag falls when the player finishes and freezes classification, so the
+  // only finishers are those ahead of (or level with) the player at that
+  // instant. If fewer than two cars had finished, judge the spread on the
+  // classified progress frozen at the flag instead - which is the whole point
+  // of the freeze: rivals still circulating can no longer add finishers.
+  const frozen = director.frozenClassification();
+  const finishes = (frozen?.cars ?? director.cars)
+    .filter((c) => c.finished)
+    .map((c) => c.finishTime);
   if (finishes.length > 1) {
     const spread = Math.max(...finishes) - Math.min(...finishes);
     // A field finishing within a few seconds of each other means the AI
     // skill spread is doing something; a field finishing minutes apart means
     // some cars are getting stuck somewhere.
     check('field finishes together', spread < 90, `${f(spread, 1)}s between first and last`);
+  } else if (frozen) {
+    const dists = frozen.cars.map((c) => c.totalDist);
+    const distSpread = Math.max(...dists) - Math.min(...dists);
+    // ~80 m/s is the pack's pace, so convert the arc spread to a rough gap.
+    const approxSec = distSpread / 80;
+    check('field finishes together', approxSec < 90,
+          `${f(distSpread, 0)} m (~${f(approxSec, 0)}s) between first and last at the flag`);
   } else {
     check('field finishes together', false, 'not enough finishers to judge');
   }

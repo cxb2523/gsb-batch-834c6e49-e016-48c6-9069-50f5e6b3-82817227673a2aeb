@@ -64,6 +64,30 @@ export interface GridRow {
   finished: boolean;
 }
 
+/**
+ * A car's race classification, captured the instant the player takes the flag.
+ *
+ * Everything that decides a position - laps completed, total progress, whether
+ * the car finished and when - is copied here. The live car keeps moving for the
+ * results slow-motion, but the board is built only from this snapshot.
+ */
+interface FrozenCarState {
+  lap: number;
+  totalDist: number;
+  finished: boolean;
+  finishTime: number;
+}
+
+interface FrozenClassification {
+  /** Cars in classified order, best first. */
+  order: CarSim[];
+  cars: Map<CarSim, FrozenCarState>;
+  /** Race clock at the freeze (never the later results-screen time). */
+  clock: number;
+  bestLap: number | null;
+  playerLaps: number[];
+}
+
 /** Optional presentation hook, used by main.ts to drive the menu. */
 export interface RaceEvents {
   onCountdown?(text: string | null): void;
@@ -111,6 +135,14 @@ export class RaceDirector {
 
   /** Rival catch-up. Disabled by the verifier to measure its effect. */
   catchUp = true;
+
+  /**
+   * Set the instant the player crosses the line. From then until the race is
+   * restarted, classification is read from this snapshot and no rule that can
+   * change a position (lap counting, finishing, recovery resets, item hits) is
+   * allowed to touch the cars. The results slow-motion only moves bodies.
+   */
+  private frozen: FrozenClassification | null = null;
 
   private readonly carFactory: CarFactory;
 
@@ -193,6 +225,7 @@ export class RaceDirector {
   startRace(): void {
     this.env.audio.ensure();
     this.env.audio.duck(false);
+    this.unfreezeClassification();
     this.spawnRaceGrid();
     this.items.reset();
     this.state = 'countdown';
@@ -244,13 +277,16 @@ export class RaceDirector {
   quitToMenu(): void {
     this.state = 'attract';
     this.env.audio.duck(true);
+    // Attract mode is a fresh, running pack: any results-snapshot freeze has
+    // to be lifted or the new cars would be treated as a replay.
+    this.unfreezeClassification();
     this.spawnAttractPack();
     this.events.onCountdown?.(null);
     this.events.onStateChange?.(this.state);
   }
 
   resetPlayer(): void {
-    if (this.state !== 'race') return;
+    if (this.state !== 'race' || this.frozen) return;
     this.player.resetToTrack(this.env);
     this.player.disabled = false;
   }
@@ -283,6 +319,11 @@ export class RaceDirector {
     let steps = 0;
     while (this.acc >= FIXED_DT && steps < maxSteps) {
       for (const c of this.cars) {
+        if (this.frozen) {
+          // Results slow-motion: bodies move, classification state does not.
+          this.presentationStep(c, FIXED_DT);
+          continue;
+        }
         const ai = c.ai as AIController | null;
         c.step(ai ? ai.computeInput(this.env, this.cars) : NEUTRAL_INPUT, FIXED_DT, this.env);
       }
@@ -324,7 +365,9 @@ export class RaceDirector {
   }
 
   private raceStep(dt: number): void {
-    this.clock += dt;
+    // Once the classification is frozen the race clock stops: the recorded
+    // times must stay exactly as they were when the player crossed the line.
+    if (!this.frozen) this.clock += dt;
     this.acc += dt;
     let steps = 0;
     while (this.acc >= FIXED_DT && steps < MAX_SUBSTEPS) {
@@ -333,6 +376,22 @@ export class RaceDirector {
       steps++;
     }
     if (steps >= MAX_SUBSTEPS) this.acc = 0;
+
+    // The board appears a beat after the flag, so this countdown has to keep
+    // running even though nothing below it may move a position.
+    if (this.player.finished && this.classifyOnPlayerFinish && !this.frozen) {
+      // The flag-freeze normally happens inside raceLogic; this covers a
+      // classification that was skipped for any reason.
+      this.freezeClassification();
+    }
+    if (this.frozen) {
+      this.finishDelay -= dt;
+      // Item meshes keep animating during the beat, but a frozen player can no
+      // longer use (or be reset by) anything. Only the visuals continue.
+      this.items.update(dt, this.cars, (car) => this.order.indexOf(car) + 1, false);
+      if (this.finishDelay <= 0) this.showResults();
+      return;
+    }
 
     this.standingsT -= dt;
     if (this.standingsT <= 0) {
@@ -376,11 +435,6 @@ export class RaceDirector {
     this.env.audio.updateEngine(this.player, near ? { dist: nd, speed: near.speed } : null, dt);
     if (this.player.boosting && !this.wasBoosting) this.env.audio.whoosh();
     this.wasBoosting = this.player.boosting;
-
-    if (this.player.finished && this.classifyOnPlayerFinish) {
-      this.finishDelay -= dt;
-      if (this.finishDelay <= 0) this.showResults();
-    }
     void pos;
   }
 
@@ -389,6 +443,13 @@ export class RaceDirector {
   private physicsSubstep(dt: number): void {
     this.updateCatchUp();
     for (const c of this.cars) {
+      if (this.frozen && !c.isPlayer) {
+        // Classification is frozen: the rivals are a replay. Keep their bodies
+        // moving for the shots, but nothing they do may be read back into the
+        // rules, so they are driven as a pure presentation simulation.
+        this.presentationStep(c, dt);
+        continue;
+      }
       let input: DriveInput;
       if (c === this.player && !this.env.autopilot) {
         input = c.disabled ? NEUTRAL_INPUT : this.playerInput;
@@ -409,6 +470,9 @@ export class RaceDirector {
 
     // Recovery: an AI that ends up facing the wrong way, off in the boulder
     // field, or wedged, is put back on the line rather than left stranded.
+    // Once classification is frozen, a reset would rewrite stored progress and
+    // is exactly the bug this freeze exists to prevent.
+    if (this.frozen) return;
     for (const c of this.cars) {
       if (!c.ai || c.finished) continue;
       const f = this.env.track.frameAt(c.s);
@@ -424,6 +488,97 @@ export class RaceDirector {
         this.recomputeOrder();
       }
     }
+  }
+
+  /**
+   * Advance a car purely for the results slow-motion.
+   *
+   * The body is stepped exactly as normal so the replay looks alive, but the
+   * car is `rulesLocked`, so raceLogic (lap, checkpoint, progress, boost pads)
+   * and the recovery reset both skip it. Classification itself is read from
+   * the frozen snapshot, never from the live car, so even its arc position is
+   * allowed to keep moving: crossing the line again changes nothing.
+   */
+  private presentationStep(c: CarSim, dt: number): void {
+    const ai = c.ai as AIController | null;
+    c.step(ai ? ai.computeInput(this.env, this.cars) : NEUTRAL_INPUT, dt, this.env);
+  }
+
+  /**
+   * Freeze classification at the instant the player takes the flag.
+   *
+   * Every finisher keeps the time it actually set; everyone still running is
+   * classified in place, on the progress it had at this moment, as one lap
+   * short and with no finish time. From here on the results are a snapshot:
+   * the slow-motion behind the board is presentation only.
+   */
+  private freezeClassification(): void {
+    this.recomputeOrder();
+    const cars = new Map<CarSim, FrozenCarState>();
+    for (const c of this.cars) {
+      cars.set(c, {
+        lap: c.lap,
+        totalDist: c.totalDist,
+        finished: c.finished,
+        finishTime: c.finishTime,
+      });
+      // Nothing may reset or reclassify a car from now until the restart.
+      c.rulesLocked = true;
+    }
+    this.frozen = {
+      order: this.order.slice(),
+      cars,
+      clock: this.clock,
+      bestLap: this.bestLap,
+      playerLaps: this.player.lapTimes.slice(),
+    };
+  }
+
+  /** Restart-only: drop the snapshot and hand the rules back to the cars. */
+  private unfreezeClassification(): void {
+    this.frozen = null;
+    for (const c of this.cars) c.rulesLocked = false;
+  }
+
+  /** True once the player's finish has frozen the classification. */
+  get classificationFrozen(): boolean {
+    return this.frozen !== null;
+  }
+
+  /**
+   * Debug/verification hook: the exact classification the results board was
+   * built from. Null while the race is still live.
+   */
+  frozenClassification(): {
+    clock: number;
+    cars: { name: string; lap: number; finished: boolean; finishTime: number; totalDist: number }[];
+  } | null {
+    if (!this.frozen) return null;
+    return {
+      clock: this.frozen.clock,
+      cars: this.frozen.order.map((c) => {
+        const f = this.frozen!.cars.get(c)!;
+        return { name: c.name, lap: f.lap, finished: f.finished, finishTime: f.finishTime, totalDist: f.totalDist };
+      }),
+    };
+  }
+
+  /** Classified progress for a car: the frozen value once the flag has fallen. */
+  private classifiedDist(c: CarSim): number {
+    return this.frozen?.cars.get(c)?.totalDist ?? c.totalDist;
+  }
+
+  private classifiedFinished(c: CarSim): boolean {
+    return this.frozen?.cars.get(c)?.finished ?? c.finished;
+  }
+
+  private classifiedFinishTime(c: CarSim): number {
+    return this.frozen?.cars.get(c)?.finishTime ?? c.finishTime;
+  }
+
+  /** Laps a car is classified as having completed. */
+  private classifiedLap(c: CarSim): number {
+    return this.frozen?.cars.get(c)?.lap ?? c.lap;
   }
 
   /**
@@ -492,6 +647,9 @@ export class RaceDirector {
   }
 
   private raceLogic(c: CarSim): void {
+    // Frozen classification: lap, checkpoint, progress and boost-pad state are
+    // part of the results snapshot and must not be advanced by the replay.
+    if (c.rulesLocked) return;
     const track = this.env.track;
     const L = track.length;
 
@@ -536,9 +694,12 @@ export class RaceDirector {
             c.finished = true;
             c.finishTime = this.clock;
             if (c === this.player) {
+              // The player's flag freezes the classification immediately; the
+              // board then appears after a short slow-motion beat.
               this.finishDelay = 2.6;
               this.env.audio.finish();
               this.events.onNotice?.('FINISH', 2200);
+              if (this.classifyOnPlayerFinish) this.freezeClassification();
             }
           }
         } else if (c === this.player && this.noticeT <= 0) {
@@ -580,6 +741,12 @@ export class RaceDirector {
   }
 
   private recomputeOrder(): void {
+    // Frozen: the order is the classification, taken from the snapshot and
+    // never re-sorted by cars that are merely still driving around.
+    if (this.frozen) {
+      this.order = this.frozen.order.slice();
+      return;
+    }
     this.order = this.cars.slice().sort((a, b) => {
       if (a.finished && b.finished) return a.finishTime - b.finishTime;
       if (a.finished) return -1;
@@ -590,20 +757,24 @@ export class RaceDirector {
 
   private showResults(): void {
     this.state = 'results';
-    this.recomputeOrder();
-    const leaderT = this.order[0].finishTime || this.clock;
+    if (!this.frozen) this.freezeClassification();
+    const frozen = this.frozen!;
+    const leaderT = frozen.order[0].finished ? this.classifiedFinishTime(frozen.order[0]) : frozen.clock;
     this.events.onResults?.({
-      position: this.order.indexOf(this.player) + 1,
+      position: frozen.order.indexOf(this.player) + 1,
       total: this.cars.length,
-      totalTime: this.player.finishTime,
-      bestLap: this.bestLap,
-      laps: this.player.lapTimes,
-      standings: this.order.map((c) => ({
-        name: c.name,
-        time: c.finished ? c.finishTime : null,
-        gap: c.finished ? c.finishTime - leaderT : null,
-        isPlayer: c === this.player,
-      })),
+      totalTime: this.player.finished ? frozen.cars.get(this.player)!.finishTime : null,
+      bestLap: frozen.bestLap,
+      laps: frozen.playerLaps,
+      standings: frozen.order.map((c) => {
+        const f = frozen.cars.get(c)!;
+        return {
+          name: c.name,
+          time: f.finished ? f.finishTime : null,
+          gap: f.finished ? f.finishTime - leaderT : null,
+          isPlayer: c === this.player,
+        };
+      }),
     });
     this.events.onStateChange?.(this.state);
   }
@@ -615,16 +786,16 @@ export class RaceDirector {
   }
 
   get raceProgress(): number {
-    return clamp01((this.player.totalDist + this.env.track.length) / (this.env.track.length * LAPS));
+    return clamp01((this.classifiedDist(this.player) + this.env.track.length) / (this.env.track.length * LAPS));
   }
 
   hudStandings(): StandingRow[] {
     return this.order.map((c) => ({
       name: c.name,
       color: '#' + new THREE.Color(c.color).getHexString(),
-      lap: Math.min(LAPS, c.lap + (c.finished ? 0 : 1)),
+      lap: Math.min(LAPS, this.classifiedLap(c) + (this.classifiedFinished(c) ? 0 : 1)),
       me: c === this.player,
-      finished: c.finished,
+      finished: this.classifiedFinished(c),
     }));
   }
 

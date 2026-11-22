@@ -40,6 +40,9 @@ jobs:
       - name: Circuit verification
         run: npm run verify
 
+      - name: Finish-freeze verification
+        run: npm run verify:freeze
+
       - name: Build
         run: npx vite build
 

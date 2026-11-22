@@ -254,6 +254,7 @@ shipped code, not a re-implementation.
 npm run typecheck      # tsc --noEmit, strict
 npm run verify         # circuit geometry
 npm run verify:race    # headless full-race simulation
+npm run verify:freeze  # finish-line classification freeze + restart
 npm run verify:pages   # boots the build from a GitHub Pages style subpath
 npm run verify:mobile  # emulated phone: multi-touch, menus, touch targets
 npm run playtest       # real browser, real Chrome (after npm run build)
@@ -274,6 +275,18 @@ power-up field, and asserts that a full three-lap race is completable: every
 car takes the flag, nobody goes off, lap times are plausible and consistent,
 the field finishes together, the ramp is actually jumped, attract mode is
 stable, and restarting reproduces the grid.
+
+### `npm run verify:freeze` — finish-line freeze
+
+The flag falls when the **player** finishes, so the rivals still circulating
+must be classified on the progress they had at that instant, not on whatever
+they manage during the results slow-motion. This run freezes the board, then
+deliberately dumps every unfinished rival kilometres off the circuit and plays
+the slow-motion out. It asserts that no rival gains a lap, picks up a finish
+time or gets pulled back to the racing line by recovery, that the player cannot
+be reset or reclassified after crossing, that the HUD standings and results
+board both come from the flag-time snapshot, and that restarting fully thaws
+the rules so laps count and resets work again.
 
 ### `npm run verify:pages` — deployment check
 

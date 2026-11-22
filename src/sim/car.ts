@@ -96,6 +96,13 @@ export class CarSim {
   lapStart = 0;
   finished = false;
   finishTime = 0;
+  /**
+   * Set by the race director when classification freezes on the player's
+   * finish. The car still steps for the results slow-motion, but every rule
+   * that could change a placing - track resets, lap counting - must leave it
+   * alone. Cleared by startRace().
+   */
+  rulesLocked = false;
   /** lap * length + s; the single number the standings sort on. */
   totalDist = 0;
   padCooldown = -1;
@@ -149,8 +156,18 @@ export class CarSim {
     this.visualRoll = -Math.asin(clamp(nrm.x * fwdZ - nrm.z * fwdX, -0.7, 0.7));
   }
 
-  /** Put the car back on the racing line, a little behind where it was. */
-  resetToTrack(env: SimEnv): void {
+  /**
+   * Put the car back on the racing line, a little behind where it was.
+   *
+   * A car whose classification is frozen is a visual replay only; resetting it
+   * would rewrite the progress the results board was built from. `force` is
+   * reserved for numerical rescue: if the body goes non-finite, leaving it
+   * there would poison the rendering and every other car's contact checks, so
+   * the recovery is allowed even under a freeze (classification still reads the
+   * frozen snapshot, never the live car, so this cannot alter a placing).
+   */
+  resetToTrack(env: SimEnv, force = false): void {
+    if (this.rulesLocked && !force) return;
     const near = env.track.nearestS(this.pos.x, this.pos.z);
     const back = (near.s - 6 + env.track.length) % env.track.length;
     const f = env.track.frameAt(back);
@@ -335,7 +352,7 @@ export class CarSim {
       this.vel.z *= -0.3;
     }
     if (!Number.isFinite(this.pos.x + this.pos.y + this.pos.z + this.vel.x + this.vel.y + this.vel.z)) {
-      this.resetToTrack(env);
+      this.resetToTrack(env, true);
       return;
     }
     const vv = Math.hypot(this.vel.x, this.vel.z);
