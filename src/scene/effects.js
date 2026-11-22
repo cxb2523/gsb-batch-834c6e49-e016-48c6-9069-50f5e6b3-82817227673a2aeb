@@ -1313,9 +1313,33 @@ export function createEffects(scene,container){
    float alpha=0.38+0.56*wave;
    gl_FragColor=vec4(col,alpha);
   }`;
- function clear(){for(const l of labels)l.remove();labels=[];shaders=[];group.traverse(o=>{o.geometry?.dispose();if(o.material&&o.material.map!==glowTex)o.material.dispose();});group.clear();paths=[];}
+ function disposeMaterial(m){
+  if(!m)return;
+  if(Array.isArray(m)){m.forEach(disposeMaterial);return;}
+  m.dispose();
+ }
+ // 按侧重建前释放上一轮的全部几何体与材质。
+ // 注意：SpriteMaterial.dispose() 不会释放其 map，而 glowTex 是跨重建共享的贴图，
+ // 因此 clear() 绝不能释放它——共享贴图只在整体 dispose() 时释放一次。
+ function clear(){
+  for(const l of labels)l.remove();
+  labels=[];
+  group.traverse(o=>{
+   // Sprite 使用 Three.js 内置共享几何体（所有 Sprite 同一份），绝不能随单轮图层释放，
+   // 否则重建后及舞台其他位置的 Sprite 将引用已销毁几何体。
+   if(o.geometry&&!o.isSprite)o.geometry.dispose();
+   disposeMaterial(o.material);
+   // 共享的 glowTex 不属于任何单轮图层：仅解除材质引用，不释放贴图，
+   // 它会在整体 dispose() 中统一释放，避免重建后的粒子引用已销毁贴图。
+   if(o.material&&o.material.map===glowTex)o.material.map=null;
+  });
+  group.clear();
+  paths=[];
+  shaders=[];
+ }
  function show(point,start,side=1){
   clear();const info=associations[point.code];if(!info||!start)return;
+  group.visible=enabled;
   info.targets.forEach(([name,raw],i)=>{
    const end=new T.Vector3(...raw);end.x*=side;
    const middle=start.clone().lerp(end,.5);
@@ -1353,7 +1377,7 @@ export function createEffects(scene,container){
    const label=document.createElement('span');label.className='effect-label';
    label.innerHTML=`<i class="effect-dot"></i><span>${name}</span>`;
    container.appendChild(label);labels.push(label);
-   paths.push({curve,start,end,beads,halo:haloGroup,innerRing,outerRing,label,index:i});
+   paths.push({curve,start,end,beads,halo:haloGroup,innerRing,outerRing,label,index:i,side});
   });
   group.visible=enabled;
  }
@@ -1373,7 +1397,7 @@ export function createEffects(scene,container){
    p.innerRing.scale.setScalar(pulse);
    const wave=paused||reduced?1:1+.32*((elapsed/1400+p.index*.3)%1);
    p.outerRing.scale.setScalar(wave);
-   p.outerRing.material.opacity=paused||reduced?.4:.55*(1-((elapsed/1400+p.index*.3)%1));
+   p.outerRing.material.opacity=(paused||reduced)?.4:.55*(1-((elapsed/1400+p.index*.3)%1));
    const s=p.end.clone().project(camera),ax=(s.x*.5+.5)*w,ay=(-s.y*.5+.5)*h;
    if(s.z<-1||s.z>1||ax<10||ax>w-10||ay<60||ay>h-55){p.label.hidden=true;continue;}
    items.push({p,ax,ay});
@@ -1410,5 +1434,12 @@ export function createEffects(scene,container){
   }
   return leaders;
  }
- return {show,clear,update,setEnabled(v){enabled=v;group.visible=v;for(const l of labels)l.hidden=!v;},setPaused(v){paused=v;},get active(){return paths.length>0;}};
+ // 整体销毁：释放当前图层后再释放共享贴图，供页面卸载或舞台重建时调用。
+ function dispose(){
+  clear();
+  glowTex.dispose();
+ }
+ return {show,clear,update,dispose,setEnabled(v){enabled=v;group.visible=v;for(const l of labels)l.hidden=!v;},setPaused(v){paused=v;},get active(){return paths.length>0;},get side(){return paths.length?paths[0].side:null;},get paused(){return paused;},get enabled(){return enabled;},
+  // 只读快照：供自动化测试与调试确认每条弧线的起点/靶区均属于当前观察侧。
+  get snapshot(){return paths.map(p=>({side:p.side,start:p.start.toArray(),end:p.end.toArray()}));}};
 }

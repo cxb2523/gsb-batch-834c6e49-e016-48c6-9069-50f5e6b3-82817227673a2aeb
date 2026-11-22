@@ -1,0 +1,70 @@
+<!doctype html><html><head><meta charset="utf-8"><title>side-smoke</title>
+<script type="importmap">{"imports":{"three":"../../src/vendor/three.module.js"}}</script></head>
+<body><div id="out">RUNNING</div>
+<script type="module">
+const out = [];
+const ok = (cond, msg) => out.push((cond ? 'PASS' : 'FAIL') + ' ' + msg);
+try {
+  const stageMod = await import('../../src/scene/stage-state.js');
+  const bodyMod = await import('../../src/scene/body-materials.js');
+  const effectsMod = await import('../../src/scene/effects.js');
+  const THREE = await import('three');
+  const {StageState, SIDE_LEFT, SIDE_RIGHT, markerVisible, segmentVisible, qiParticleVisible} = stageMod;
+
+  const stage = new StageState();
+  let events = 0;
+  stage.subscribe(() => events++);
+  stage.setSide(SIDE_RIGHT);
+  stage.setSide(SIDE_RIGHT);
+  ok(events === 1 && stage.side === SIDE_RIGHT, 'duplicate side set does not notify');
+
+  const renderer = new THREE.WebGLRenderer({antialias: false});
+  const scene = new THREE.Scene();
+  const skin = new THREE.MeshPhysicalMaterial({color: 0xc89373});
+  const eye = new THREE.MeshPhysicalMaterial({color: 0xeeeeee});
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(8, 16, 12), [skin, eye]));
+  const uniforms = {uRimColor:{value:new THREE.Color(0x6ef2de)},uRimPower:{value:2.35},uRimStrength:{value:.8},
+    uPatinaColor:{value:new THREE.Color(0x45a394)},uPatinaStrength:{value:0},uScanStrength:{value:.3},
+    uContourStrength:{value:.08},uXrayFade:{value:0}};
+  const camera = new THREE.PerspectiveCamera();
+  for (const mode of bodyMod.BODY_MATERIAL_MODES) {
+    bodyMod.applyBodyMaterial(mode, {skin, eye, wireMaterial: null, uniforms, stage});
+    renderer.render(scene, camera);
+  }
+  ok(stage.side === SIDE_RIGHT, 'side survives four material recompilations in real WebGL');
+
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const layer = effectsMod.createEffects(scene, container);
+  const start = s => new THREE.Vector3(1.76*s, 4.3, .12);
+  layer.show({code:'LI4'}, start(1), 1);
+  const countFirst = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0), 0);
+  layer.setPaused(true); layer.setEnabled(false);
+  layer.show({code:'LI4'}, start(-1), -1);
+  ok(layer.side === -1 && layer.paused === true && layer.enabled === false, 'pause/enabled survive side rebuild');
+  ok(layer.snapshot.every(a => a.side === -1 && a.start[0] < 0 && a.end[0] <= 0), 'all arcs mirrored to right side');
+  const countSecond = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0), 0);
+  ok(countFirst === countSecond, 'no object accumulation across rebuild (' + countFirst + ')');
+  // 连续 20 轮快速切侧
+  for (let i=0;i<20;i++){ const s=i%2?1:-1; layer.show({code:'LI4'}, start(s), s); }
+  const countRapid = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0), 0);
+  ok(countRapid === countFirst, 'rapid 20x side switches do not stack objects');
+  layer.clear();
+  ok(scene.children.every(g => !g.children || g.children.length === 0) && container.children.length === 0, 'clear releases scene objects and labels');
+  layer.dispose();
+
+  const left = {side: 1, bilateral: true, p: {bilateral: true}};
+  const mid = {side: 1, bilateral: false, p: {bilateral: false}};
+  ok(markerVisible(left, SIDE_RIGHT, ()=>true) === false, 'opposite marker hidden');
+  ok(markerVisible(mid, SIDE_RIGHT, ()=>true) === true, 'midline marker stays');
+  const segL = {side:1, bilateral:true, points:[left, {...left}]};
+  ok(segmentVisible(segL, SIDE_RIGHT, ()=>true, true) === false, 'opposite tube hidden');
+  ok(qiParticleVisible({seg:segL}, SIDE_RIGHT, ()=>true, true) === false, 'opposite qi particle hidden');
+  ok(segmentVisible(segL, SIDE_LEFT, ()=>true, false) === false, 'line switch hides tube');
+
+  renderer.dispose();
+} catch (e) {
+  out.push('ERROR ' + (e && e.stack ? e.stack : String(e)));
+}
+document.getElementById('out').textContent = out.join('\n');
+</script></body></html>

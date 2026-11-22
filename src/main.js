@@ -1,5 +1,14 @@
 import {createHuman, nearestSurface} from './scene/human-model.js';
 import {associations, createEffects} from './scene/effects.js';
+import {
+  StageState,
+  SIDE_LEFT,
+  matchesSide,
+  markerVisible,
+  segmentVisible,
+  qiParticleVisible
+} from './scene/stage-state.js';
+import {applyBodyMaterial} from './scene/body-materials.js';
 import {channels, catalog} from './data/catalog.js';
 import {initialPoints, extraPoints} from './data/points.js';
 import * as T from 'three';
@@ -91,7 +100,15 @@ const data = [
   order: parseInt(p.code.match(/\d+$/)?.[0] || 0)
 }));
 
-let effectLayer = null, effectPaused = false;
+let effectLayer = null;
+// 三维舞台统一状态源：观察侧、显示开关与暂停状态只允许通过它读取/变更。
+const stage = new StageState({
+  initialSide: SIDE_LEFT,
+  showLines: true,
+  showLabels: true,
+  showEffects: true,
+  effectsPaused: false
+});
 let selected = 12, region = '全部', query = '', channelFilter = '全部', scope = 'model'; // Default 合谷 (LI4) or 百会
 // Keep default 百会/迎香 or 合谷? Let's check index 12 -> 合谷, index 3 -> 迎香. Let's default to 合谷 (id of LI4) so user immediately sees glowing curves + light needle!
 selected = data.find(p => p.code === 'LI4')?.id ?? 3;
@@ -227,6 +244,9 @@ function list() {
   syncMeridianPills();
 }
 
+// 经气粒子仅在所选经脉变化时重建，且一次性覆盖两侧光路。
+// 切换观察侧不重新创建任何 Sprite/材质，可见性统一由 animate() 中的 qiParticleVisible 谓词驱动，
+// 因此已隐藏侧的粒子不会被引用，也不会因连续快速切侧产生叠加或泄漏。
 function rebuildActiveQiParticles() {
   if (!scene || !dotTex) return;
   for (const qp of activeQiParticles) {
@@ -235,10 +255,7 @@ function rebuildActiveQiParticles() {
   }
   activeQiParticles = [];
   const activeMeridian = data[selected]?.meridian;
-  const activeSide = Number($('#sideChoice').value);
-  const segs = meridianSegments.filter(
-    s => s.meridian === activeMeridian && (!s.bilateral || s.side === activeSide || channelFilter === activeMeridian)
-  );
+  const segs = meridianSegments.filter(s => s.meridian === activeMeridian);
   segs.forEach((seg, idx) => {
     for (let k = 0; k < 2; k++) {
       const sp = new T.Sprite(
@@ -252,6 +269,7 @@ function rebuildActiveQiParticles() {
         })
       );
       sp.scale.set(k === 0 ? 0.088 : 0.065, k === 0 ? 0.088 : 0.065, 1);
+      sp.visible = false;
       scene.add(sp);
       activeQiParticles.push({sprite: sp, seg, offset: (idx * 0.19 + k * 0.5) % 1});
     }
@@ -396,11 +414,17 @@ $('#next').onclick = () => {
 $('#summaryCounts').textContent = `${mapped.length} 个三维空间穴位 · ${mapped.filter(p => associations[p.code]).length} 个动态关联流光`;
 $('#footerCount').textContent = `收录 361 正经穴 + 2 奇穴 · ${mapped.length} 个 3D 空间点位`;
 
+// 观察侧切换：stage.setSide 是唯一状态变更入口。
+// 侧别真正变化时才会通知订阅者重建主治流光；标记/光路/粒子/标签全部在动画帧按谓词过滤，无需重建。
+// 连续快速切到相同侧别时 setSide 返回 false，不产生任何重建。
 $('#sideChoice').onchange = () => {
-  rebuildActiveQiParticles();
+  const nextSide = Number($('#sideChoice').value);
+  if (!stage.setSide(nextSide)) return;
   if (data[selected].modeled) focusPoint();
-  updateEffects(true);
 };
+
+// 主治流光按当前观察侧重建；暂停与显示开关由 effectLayer 内部状态保持，不受重建影响。
+stage.subscribe(() => updateEffects(true));
 
 // 经典关联穴位快捷按钮
 $('#effectExamples').innerHTML = ['LI4', 'PC6', 'ST36', 'GB20', 'CV12', 'BL40', 'LU7', 'LR3']
@@ -427,11 +451,11 @@ function updateEffects(fit = false) {
   $('#pauseEffects').disabled = !info;
   $('#fitEffects').disabled = !info;
   if (!effectLayer) return;
-  const side = Number($('#sideChoice').value);
-  const mark = markers.find(m => m.p.id === selected && (m.side === side || !m.p.bilateral));
+  const side = stage.side;
+  const mark = markers.find(m => m.p.id === selected && matchesSide(m, side));
   effectLayer.show(p, mark?.mesh.position.clone(), side);
-  effectLayer.setEnabled($('#showEffects').checked);
-  if (info && fit && $('#showEffects').checked) frameEffects();
+  effectLayer.setEnabled(stage.showEffects);
+  if (info && fit && stage.showEffects) frameEffects();
 }
 
 function flyTo(targetPos, camPos, duration = 680) {
@@ -452,26 +476,27 @@ function frameEffects() {
   $('#rotate').classList.remove('active');
   const p = data[selected], info = associations[p.code];
   const rear = p.pos?.[2] < 0 && info.targets.every(t => t[1][2] < 0);
-  const side = Number($('#sideChoice').value);
+  const side = stage.side;
   flyTo(new T.Vector3(0, 3.86, 0), new T.Vector3(side * 1.4, 4.35, rear ? -12.9 : 12.9));
   $$('[data-view]').forEach(b => b.classList.remove('active'));
 }
 
 $('#showEffects').onchange = () => {
-  effectLayer?.setEnabled($('#showEffects').checked);
-  if ($('#showEffects').checked) frameEffects();
+  stage.showEffects = $('#showEffects').checked;
+  effectLayer?.setEnabled(stage.showEffects);
+  if (stage.showEffects) frameEffects();
 };
 $('#pauseEffects').onclick = () => {
-  effectPaused = !effectPaused;
-  effectLayer?.setPaused(effectPaused);
-  $('#pauseEffects').textContent = effectPaused ? '继续流动' : '暂停流动';
+  stage.effectsPaused = !stage.effectsPaused;
+  effectLayer?.setPaused(stage.effectsPaused);
+  $('#pauseEffects').textContent = stage.effectsPaused ? '继续流动' : '暂停流动';
 };
 $('#fitEffects').onclick = frameEffects;
 
 function focusPoint() {
   if (!camera || !data[selected].modeled) return;
-  const side = Number($('#sideChoice').value);
-  const mark = markers.find(m => m.p.id === selected && (m.side === side || !m.p.bilateral));
+  const side = stage.side;
+  const mark = markers.find(m => m.p.id === selected && matchesSide(m, side));
   if (!mark) return;
   auto = false;
   $('#rotate').classList.remove('active');
@@ -487,7 +512,7 @@ function setView(v) {
   if (!camera) return;
   auto = false;
   $('#rotate').classList.remove('active');
-  const side = Number($('#sideChoice').value);
+  const side = stage.side;
   const d = 12.6;
   let target = new T.Vector3(0, 3.86, 0);
   let cam = new T.Vector3(0, 4.28, d);
@@ -699,114 +724,19 @@ function attachSculpturalShader(mat) {
   mat.customProgramCacheKey = () => 'guanxue-sculptural-v2';
 }
 
-// 切换四种东方博物级材质
+// 切换四种东方博物级材质。
+// 所有材质参数集中在 body-materials 预设中原地应用，不创建新几何体/材质/贴图；
+// 观察侧、流光暂停/显示开关、标签布局均由 stage 与各图层自身持有，着色器重编译不会重置它们。
 function setBodyMaterial(mode) {
   if (!humanMesh) return;
   const [skin, eye] = humanMesh.material;
-  if (mode === 'jade') {
-    skin.color.setHex(0x143840);
-    skin.emissive.setHex(0x05181e);
-    skin.emissiveIntensity = 0.55;
-    skin.roughness = 0.44;
-    skin.metalness = 0.08;
-    skin.clearcoat = 0.24;
-    skin.clearcoatRoughness = 0.42;
-    skin.sheen = 0.75;
-    skin.sheenColor = new T.Color(0x6ef2de);
-    skin.sheenRoughness = 0.45;
-    skin.transparent = true;
-    skin.opacity = 0.95;
-    skinUniforms.uRimColor.value.setHex(0x6ef2de);
-    skinUniforms.uRimPower.value = 2.35;
-    skinUniforms.uRimStrength.value = 0.85;
-    skinUniforms.uPatinaStrength.value = 0.0;
-    skinUniforms.uScanStrength.value = 0.34;
-    skinUniforms.uContourStrength.value = 0.09;
-    skinUniforms.uXrayFade.value = 0.0;
-    eye.color.setHex(0x88e8dc);
-    if (wireMesh) {
-      wireMesh.material.color.setHex(0x6ef2de);
-      wireMesh.material.opacity = 0.032;
-    }
-  } else if (mode === 'bronze') {
-    skin.color.setHex(0x8a643b);
-    skin.emissive.setHex(0x160d05);
-    skin.emissiveIntensity = 0.35;
-    skin.roughness = 0.34;
-    skin.metalness = 0.82;
-    skin.clearcoat = 0.18;
-    skin.clearcoatRoughness = 0.38;
-    skin.sheen = 0.3;
-    skin.sheenColor = new T.Color(0xf5cc7e);
-    skin.sheenRoughness = 0.45;
-    skin.transparent = false;
-    skin.opacity = 1.0;
-    skinUniforms.uRimColor.value.setHex(0xf5cc7e);
-    skinUniforms.uRimPower.value = 2.8;
-    skinUniforms.uRimStrength.value = 0.52;
-    skinUniforms.uPatinaColor.value.setHex(0x479e8e);
-    skinUniforms.uPatinaStrength.value = 0.28;
-    skinUniforms.uScanStrength.value = 0.08;
-    skinUniforms.uContourStrength.value = 0.02;
-    skinUniforms.uXrayFade.value = 0.0;
-    eye.color.setHex(0xd6b078);
-    if (wireMesh) {
-      wireMesh.material.color.setHex(0xf5cc7e);
-      wireMesh.material.opacity = 0.024;
-    }
-  } else if (mode === 'xray') {
-    skin.color.setHex(0x061018);
-    skin.emissive.setHex(0x020912);
-    skin.emissiveIntensity = 0.35;
-    skin.roughness = 0.55;
-    skin.metalness = 0.1;
-    skin.clearcoat = 0.1;
-    skin.clearcoatRoughness = 0.5;
-    skin.sheen = 0.4;
-    skin.sheenColor = new T.Color(0x52c8ff);
-    skin.sheenRoughness = 0.4;
-    skin.transparent = true;
-    skin.opacity = 1.0;
-    skinUniforms.uRimColor.value.setHex(0x64d6ff);
-    skinUniforms.uRimPower.value = 1.85;
-    skinUniforms.uRimStrength.value = 1.25;
-    skinUniforms.uPatinaStrength.value = 0.0;
-    skinUniforms.uScanStrength.value = 0.45;
-    skinUniforms.uContourStrength.value = 0.22;
-    skinUniforms.uXrayFade.value = 0.92;
-    eye.color.setHex(0x7be0ff);
-    if (wireMesh) {
-      wireMesh.material.color.setHex(0x64d6ff);
-      wireMesh.material.opacity = 0.065;
-    }
-  } else {
-    skin.color.setHex(0xd8c8b6);
-    skin.emissive.setHex(0x1f140d);
-    skin.emissiveIntensity = 0.18;
-    skin.roughness = 0.56;
-    skin.metalness = 0.02;
-    skin.clearcoat = 0.08;
-    skin.clearcoatRoughness = 0.6;
-    skin.sheen = 0.45;
-    skin.sheenColor = new T.Color(0xffe6d4);
-    skin.sheenRoughness = 0.65;
-    skin.transparent = false;
-    skin.opacity = 1.0;
-    skinUniforms.uRimColor.value.setHex(0x88b4c4);
-    skinUniforms.uRimPower.value = 3.0;
-    skinUniforms.uRimStrength.value = 0.32;
-    skinUniforms.uPatinaStrength.value = 0.0;
-    skinUniforms.uScanStrength.value = 0.05;
-    skinUniforms.uContourStrength.value = 0.015;
-    skinUniforms.uXrayFade.value = 0.0;
-    eye.color.setHex(0xf2e9de);
-    if (wireMesh) {
-      wireMesh.material.color.setHex(0xffffff);
-      wireMesh.material.opacity = 0.014;
-    }
-  }
-  skin.needsUpdate = true;
-  eye.needsUpdate = true;
+  applyBodyMaterial(mode, {
+    skin,
+    eye,
+    wireMaterial: wireMesh?.material,
+    uniforms: skinUniforms,
+    stage
+  });
   $$('#materialSwitch button').forEach(b => b.classList.toggle('active', b.dataset.mat === mode));
 }
 
@@ -1255,13 +1185,14 @@ try {
     if (ambientParticles) ambientParticles.rotation.y = -time * 0.00007;
 
     const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
-    const activeSide = Number($('#sideChoice').value);
+    const activeSide = stage.side;
     const selectedPoint = data[selected];
     let selectedMarker = null;
 
     for (const m of markers) {
-      m.mesh.visible = visible(m.p);
-      const isSel = m.p.id === selected && (m.side === activeSide || !m.p.bilateral);
+      // 观察侧为统一状态源：对侧标记直接隐藏，正中单穴（bilateral === false）两侧均保留。
+      m.mesh.visible = markerVisible(m, activeSide, visible);
+      const isSel = m.p.id === selected && matchesSide(m, activeSide);
       const isHov = m.p.id === hoveredId;
       if (isSel) selectedMarker = m;
 
@@ -1287,9 +1218,11 @@ try {
     }
 
     // 更新经脉立体光路与流动经气粒子（保持世界坐标不缩放，通过亮度与不透明度凸显当选经脉）
+    // 两者都以 stage.side 为统一过滤源：对侧管路与其上的粒子同时消失，正中单穴管路始终保留。
     const showLines = $('#showLines').checked;
+    stage.showLines = showLines;
     for (const seg of meridianSegments) {
-      const isVis = showLines && seg.points.every(m => visible(m.p));
+      const isVis = segmentVisible(seg, activeSide, visible, showLines);
       seg.mesh.visible = isVis;
       if (isVis) {
         const isCurrent = seg.meridian === selectedPoint?.meridian;
@@ -1299,7 +1232,7 @@ try {
     }
 
     for (const qp of activeQiParticles) {
-      qp.sprite.visible = qp.seg.mesh.visible;
+      qp.sprite.visible = qiParticleVisible(qp, activeSide, visible, showLines);
       if (qp.sprite.visible) {
         const t = (time * 0.00052 + qp.offset) % 1;
         qp.sprite.position.copy(qp.seg.curve.getPoint(t));
@@ -1313,6 +1246,7 @@ try {
     if (time - lastLabels > 70) {
       lastLabels = time;
       const showLabels = $('#showLabels').checked;
+      stage.showLabels = showLabels;
       const candidates = [];
       const ordered = [...markers].sort((a, b) => {
         const selDiff = (b.p.id === selected) - (a.p.id === selected);
@@ -1325,7 +1259,8 @@ try {
       for (const m of ordered) {
         m.label.hidden = true;
         if (!m.mesh.visible || !showLabels) continue;
-        if (m.p.bilateral && m.side !== activeSide) continue;
+        // 双重保险：引线标签同样只呈现当前观察侧，正中单穴不受影响。
+        if (!matchesSide(m, activeSide)) continue;
 
         screen.copy(m.mesh.position).project(camera);
         const ax = (screen.x * 0.5 + 0.5) * w;
@@ -1407,6 +1342,44 @@ try {
 
     renderer.render(scene, camera);
   }
+
+  // 调试/自动化测试钩子：只读暴露舞台状态与各图层实时可见性，不参与生产逻辑。
+  window.__guanxueStage = {
+    stage,
+    get markers() {
+      return markers.map(m => ({
+        id: m.p.id,
+        code: m.p.code,
+        side: m.side,
+        bilateral: m.p.bilateral,
+        visible: m.mesh.visible
+      }));
+    },
+    get segments() {
+      return meridianSegments.map(s => ({
+        meridian: s.meridian,
+        side: s.side,
+        bilateral: s.bilateral,
+        visible: s.mesh.visible
+      }));
+    },
+    get qiParticles() {
+      return activeQiParticles.map(q => ({side: q.seg.side, bilateral: q.seg.bilateral, visible: q.sprite.visible}));
+    },
+    get effects() {
+      return {
+        active: effectLayer?.active ?? false,
+        side: effectLayer?.side ?? null,
+        paused: effectLayer?.paused ?? false,
+        enabled: effectLayer?.enabled ?? false,
+        snapshot: effectLayer?.snapshot ?? []
+      };
+    },
+    get labels() {
+      return markers.map(m => ({code: m.p.code, side: m.side, bilateral: m.p.bilateral, hidden: m.label.hidden}));
+    }
+  };
+
   animate();
 } catch (e) {
   console.error(e);

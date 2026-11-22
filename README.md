@@ -60,7 +60,22 @@ npm start
 # 3. 运行工程完整性校验与单元测试
 npm run check
 npm test
+
+# 4.（可选，需要本机装有 Chrome/Edge）无头浏览器真实 WebGL 冒烟测试
+#    自动启动静态服务，用虚拟时钟驱动 tests/browser/ 下的两个测试页并解析 PASS/FAIL
+npm run test:browser
 ```
+
+### 观察侧状态源与图层过滤（架构约定）
+
+三维舞台的「观察侧（人体左/右）」由 `src/scene/stage-state.js` 的 `StageState` 统一持有，是唯一状态源：
+
+- `setSide()` 是观察侧的唯一变更入口；侧别未变时不通知、不重建，连续快速切换不会叠加或泄漏。
+- 穴位标记、同经光路、经气粒子、主治流光、引线标签全部通过 `markerVisible` / `segmentVisible` / `qiParticleVisible` / `matchesSide` 谓词按当前侧过滤；正中单穴（任督二脉等 `bilateral === false`）在两侧均保留。
+- 经气粒子按所选经脉一次性双侧构建，切侧只切换可见性、不重建 Sprite；主治流光（`src/scene/effects.js`）在切侧时按新侧重建，并在 `clear()` 中释放被替换的几何体/材质（共享的 Sprite 几何体与发光贴图仅在整体 `dispose()` 时释放）。
+- 四种人体材质切换（`src/scene/body-materials.js`）只原地修改既有材质与 shader uniform，不创建新几何体/材质/贴图，观察侧、流光暂停与显示开关、标签布局均不因着色器重编译而丢失。
+
+`window.__guanxueStage` 是只读调试/自动化钩子，暴露各图层的实时可见性快照，不参与生产逻辑。
 
 ---
 
@@ -78,6 +93,7 @@ npm test
 │   └── THREE-LICENSE.txt        # Three.js r170 MIT 许可
 ├── scripts/
 │   ├── check-integrity.mjs      # index.html 资产引用、相对 ESM 导入与语法检查脚本
+│   ├── browser-smoke.mjs        # 零依赖无头 Chrome/Edge 真实 WebGL 冒烟运行器（npm run test:browser）
 │   └── dev-server.mjs           # 零依赖 Node 静态开发预览服务器
 ├── src/
 │   ├── main.js                  # 主应用入口：Three.js 场景、GLSL 着色器材质、罗盘与交互控制器
@@ -85,6 +101,8 @@ npm test
 │   │   ├── catalog.js           # 十四经脉元信息与 361 正经穴完整标准编号目录
 │   │   └── points.js            # 152 个三维空间穴位坐标、体表解剖标志与特写视角参数
 │   ├── scene/
+│   │   ├── stage-state.js       # 三维舞台统一状态源（观察侧/显示开关/暂停）与各图层侧别过滤谓词
+│   │   ├── body-materials.js    # 四种东方博物级人体材质预设（原地应用，不新建资源）
 │   │   ├── effects.js           # 149 组穴位—部位传统主治关联与 GLSL 流光弧线渲染引擎
 │   │   └── human-model.js       # 13,524 顶点三维人体基础网格与体表最近点投射算法 (CC0)
 │   ├── styles/
@@ -93,7 +111,11 @@ npm test
 │       ├── OrbitControls.js     # Three.js r170 轨道相机控制器
 │       └── three.module.js      # Three.js r170 核心模块
 ├── tests/
-│   └── atlas.test.mjs           # node:test 自动化测试（经穴目录、三维坐标范围、流光数据与网格投射）
+│   ├── atlas.test.mjs           # node:test 自动化测试（经穴目录、三维坐标范围、流光数据与网格投射）
+│   ├── stage-state.test.mjs     # 统一状态源与标记/光路/粒子侧别过滤谓词测试
+│   ├── body-materials.test.mjs  # 四种材质预设原地应用与观察侧状态保持测试
+│   ├── effects-lifecycle.test.mjs # 主治流光按侧重建、资源释放与无泄漏生命周期测试
+│   └── browser/                 # 无头浏览器真实 WebGL 冒烟测试页（由 browser-smoke.mjs 驱动）
 ├── .editorconfig                # 跨编辑器代码格式规范
 ├── .gitignore                   # Git 忽略清单
 ├── .nojekyll                    # 禁用 GitHub Pages Jekyll 解析，原生直出 ES Modules

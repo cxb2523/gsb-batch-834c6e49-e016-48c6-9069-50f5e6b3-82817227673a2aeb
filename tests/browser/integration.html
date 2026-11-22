@@ -1,0 +1,140 @@
+<!doctype html><html><head><meta charset="utf-8"><title>guanxue-integration</title></head>
+<body><div id="out">RUNNING</div>
+<script type="importmap">{"imports":{"three":"../../src/vendor/three.module.js"}}</script>
+<script type="module">
+// 单文档真实 WebGL 集成冒烟（无 iframe，rAF 正常运行）。
+// 用真实 three.js 渲染器、真实 effects 图层、真实材质预设与统一状态源，
+// 在浏览器里端到端验证观察侧作为唯一状态源时各图层的过滤、重建、释放与材质切换行为。
+const out=[]; const ok=(c,m)=>out.push((c?'PASS':'FAIL')+' '+m);
+Promise.all([
+  import('../../src/scene/stage-state.js'),
+  import('../../src/scene/body-materials.js'),
+  import('../../src/scene/effects.js'),
+  import('three')
+]).then(([stageMod, bodyMod, effectsMod, THREE]) => run(stageMod, bodyMod, effectsMod, THREE))
+  .catch(e => { document.getElementById('out').textContent='ERROR '+(e.stack||String(e)); });
+
+function run(stageMod, bodyMod, effectsMod, THREE) {
+const {StageState, SIDE_LEFT, SIDE_RIGHT, markerVisible, segmentVisible, qiParticleVisible} = stageMod;
+  const renderer = new THREE.WebGLRenderer({antialias:false});
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
+  camera.position.set(0, 4.3, 12); camera.lookAt(0, 4.3, 0);
+
+  // ---- 构造与真实 main.js 同构的标记/管路/粒子数据（双侧 + 正中）----
+  const mkMarker = (id, side, bilateral, meridian='手阳明大肠经') => ({
+    p: {id, bilateral, meridian, code:'X'+id}, side, bilateral,
+    mesh: {visible:true, position:new THREE.Vector3(0.3*side, 4+id*0.1, 0.2)}
+  });
+  const markers = [];
+  let mid=0;
+  for (const side of [SIDE_LEFT, SIDE_RIGHT]) for (let i=0;i<6;i++) markers.push(mkMarker(mid++, side, true));
+  for (let i=0;i<3;i++) markers.push(mkMarker(mid++, 1, false, '督脉')); // 正中单穴
+  const mkSeg = (a, b, side, bilateral, meridian) => ({
+    side, bilateral, meridian, points:[a,b],
+    mesh:{visible:true, material:{color:new THREE.Color(), opacity:1}},
+    curve:{getPoint:t=>new THREE.Vector3(t,0,0)}
+  });
+  const segL1=mkSeg(markers[0],markers[1],SIDE_LEFT,true,'手阳明大肠经');
+  const segR1=mkSeg(markers[6],markers[7],SIDE_RIGHT,true,'手阳明大肠经');
+  const segMid=mkSeg(markers[12],markers[13],1,false,'督脉');
+  const segments=[segL1,segR1,segMid];
+  const qiParticles = segments.map(seg => ({seg, sprite:{visible:false}}));
+
+  const stage = new StageState();
+  const alwaysVisible = () => true;
+
+  // ---- 复刻 main.js animate() 每帧的过滤逻辑 ----
+  function applyFrame(showLines=true) {
+    for (const m of markers) m.mesh.visible = markerVisible(m, stage.side, alwaysVisible);
+    for (const seg of segments) {
+      seg.mesh.visible = segmentVisible(seg, stage.side, alwaysVisible, showLines);
+    }
+    for (const qp of qiParticles) qp.sprite.visible = qiParticleVisible(qp, stage.side, alwaysVisible, showLines);
+  }
+  const count = (arr, pred) => arr.filter(pred).length;
+
+  // 初始左侧
+  applyFrame();
+  ok(stage.side === SIDE_LEFT, 'initial side left');
+  ok(count(markers,m=>m.mesh.visible&&m.bilateral&&m.side===SIDE_RIGHT)===0, 'right markers hidden on left view');
+  ok(count(markers,m=>m.mesh.visible&&m.bilateral&&m.side===SIDE_LEFT)>0, 'left markers shown');
+  ok(segR1.mesh.visible===false && segL1.mesh.visible===true, 'tube filtered to left');
+  ok(segMid.mesh.visible===true, 'midline tube always visible');
+  ok(qiParticles.find(q=>q.seg===segR1).sprite.visible===false, 'right qi hidden');
+  const midVisible = count(markers,m=>m.mesh.visible&&!m.bilateral);
+
+  // 切到右侧（唯一变更入口）
+  let events=0; stage.subscribe(()=>events++);
+  stage.setSide(SIDE_RIGHT); stage.setSide(SIDE_RIGHT);
+  ok(events===1, 'duplicate setSide does not re-notify');
+  applyFrame();
+  ok(count(markers,m=>m.mesh.visible&&m.bilateral&&m.side===SIDE_LEFT)===0, 'left markers hidden after switch');
+  ok(count(markers,m=>m.mesh.visible&&m.bilateral&&m.side===SIDE_RIGHT)>0, 'right markers shown');
+  ok(segL1.mesh.visible===false && segR1.mesh.visible===true, 'tube filtered to right');
+  ok(qiParticles.find(q=>q.seg===segL1).sprite.visible===false, 'left qi hidden');
+  ok(count(markers,m=>m.mesh.visible&&!m.bilateral)===midVisible, 'midline markers preserved');
+  // 渲染一帧确认无 WebGL 错误
+  renderer.render(scene, camera);
+
+  // 显示开关：关闭光路时所有双侧/正中管路与粒子隐藏
+  applyFrame(false);
+  ok(segments.every(s=>s.mesh.visible===false), 'line switch hides all tubes');
+  ok(qiParticles.every(q=>q.sprite.visible===false), 'line switch hides all qi');
+  applyFrame(true);
+
+  // ---- 真实 effects 图层：切侧重建 + 暂停/开关 + 释放 ----
+  const container = document.createElement('div'); document.body.appendChild(container);
+  const layer = effectsMod.createEffects(scene, container);
+  const start = s => new THREE.Vector3(1.76*s, 4.3, 0.12);
+  layer.show({code:'LI4'}, start(SIDE_RIGHT), SIDE_RIGHT);
+  ok(layer.active && layer.side===SIDE_RIGHT, 'effect layer on right');
+  ok(layer.snapshot.every(a=>a.side===SIDE_RIGHT&&a.start[0]<0&&a.end[0]<=0), 'effect arcs belong to right');
+  const objsFirst = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0),0);
+  layer.setPaused(true); layer.setEnabled(false);
+  layer.show({code:'LI4'}, start(SIDE_LEFT), SIDE_LEFT);
+  ok(layer.paused===true && layer.enabled===false && layer.side===SIDE_LEFT, 'pause/enabled survive effect rebuild');
+  ok(layer.snapshot.every(a=>a.side===SIDE_LEFT&&a.start[0]>0&&a.end[0]>=0), 'rebuilt arcs belong to left');
+  const objsSecond = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0),0);
+  ok(objsFirst===objsSecond, 'no object accumulation across effect rebuild');
+  for (let i=0;i<15;i++){ const s=i%2?SIDE_LEFT:SIDE_RIGHT; layer.show({code:'LI4'},start(s),s); }
+  const objsRapid = scene.children.reduce((n,g)=>n+(g.children?g.children.length:0),0);
+  ok(objsRapid===objsFirst, 'rapid 15x side switches do not stack objects');
+  layer.clear();
+  ok(scene.children.every(g=>!g.children||g.children.length===0) && container.children.length===0, 'effect clear releases everything');
+  layer.dispose();
+
+  // ---- 四种材质真实重编译，观察侧/暂停/开关保持 ----
+  const skin=new THREE.MeshPhysicalMaterial({color:0xc89373});
+  const eye=new THREE.MeshPhysicalMaterial({color:0xeeeeee});
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(8,16,12),[skin,eye]));
+  const uniforms={uRimColor:{value:new THREE.Color(0x6ef2de)},uRimPower:{value:2.35},uRimStrength:{value:.8},
+    uPatinaColor:{value:new THREE.Color(0x45a394)},uPatinaStrength:{value:0},uScanStrength:{value:.3},
+    uContourStrength:{value:.08},uXrayFade:{value:0}};
+  stage.setSide(SIDE_RIGHT); stage.effectsPaused=true; stage.showEffects=false;
+  for (const mode of bodyMod.BODY_MATERIAL_MODES) {
+    bodyMod.applyBodyMaterial(mode,{skin,eye,wireMaterial:null,uniforms,stage});
+    renderer.render(scene,camera);
+  }
+  ok(stage.side===SIDE_RIGHT, 'side survives four real material recompilations');
+  ok(stage.effectsPaused===true && stage.showEffects===false, 'pause/show flags survive material recompilations');
+  applyFrame();
+  ok(count(markers,m=>m.mesh.visible&&m.bilateral&&m.side===SIDE_LEFT)===0, 'filtering intact after material switch');
+
+  // ---- 帧稳定性：模拟 30 个动画帧的过滤计算（谓词为纯函数，setTimeout 迭代等价于 rAF 回调）----
+  let n=0;
+  const tick=()=>{
+    applyFrame();
+    if(++n>=30){
+      try {
+        ok(markers.filter(m=>m.mesh.visible&&m.bilateral).every(m=>m.side===SIDE_RIGHT), 'filtering stable across 30 simulated frames');
+        renderer.dispose();
+        document.getElementById('out').textContent = out.join('\n');
+      } catch(e) { document.getElementById('out').textContent='ERROR '+(e.stack||String(e))+'\n'+out.join('\n'); }
+      return;
+    }
+    setTimeout(tick, 0);
+  };
+  setTimeout(tick, 0);
+}
+</script></body></html>
