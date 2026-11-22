@@ -1,5 +1,5 @@
 import { connect } from 'react-redux';
-import { setLoaded, setAuthorized, setDuration, setName, end } from '@client/store/player';
+import { setLoaded, setAuthorized, setAvailable, setDuration, setName, end } from '@client/store/player';
 import VideoComponent from '@client/components/video/Video';
 import YoutubeVideoComponent from '@client/components/video/YoutubeVideo';
 
@@ -10,6 +10,7 @@ export default function Wrapper(Component) {
             playing: state.player.playing,
             time: state.player.time,
             authorized: state.player.authorized,
+            available: state.player.available,
             loaded: state.player.loaded,
             volume: state.options.volume,
         }),
@@ -17,6 +18,7 @@ export default function Wrapper(Component) {
             setDuration: duration => dispatch(setDuration(duration)),
             setLoaded: loaded => dispatch(setLoaded(loaded)),
             setAuthorized: authorized => dispatch(setAuthorized(authorized)),
+            setAvailable: available => dispatch(setAvailable(available)),
             setName: name => dispatch(setName(name)),
             end: () => dispatch(end()),
         }),

@@ -10,6 +10,8 @@ export const PLAYER_SET_DURATION = 'PLAYER_SET_DURATION';
 export const PLAYER_SET_NAME = 'PLAYER_SET_NAME';
 export const PLAYER_LOADED = 'PLAYER_LOADED';
 export const PLAYER_AUTHORIZED = 'PLAYER_AUTHORIZED';
+export const PLAYER_AVAILABLE = 'PLAYER_AVAILABLE';
+export const PLAYER_FILE_UPLOADED = 'PLAYER_FILE_UPLOADED';
 export const PLAYER_PLAY = 'PLAYER_PLAY';
 export const PLAYER_PAUSE = 'PLAYER_PAUSE';
 export const PLAYER_SEEK = 'PLAYER_SEEK';
@@ -29,8 +31,12 @@ export function loadVideoFromYoutube(url) {
     return { type: PLAYER_LOAD_FROM_YOUTUBE, payload: { url, source: 'youtube' } };
 }
 
-export function loadVideoFromServer(source, name, url = null) {
-    return { type: PLAYER_LOAD_FROM_SERVER, payload: { source, name, url } };
+export function loadVideoFromServer(source, name, url = null, available = true, version = 0) {
+    return { type: PLAYER_LOAD_FROM_SERVER, payload: { source, name, url, available, version } };
+}
+
+export function fileUploaded(url) {
+    return { type: PLAYER_FILE_UPLOADED, payload: { url } };
 }
 
 export function completeVideoFromFile(url, name, type = null) {
@@ -55,6 +61,10 @@ export function setLoaded(loaded) {
 
 export function setAuthorized(authorized) {
     return { type: PLAYER_AUTHORIZED, payload: { authorized } };
+}
+
+export function setAvailable(available) {
+    return { type: PLAYER_AVAILABLE, payload: { available } };
 }
 
 export function play(time) {
@@ -90,10 +100,13 @@ const initialState = {
     subtitles: [],
     loaded: false,
     authorized: true,
+    available: true,
     playing: false,
     fromServer: false,
     time: 0,
     showtime: false,
+    uploadedUrl: null,
+    version: 0,
 };
 
 const inititalSubtitleState = {
@@ -132,8 +145,10 @@ export default function player(state = initialState, action) {
                 type: payload.type,
                 source: payload.source,
                 fromServer: false,
+                available: true,
                 playing: false,
                 time: 0,
+                uploadedUrl: null,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -144,8 +159,10 @@ export default function player(state = initialState, action) {
                 sources: [],
                 source: payload.source,
                 fromServer: false,
+                available: true,
                 playing: false,
                 time: 0,
+                uploadedUrl: null,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -158,8 +175,10 @@ export default function player(state = initialState, action) {
                 type: payload.type,
                 source: payload.source,
                 fromServer: false,
+                available: true,
                 playing: false,
                 time: 0,
+                uploadedUrl: null,
                 subtitles: state.url ? [] : state.subtitles,
             };
 
@@ -171,6 +190,11 @@ export default function player(state = initialState, action) {
                 name: payload.name,
                 source: payload.source,
                 fromServer: true,
+                available: payload.available !== false,
+                version: payload.version || 0,
+                playing: false,
+                time: 0,
+                uploadedUrl: null,
             };
 
         case PLAYER_COMPLETE_FROM_FILE:
@@ -195,6 +219,12 @@ export default function player(state = initialState, action) {
 
         case PLAYER_AUTHORIZED:
             return { ...state, authorized: payload.authorized };
+
+        case PLAYER_AVAILABLE:
+            return { ...state, available: payload.available };
+
+        case PLAYER_FILE_UPLOADED:
+            return { ...state, uploadedUrl: payload.url };
 
         case PLAYER_PLAY:
             return { ...state, playing: true, time: payload.time };

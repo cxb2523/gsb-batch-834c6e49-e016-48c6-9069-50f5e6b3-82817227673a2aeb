@@ -14,6 +14,7 @@ class Room extends Component {
     static propTypes = {
         id: PropTypes.string.isRequired,
         url: PropTypes.bool.isRequired,
+        available: PropTypes.bool.isRequired,
         source: PropTypes.string,
         name: PropTypes.string,
         showtime: PropTypes.bool.isRequired,
@@ -30,10 +31,14 @@ class Room extends Component {
     }
 
     renderContent() {
-        const { source, url, name } = this.props;
+        const { source, url, name, available } = this.props;
 
-        if (url) {
+        if (url && available) {
             return <Player />;
+        }
+
+        if (!available) {
+            return <div className="placeholder">{i18n.t('room.unavailable', { name })}</div>;
         }
 
         if (source === 'file') {
@@ -65,6 +70,7 @@ export default connect(
     state => ({
         source: state.player.source,
         url: state.player.url !== null,
+        available: state.player.available,
         name: state.player.name,
         showtime: state.player.showtime,
     }),

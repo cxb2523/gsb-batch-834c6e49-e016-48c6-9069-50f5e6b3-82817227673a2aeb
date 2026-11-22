@@ -15,6 +15,7 @@ class Socket extends Component {
             source: PropTypes.string.isRequired,
             name: PropTypes.string.isRequired,
             fromServer: PropTypes.bool.isRequired,
+            uploadedUrl: PropTypes.string,
         }),
         // Dispatchers
         onOpen: PropTypes.func.isRequired,
@@ -98,29 +99,44 @@ class Socket extends Component {
             this.api.setReady(ready);
         }
 
-        if (video && (!prevProps.video || video.url !== prevProps.video.url) && !video.fromServer) {
-            const { source, name, url } = video;
+        if (video && !video.fromServer) {
+            const previous = prevProps.video;
+            const changed = !previous
+                || video.url !== previous.url
+                || video.uploadedUrl !== previous.uploadedUrl;
 
-            this.api.loadVideo(source, name, url);
+            if (changed) {
+                const { source, name, url, uploadedUrl } = video;
+
+                if (source === 'file' && !uploadedUrl) {
+                    // The file may have been dropped before joining the room:
+                    // make sure its upload (and replayable address) is on the way.
+                    get('drop-handler').uploadPendingFile();
+                }
+
+                // Local files are announced with their replayable address
+                // (null until the upload to the server completed).
+                this.api.loadVideo(source, name, source === 'file' ? uploadedUrl : url);
+            }
         }
     }
 
     onVideoUrl(event) {
-        const { name, url } = event.detail;
+        const { name, url, available, version } = event.detail;
 
-        this.props.onVideo('url', name, url);
+        this.props.onVideo('url', name, url, available, version);
     }
 
     onVideoYoutube(event) {
-        const { name, url } = event.detail;
+        const { name, url, available, version } = event.detail;
 
-        this.props.onVideo('youtube', name, url);
+        this.props.onVideo('youtube', name, url, available, version);
     }
 
     onVideoFile(event) {
-        const { name } = event.detail;
+        const { name, url, available, version } = event.detail;
 
-        this.props.onVideo('file', name);
+        this.props.onVideo('file', name, url, available, version);
     }
 
     /**
@@ -139,12 +155,12 @@ class Socket extends Component {
 
 export default connect(
     state => {
-        const { loaded, authorized, url, source, name, fromServer } = state.player;
+        const { loaded, authorized, url, source, name, fromServer, uploadedUrl } = state.player;
         const { connected } = state.room;
 
         return {
             ready: connected && loaded && authorized,
-            video: connected && url && source && name ? { url, source, name, fromServer } : null,
+            video: connected && url && source && name ? { url, source, name, fromServer, uploadedUrl } : null,
         };
     },
     dispatch => ({
@@ -158,6 +174,6 @@ export default connect(
         onControlPause: event => dispatch(pause(event.detail)),
         onControlSeek: event => dispatch(seek(event.detail)),
         onControlStop: event => dispatch(stop(event.detail)),
-        onVideo: (source, name, url = null) => dispatch(loadVideoFromServer(source, name, url)),
+        onVideo: (source, name, url = null, available = true, version = 0) => dispatch(loadVideoFromServer(source, name, url, available, version)),
     })
 )(Socket);

@@ -8,10 +8,12 @@ export default class Video extends Component {
         playing: PropTypes.bool.isRequired,
         time: PropTypes.number.isRequired,
         authorized: PropTypes.bool.isRequired,
+        available: PropTypes.bool.isRequired,
         loaded: PropTypes.bool.isRequired,
         setDuration: PropTypes.func.isRequired,
         setLoaded: PropTypes.func.isRequired,
         setAuthorized: PropTypes.func.isRequired,
+        setAvailable: PropTypes.func.isRequired,
         end: PropTypes.func.isRequired,
         onTimeUpdate: PropTypes.func.isRequired,
         onDurationChange: PropTypes.func.isRequired,
@@ -51,7 +53,13 @@ export default class Video extends Component {
     get buffered() { return this.element.buffered; }
 
     componentDidUpdate(prevProps) {
-        const { time, playing, volume } = this.props;
+        const { src, time, playing, volume } = this.props;
+
+        // Source changed: the old element's state is irrelevant, the fresh
+        // element will sync on canplay. Never carry old timings over.
+        if (src !== prevProps.src) {
+            return;
+        }
 
         if (playing !== prevProps.playing) {
             playing ? this.play(time) : this.pause(time);
@@ -61,6 +69,17 @@ export default class Video extends Component {
 
         if (volume !== prevProps.volume) {
             this.element.volume = this.props.volume;
+        }
+    }
+
+    componentWillUnmount() {
+        if (this.element) {
+            // Fully detach the old source: once unmounted, its pause/seek/end
+            // events must not leak into the room anymore.
+            this.element.pause();
+            this.element.removeAttribute('src');
+            this.element.load();
+            this.element = null;
         }
     }
 
@@ -149,6 +168,12 @@ export default class Video extends Component {
 
     onError(error) {
         console.error(error);
+
+        // The source address is missing or expired: show an explicit
+        // unavailable state instead of a blank player.
+        if (this.props.available) {
+            this.props.setAvailable(false);
+        }
     }
 
     render(){
@@ -168,6 +193,7 @@ export default class Video extends Component {
                 onPlay={this.props.onPlayed}
                 onPause={this.props.onPaused}
                 onEnded={this.onEnded}
+                onError={this.onError}
             >
                 <Subtitles />
             </video>

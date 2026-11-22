@@ -12,6 +12,7 @@ import Showtime from '@client/common/Showtime';
 class Player extends Component {
     static propTypes = {
         source: PropTypes.string.isRequired,
+        url: PropTypes.string.isRequired,
         setShowtime: PropTypes.func.isRequired,
     };
 
@@ -88,13 +89,16 @@ class Player extends Component {
     }
 
     render() {
-        const { source } = this.props;
+        const { source, url } = this.props;
         const VideoComponent = source === 'youtube' ? YoutubeVideo : Video;
 
         return (
             <figure className="player">
                 <AuthorizationModal />
+                {/* Keyed by url: switching source unmounts the old video element
+                    (fully unbinding its events) before the new source is bound. */}
                 <VideoComponent
+                    key={url}
                     ref={this.setVideo}
                     onTimeUpdate={this.onTimeUpdate}
                     onDurationChange={this.onTimeUpdate}
@@ -127,6 +131,7 @@ class Player extends Component {
 export default connect(
     state => ({
         source: state.player.source,
+        url: state.player.url,
     }),
     dispatch => ({
         setShowtime: showtime => dispatch(setShowtime(showtime)),

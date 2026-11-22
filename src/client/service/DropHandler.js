@@ -1,13 +1,15 @@
-import { loadVideoFromFile, loadVideoFromUrl, loadVideoFromYoutube, loadSubtitle, completeVideoFromFile } from '@client/store/player';
+import { loadVideoFromFile, loadVideoFromUrl, loadVideoFromYoutube, loadSubtitle, completeVideoFromFile, fileUploaded } from '@client/store/player';
 import HeadRequest from '@client/http/HeadRequest';
 
 const FILENAME_MATCHER = /^\/?(.+)\.(\w+)$/i;
 
 export default class DropHandler {
-    constructor(store, converter, youtube) {
+    constructor(store, converter, youtube, api) {
         this.store = store;
         this.converter = converter;
         this.youtube = youtube;
+        this.api = api;
+        this.pendingFile = null;
 
         this.onDragOver = this.onDragOver.bind(this);
         this.onDrop = this.onDrop.bind(this);
@@ -114,6 +116,30 @@ export default class DropHandler {
         this.store.dispatch(
             action(URL.createObjectURL(file), file.name, file.size, file.type)
         );
+
+        // Upload local files so the server can hand a replayable address
+        // to the other members and to late joiners.
+        if (!isFileFromServer) {
+            this.pendingFile = file;
+            this.uploadPendingFile();
+        }
+    }
+
+    /**
+     * Upload the last dropped local file, once connected to a room
+     */
+    uploadPendingFile() {
+        if (!this.pendingFile || !this.api.client) {
+            return;
+        }
+
+        const file = this.pendingFile;
+
+        this.pendingFile = null;
+
+        this.api.uploadFile(file)
+            .then(({ url }) => this.store.dispatch(fileUploaded(url)))
+            .catch(error => console.error('File upload failed:', error));
     }
 
     handleSubtitle(file) {

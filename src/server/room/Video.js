@@ -7,6 +7,7 @@ export default class Video extends EventEmitter {
         this.source = source;
         this.url = url;
         this.name = name;
+        this.version = 0;
         this.playedAt = null;
         this.at = null;
         this.currentTime = 0;
@@ -14,6 +15,35 @@ export default class Video extends EventEmitter {
 
     get playing() {
         return this.playedAt !== null;
+    }
+
+    /**
+     * Whether this source has a replayable address for (late) joiners
+     *
+     * @return {Boolean}
+     */
+    get available() {
+        return this.url !== null;
+    }
+
+    /**
+     * Serializable description of this source
+     *
+     * @return {Object}
+     */
+    getInfo() {
+        const { source, url, name, available, version } = this;
+
+        return { source, url, name, available, version };
+    }
+
+    /**
+     * Register a replayable address (e.g. once the upload of a local file completed)
+     *
+     * @param {String} url
+     */
+    setUrl(url) {
+        this.url = url;
     }
 
     get time() {

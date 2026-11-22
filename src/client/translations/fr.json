@@ -11,7 +11,8 @@
     },
     "room": {
         "drop_to_start": "Déposez un fichier vidéo ou un lien pour commencer !",
-        "drop_file": "Déposer le fichier \"{{name}}\" pour rejoindre"
+        "drop_file": "Déposer le fichier \"{{name}}\" pour rejoindre",
+        "unavailable": "La vidéo \"{{name}}\" n'est pas disponible (adresse manquante ou expirée). Déposez le fichier pour la regarder."
     },
     "about": {
         "button": "À propos",

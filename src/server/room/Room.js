@@ -9,6 +9,7 @@ export default class Room {
         this.users = new Map();
         this.emptyResolver = new TimedEvent(this.checkEmpty.bind(this), 5000);
         this.video = null;
+        this.videoVersion = 0;
 
         this.addClient = this.addClient.bind(this);
         this.removeClient = this.removeClient.bind(this);
@@ -61,16 +62,20 @@ export default class Room {
     createUser(client) {
         const user = new User(client.id);
 
-        this.send('user:add', user.id);
-        this.sumUp(client, user);
-
-        this.users.set(client, user);
-
-        user.on('ready', this.onUserReady);
-
+        // Pause before the newcomer is registered: the pause broadcast reaches
+        // existing members only, and the snapshot below already carries the
+        // paused state, so nobody receives the same state twice.
         if (this.video) {
             this.video.pause();
         }
+
+        this.send('user:add', user.id);
+
+        this.users.set(client, user);
+
+        this.sumUp(client, user);
+
+        user.on('ready', this.onUserReady);
     }
 
     removeUser(client) {
@@ -92,15 +97,18 @@ export default class Room {
     sumUp(client, user) {
         client.send('user:me', user.id);
 
-        this.users.forEach(user => {
-            client.send('user:add', user.id);
-            client.send('user:ready', user);
+        this.users.forEach(other => {
+            if (other !== user) {
+                client.send('user:add', other.id);
+                client.send('user:ready', other);
+            }
         });
 
         if (this.video) {
-            const { source, url, name } = this.video;
-
-            client.send(`video:${source}`, { url, name });
+            // Full snapshot, in order: source, then play/pause state, then position.
+            // Sent to the newcomer only, never broadcast to the room.
+            client.send(`video:${this.video.source}`, this.video.getInfo());
+            client.send(this.video.playing ? 'control:play' : 'control:pause', this.video.time);
             client.send('control:seek', this.video.currentTime);
         }
     }
@@ -140,7 +148,23 @@ export default class Room {
     }
 
     onClientVideoFile(data, client) {
-        this.setVideo(new Video('file', null, data.name), client);
+        const { name } = data;
+        const url = Room.sanitizeUrl(data.url);
+        const current = this.video;
+
+        // Same local file, now with a replayable address (upload completed):
+        // register the address on the current video instead of resetting the room.
+        if (current && current.source === 'file' && current.name === name && !current.url && url) {
+            current.setUrl(url);
+
+            this.sendToOther(client, `video:${current.source}`, current.getInfo());
+
+            console.info('Registered replayable address for file:', name, url);
+
+            return;
+        }
+
+        this.setVideo(new Video('file', url, name), client);
     }
 
     onClientVideoUrl(data, client) {
@@ -151,30 +175,48 @@ export default class Room {
         this.setVideo(new Video('youtube', data.url, data.name), client);
     }
 
+    /**
+     * Only http(s) addresses are replayable by other members
+     * (blob: and object URLs only exist in the sender's browser).
+     *
+     * @param {String} url
+     *
+     * @return {String|null}
+     */
+    static sanitizeUrl(url) {
+        return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null;
+    }
+
     unloadVideo() {
         if (this.video) {
+            // Fully unbind the old source first: it must not broadcast anymore.
             this.video.off('play', this.onVideoPlay);
             this.video.off('pause', this.onVideoPause);
             this.video.off('seek', this.onVideoSeek);
             this.video.off('stop', this.onVideoStop);
+            this.video = null;
         }
     }
 
     setVideo(video, client) {
         this.unloadVideo();
 
+        // Assign the new source before broadcasting: any member joining while
+        // the broadcast is in flight gets a snapshot of this same version.
+        this.video = video;
+        this.video.version = ++this.videoVersion;
+
         video.on('play', this.onVideoPlay);
         video.on('pause', this.onVideoPause);
         video.on('seek', this.onVideoSeek);
         video.on('stop', this.onVideoStop);
 
-        const { source, url, name } = video;
+        this.sendToOther(client, `video:${video.source}`, video.getInfo());
 
-        this.sendToOther(client, `video:${source}`, { url, name });
+        // Reset playback state and position for existing members
+        this.sendToOther(client, 'control:stop');
 
-        this.video = video;
-
-        console.info('Loaded video:', source, url, name);
+        console.info('Loaded video:', video.source, video.url, video.name);
     }
 
     onUserReady(event) {

@@ -24,7 +24,7 @@ container.registerParameter('config:debug', process.env.NODE_ENV === 'developmen
 container.registerCallback('store', createStore, ['config:debug']);
 
 // Services:
-container.registerService('drop-handler', DropHandler, ['store', 'converter', 'youtube']);
+container.registerService('drop-handler', DropHandler, ['store', 'converter', 'youtube', 'api']);
 container.registerService('converter', SubtitleConverter);
 container.registerService('router', Router, ['store']);
 container.registerService('api', Api, ['config:host', 'config:protocol']);

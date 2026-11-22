@@ -1,8 +1,9 @@
 import Room from '@server/room/Room';
 
 export default class RoomManager {
-    constructor() {
+    constructor(onDelete = null) {
         this.rooms = new Map();
+        this.onDelete = onDelete;
 
         this.deleteRoom = this.deleteRoom.bind(this);
     }
@@ -47,6 +48,10 @@ export default class RoomManager {
         this.rooms.delete(id);
 
         room.destroy();
+
+        if (this.onDelete) {
+            this.onDelete(room);
+        }
 
         console.info(`Room ${id} destroyed.`);
     }
