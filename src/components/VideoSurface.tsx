@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type Hls from "hls.js";
 import { isLocalMedia, mediaUrl } from "../api";
+import { PlayerSession } from "../playback-session";
 
 export type VideoHandle = {
   el: () => HTMLVideoElement | null; play: () => void; pause: () => void; toggle: () => void;
@@ -15,11 +16,20 @@ type Props = {
   onResumeRequired?: () => void; className?: string;
 };
 
-/** Bounded HLS buffering, explicit play intent, lazy codec loading and complete teardown. */
+/** 看门狗在「没有任何进度」多久后判定为卡死。 */
+const STALL_LIMIT_MS = 12_000;
+const STALL_LIMIT_RELAXED_MS = 20_000;
+
+/**
+ * Bounded HLS buffering, explicit play intent, lazy codec loading and complete teardown.
+ *
+ * `src` 变化即开始新一轮：上一轮的 hls.js 被销毁、看门狗与挂起定时器被取消、媒体节点
+ * 解除绑定。迟到的清单/引擎回包属于上一轮，不会挂到新视频上。
+ */
 const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(props, ref) {
   const { src, poster, autoPlay = true, active = true, enhancedBuffer = true, muted = false, loop = false,
     fit = "contain", volume = 1, rate = 1, className = "" } = props;
-  const videoRef = useRef<HTMLVideoElement>(null), hlsRef = useRef<Hls | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null), hlsRef = useRef<PlayerSession | null>(null);
   const callbacks = useRef(props); callbacks.current = props;
   const wanted = useRef(autoPlay), released = useRef(false), releaseTimer = useRef<number | undefined>(undefined);
   const pendingSeek = useRef<{ time: number; at: number } | null>(null);
@@ -42,7 +52,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(props,
     videoRef.current?.pause();
     window.clearTimeout(releaseTimer.current);
     releaseTimer.current = window.setTimeout(() => {
-      hlsRef.current?.stopLoad(); released.current = true;
+      hlsRef.current?.instance?.stopLoad(); released.current = true;
     }, 60_000);
   };
   const intent = (play: boolean) => {
@@ -85,53 +95,62 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(props,
     return () => { document.removeEventListener("visibilitychange", visibility); window.clearTimeout(releaseTimer.current); };
   }, []);
   useEffect(() => {
-    const hls = hlsRef.current;
+    const hls = hlsRef.current?.instance;
     if (hls) { hls.config.maxBufferLength = enhancedBuffer ? 60 : 20; hls.config.maxBufferSize = (enhancedBuffer ? 32 : 20) * 1024 * 1024; }
   }, [enhancedBuffer]);
 
   useEffect(() => {
     const video = videoRef.current; if (!video || !src) return;
+    const session = hlsRef.current ??= new PlayerSession();
     let disposed = false, failed = false;
     let lastTime = -1, lastProgress = performance.now();
     pendingSeek.current = null; released.current = false; setReady(false); applySettings();
     const url = isLocalMedia(src) ? src : mediaUrl(src);
     const fail = (message: string) => {
       if (disposed || failed) return;
-      failed = true; hlsRef.current?.stopLoad(); report(message);
+      failed = true; session.instance?.stopLoad(); report(message);
     };
-    if (url.includes("/hls?u=")) {
-      void import("hls.js").then(({ default: Hls }) => {
-        if (disposed) return;
-        if (!Hls.isSupported()) { video.src = url; start(); return; }
-        const enhanced = callbacks.current.enhancedBuffer !== false;
-        const hls = new Hls({
-          interstitialsController: undefined, contentSteeringController: undefined, enableInterstitialPlayback: false,
-          enableWorker: true, maxBufferLength: enhanced ? 60 : 20, maxMaxBufferLength: 90,
-          maxBufferSize: (enhanced ? 32 : 20) * 1024 * 1024, backBufferLength: 15,
-          manifestLoadingTimeOut: 15000, manifestLoadingMaxRetry: 2, levelLoadingMaxRetry: 2, fragLoadingMaxRetry: 3,
-        });
-        hlsRef.current = hls;
-        hls.on(Hls.Events.MANIFEST_PARSED, start);
-        hls.on(Hls.Events.ERROR, (_event, error) => {
-          if (error.fatal) fail(`播放中断 · ${error.details}`);
-        });
-        hls.loadSource(url); hls.attachMedia(video);
-      }).catch(() => fail("播放器组件加载失败，请重试"));
-    } else { video.src = url; start(); }
+    session.open(
+      { url, hls: url.includes("/hls?u=") },
+      {
+        enhancedBuffer: () => callbacks.current.enhancedBuffer !== false,
+        onHls: (hls: Hls, Events: typeof Hls.Events) => hls.on(Events.MANIFEST_PARSED, () => { if (!disposed) start(); }),
+        onError: (message: string) => fail(message),
+        onNative: (media: string) => { if (!disposed) { video.src = media; start(); } },
+      },
+      video,
+    );
+
     const watchdog = window.setInterval(() => {
       if (disposed || failed) return;
+      const element = videoRef.current;
+      if (!element) return;
       const now = performance.now();
-      if (!wanted.current || !visible() || video.paused || video.ended || video.seeking) { lastProgress = now; lastTime = video.currentTime; return; }
-      if (Math.abs(video.currentTime - lastTime) > .15) { lastProgress = now; lastTime = video.currentTime; }
-      else if (now - lastProgress > (callbacks.current.enhancedBuffer === false ? 20_000 : 12_000)) fail("视频长时间未响应，正在刷新播放地址");
+      if (!wanted.current || !visible() || element.paused || element.ended || element.seeking) {
+        lastProgress = now; lastTime = element.currentTime; return;
+      }
+      if (Math.abs(element.currentTime - lastTime) > .15) { lastProgress = now; lastTime = element.currentTime; }
+      const limit = callbacks.current.enhancedBuffer === false ? STALL_LIMIT_RELAXED_MS : STALL_LIMIT_MS;
+      if (now - lastProgress > limit) fail("视频长时间未响应，正在刷新播放地址");
     }, 1000);
+
     return () => {
-      disposed = true; window.clearInterval(watchdog); window.clearTimeout(releaseTimer.current);
-      hlsRef.current?.destroy(); hlsRef.current = null;
-      video.pause(); video.removeAttribute("src"); video.load();
+      // 先作废本轮回包，再逐一拆除定时器与媒体节点。
+      disposed = true;
+      window.clearInterval(watchdog);
+      window.clearTimeout(releaseTimer.current);
+      releaseTimer.current = undefined;
+      session.close();
+      // 用本轮开始时捕获的节点：卸载时 React 可能已经把 ref 置空。
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
     };
+    // Latest callbacks and settings are read through refs; never recreate the stream for play/pause.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
+
+  useEffect(() => () => { hlsRef.current?.close(); hlsRef.current = null; }, []);
 
   return <video ref={videoRef} poster={poster} playsInline loop={loop} preload="metadata"
     onClick={props.onClick} className={`w-full h-full bg-black ${fit === "cover" ? "object-cover" : "object-contain"} ${className}`}

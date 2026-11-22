@@ -24,7 +24,7 @@ try {
         } catch { Start-Sleep -Milliseconds 200 }
     }
     if (-not $ready) { throw 'Vite did not become ready on 127.0.0.1:1420.' }
-    $results = foreach ($suite in @('reference-ui', 'optimization', 'discovery', 'immersive', 'playback-retry', 'security-settings', 'html-security')) {
+    $results = foreach ($suite in @('reference-ui', 'optimization', 'discovery', 'immersive', 'playback-retry', 'playback-session', 'security-settings', 'html-security')) {
         $browserProfile = Join-Path $scratch $suite
         $stderr = Join-Path $output "$suite.stderr"
         $htmlFile = Join-Path $output "$suite.html"

@@ -9,12 +9,189 @@ use ring::{aead, agreement, hkdf, rand::SystemRandom};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Sessions are keyed by line origin. A signed playback session is only valid for the
+/// line it was negotiated on, so switching lines must never reuse or clear another line's
+/// session in place.
+static SESSIONS: Lazy<std::sync::Mutex<HashMap<String, Line>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
 const MAX_SEQUENCE: u32 = 16384;
+/// Keep a handful of recent lines warm; beyond that evict the least recently used one only.
+const MAX_LINES: usize = 6;
+
+type OpenFuture = Pin<Box<dyn Future<Output = Result<Session, String>> + Send>>;
+
+/// One origin's playback session slot.
+///
+/// `session` is `None` while a handshake is in flight or after it failed: callers that
+/// arrive meanwhile wait on the same mutex, so a burst of concurrent address requests for
+/// one line performs exactly one handshake. Holding the guard across the encrypted call
+/// also serialises `sequence` / `clock_offset`, which the response binds by value.
+struct Line {
+    session: Arc<Mutex<Option<Session>>>,
+    /// Cached copy of the session deadline for cheap pruning; `None` while opening.
+    expires: Arc<std::sync::Mutex<Option<Instant>>>,
+    used: Instant,
+}
+
+impl Line {
+    fn new(now: Instant) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+            expires: Arc::new(std::sync::Mutex::new(None)),
+            used: now,
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.expires
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some_and(|expires| now >= expires)
+    }
+}
+
+fn lines() -> std::sync::MutexGuard<'static, HashMap<String, Line>> {
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// What one address request held when it finished, so a failure can be attributed
+/// to exactly that line/session instead of clearing unrelated state.
+struct Lease {
+    origin: String,
+    session: Arc<Mutex<Option<Session>>>,
+    expires: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl Lease {
+    /// Release every expired line, then (if this attempt failed) drop this line's slot so
+    /// the next request renegotiates. Other lines are untouched: an in-flight request for
+    /// a different line must not lose its session because this one errored.
+    fn finish(self, failed: bool) {
+        let now = Instant::now();
+        {
+            let mut map = lines();
+            prune_expired(&mut map, now);
+        }
+        if failed {
+            forget_line(&self.origin, &self.session);
+            // Clear under our own lock too; a waiter that already cloned the slot must see
+            // that the session it was about to reuse is gone.
+            if let Ok(mut slot) = self.session.try_lock() {
+                *slot = None;
+            }
+            if let Ok(mut expires) = self.expires.lock() {
+                *expires = None;
+            }
+        }
+    }
+}
+
+/// Callers that hold a line's async mutex keep the map lock out of the picture entirely;
+/// the map is only touched before locking a line, never after, so the two never deadlock.
+fn line_for(origin: &str, now: Instant) -> Line {
+    let mut map = lines();
+    prune_expired(&mut map, now);
+    let (session, expires) = match map.entry(origin.to_string()) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            slot.get_mut().used = now;
+            (slot.get().session.clone(), slot.get().expires.clone())
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            let fresh = Line::new(now);
+            let pair = (fresh.session.clone(), fresh.expires.clone());
+            slot.insert(fresh);
+            pair
+        }
+    };
+    evict_over_capacity(&mut map, MAX_LINES);
+    Line {
+        session,
+        expires,
+        used: now,
+    }
+}
+
+/// Drop sessions whose lifetime elapsed. Only those lines are removed.
+fn prune_expired(map: &mut HashMap<String, Line>, now: Instant) {
+    map.retain(|_, line| !line.expired(now));
+}
+
+/// 线路切换后调用：只保留当前线路（以及它正在使用的会话），其余线路的会话一并淘汰。
+///
+/// 旧会话里带着旧站点的密钥与序号，换线后既不能复用也不该滞留内存。这里逐条删除，
+/// 不作为「整体清空」：目标线路若已有可用会话，继续复用。
+pub(crate) fn retain_line(origin: &str) {
+    let mut map = lines();
+    map.retain(|key, _| key == origin);
+}
+
+/// Bound memory when the user cycles through many mirror origins.
+/// Evict the least recently used line only — never wipe the whole cache, which would
+/// discard sessions that other lines are actively using.
+fn evict_over_capacity(map: &mut HashMap<String, Line>, max: usize) {
+    while map.len() > max {
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, line)| line.used)
+            .map(|(origin, _)| origin.clone())
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+fn forget_line(origin: &str, session: &Arc<Mutex<Option<Session>>>) {
+    let mut map = lines();
+    let ours = map
+        .get(origin)
+        .is_some_and(|line| Arc::ptr_eq(&line.session, session));
+    if ours {
+        map.remove(origin);
+    }
+}
+
+/// Forget the session held by one line's slot, keeping the slot itself so waiters that
+/// already cloned it see the invalidation instead of reusing a broken session.
+fn invalidate(
+    guard: &mut OwnedMutexGuard<Option<Session>>,
+    expires: &std::sync::Mutex<Option<Instant>>,
+) {
+    **guard = None;
+    *expires.lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+/// Wait for the line's session, opening (or reopening) it at most once.
+///
+/// `open` runs while the slot is locked, so concurrent callers observe one handshake and
+/// then reuse its result instead of racing their own.
+async fn ready_session(
+    session: &Arc<Mutex<Option<Session>>>,
+    expires: &std::sync::Mutex<Option<Instant>>,
+    mut open: impl FnMut() -> OpenFuture,
+) -> Result<OwnedMutexGuard<Option<Session>>, String> {
+    let mut guard = session.clone().lock_owned().await;
+    let stale = guard
+        .as_ref()
+        .is_none_or(|current| current.expires <= Instant::now() || current.sequence >= MAX_SEQUENCE);
+    if stale {
+        invalidate(&mut guard, expires);
+        let opened = open().await?;
+        *expires.lock().unwrap_or_else(|error| error.into_inner()) = Some(opened.expires);
+        *guard = Some(opened);
+    }
+    Ok(guard)
+}
 
 struct Session {
     kid: String,
@@ -225,31 +402,40 @@ pub(crate) async fn video(
     {
         return Err("镜像线路仅供游客浏览；登录请切换到固定线路".into());
     }
-    let mut sessions = SESSIONS.lock().await;
-    if sessions
-        .get(&origin)
-        .is_none_or(|s| s.expires <= Instant::now() || s.sequence >= MAX_SEQUENCE)
-    {
-        sessions.remove(&origin);
-        // Bound the in-memory cache when switching through many mirror origins.
-        if sessions.len() >= 4 {
-            sessions.clear();
+    // One slot per line. Concurrent requests for the same line share a single handshake and
+    // then take turns on the encrypted channel, so `sequence` and `clock_offset` stay ordered.
+    let line = line_for(&origin, Instant::now());
+    let lease = Lease {
+        origin: origin.clone(),
+        session: line.session.clone(),
+        expires: line.expires.clone(),
+    };
+    let attempt = async {
+        let mut guard = ready_session(&line.session, &line.expires, || {
+            let origin = origin.clone();
+            Box::pin(async move { Session::open(&origin).await }) as OpenFuture
+        })
+        .await?;
+        let session = guard.as_mut().ok_or("播放会话不可用")?;
+        let result = session
+            .call(
+                &origin,
+                &format!("/api/videos/{id}/episodes/{ep}/playback"),
+                token,
+            )
+            .await;
+        if result.is_err() {
+            // Clear before releasing the lock: a waiter queued on this slot must renegotiate
+            // rather than continue on the session that just failed.
+            invalidate(&mut guard, &line.expires);
         }
-        sessions.insert(origin.clone(), Session::open(&origin).await?);
+        result
     }
-    let result = sessions
-        .get_mut(&origin)
-        .unwrap()
-        .call(
-            &origin,
-            &format!("/api/videos/{id}/episodes/{ep}/playback"),
-            token,
-        )
-        .await;
-    if result.is_err() {
-        sessions.remove(&origin);
-    }
-    normalize(result?, id, ep)
+    .await;
+    let failed = attempt.is_err();
+    drop(line);
+    lease.finish(failed);
+    normalize(attempt?, id, ep)
 }
 
 fn normalize(data: Value, id: i64, ep: u32) -> Result<Value, String> {
@@ -270,6 +456,17 @@ fn normalize(data: Value, id: i64, ep: u32) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests that inspect or prune the process-wide `SESSIONS` map share it; without this
+    /// guard a parallel test's cleanup could evict another test's fixture line.
+    fn sessions_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn clear_lines() {
+        lines().clear();
+    }
 
     fn fixture() -> Session {
         let key =
@@ -360,6 +557,233 @@ mod tests {
             .await
             .unwrap_err()
             .contains("镜像线路"));
+    }
+
+    /// A cache slot the tests can drive without a real handshake.
+    type Slot = (
+        Arc<Mutex<Option<Session>>>,
+        Arc<std::sync::Mutex<Option<Instant>>>,
+    );
+
+    fn slot_with(session: Session) -> Slot {
+        let expires = session.expires;
+        (
+            Arc::new(Mutex::new(Some(session))),
+            Arc::new(std::sync::Mutex::new(Some(expires))),
+        )
+    }
+
+    fn counting_opener(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        ttl: Duration,
+    ) -> impl FnMut() -> OpenFuture {
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let mut session = fixture();
+                session.expires = Instant::now() + ttl;
+                Ok(session)
+            }) as OpenFuture
+        }
+    }
+
+    /// Everything the response binds (nonce, AAD) is derived from `sequence`, so two callers
+    /// racing on one session would both encode `seq = n` and the server would reject one.
+    /// `ready_session` keeps one guard per slot: concurrent callers share the handshake and
+    /// then consume distinct sequence numbers.
+    #[tokio::test]
+    async fn concurrent_callers_share_one_handshake_and_distinct_sequences() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (session, expires): Slot = (Arc::new(Mutex::new(None)), Arc::new(std::sync::Mutex::new(None)));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (session, expires, calls) = (session.clone(), expires.clone(), calls.clone());
+            tasks.push(tokio::spawn(async move {
+                let opener = counting_opener(calls, Duration::from_secs(60));
+                let mut guard: OwnedMutexGuard<Option<Session>> =
+                    ready_session(&session, &expires, opener).await.unwrap();
+                let opened = guard.as_mut().unwrap();
+                opened.sequence += 1;
+                opened.sequence
+            }));
+        }
+        let mut sequences = Vec::new();
+        for task in tasks {
+            sequences.push(task.await.unwrap());
+        }
+        sequences.sort_unstable();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "same line opens once");
+        assert_eq!(
+            sequences,
+            (2..=9).collect::<Vec<_>>(),
+            "each caller gets its own sequence, none reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_session_is_reused_and_expired_one_renegotiates() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (session, expires) = slot_with(fixture());
+        let first = ready_session(&session, &expires, counting_opener(calls.clone(), Duration::from_secs(60)))
+            .await
+            .unwrap();
+        drop(first);
+        let second = ready_session(&session, &expires, counting_opener(calls.clone(), Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "live session reused");
+        drop(second);
+
+        // Expire it: the next caller must renegotiate exactly once.
+        session.lock().await.as_mut().unwrap().expires = Instant::now() - Duration::from_secs(1);
+        let renewed = ready_session(&session, &expires, counting_opener(calls.clone(), Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(renewed.as_ref().unwrap().expires > Instant::now());
+    }
+
+    #[tokio::test]
+    async fn sequence_exhaustion_also_renegotiates() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (session, expires) = slot_with(Session { sequence: MAX_SEQUENCE, ..fixture() });
+        let guard = ready_session(&session, &expires, counting_opener(calls.clone(), Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(guard.as_ref().unwrap().sequence < MAX_SEQUENCE);
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_propagates_and_leaves_the_slot_empty() {
+        let (session, expires): Slot = (Arc::new(Mutex::new(None)), Arc::new(std::sync::Mutex::new(None)));
+        let attempt = ready_session(&session, &expires, || {
+            Box::pin(async { Err("握手失败".to_string()) }) as OpenFuture
+        })
+        .await;
+        let Err(error) = attempt else {
+            panic!("a failed handshake must not yield a guard");
+        };
+        assert_eq!(error, "握手失败");
+        assert!(session.lock().await.is_none(), "no half-built session is kept");
+        assert!(expires.lock().unwrap().is_none());
+    }
+
+    /// Eviction must be per-line: the whole map used to be cleared once four origins were
+    /// cached, which dropped the session a concurrent request for the current line was using.
+    #[test]
+    fn capacity_eviction_keeps_the_live_lines_and_drops_only_the_oldest() {
+        let mut map = HashMap::new();
+        let mut now = Instant::now();
+        for origin in ["https://a.example", "https://b.example", "https://c.example"] {
+            now += Duration::from_secs(1);
+            map.insert(origin.to_string(), Line::new(now));
+        }
+        // Touch the middle one so the least recently used is the first.
+        now += Duration::from_secs(1);
+        map.get_mut("https://b.example").unwrap().used = now;
+        for origin in ["https://d.example", "https://e.example", "https://f.example", "https://g.example"] {
+            now += Duration::from_secs(1);
+            map.insert(origin.to_string(), Line::new(now));
+            evict_over_capacity(&mut map, MAX_LINES);
+        }
+        assert_eq!(map.len(), MAX_LINES);
+        assert!(!map.contains_key("https://a.example"), "oldest line evicted");
+        for kept in ["https://b.example", "https://c.example", "https://g.example"] {
+            assert!(map.contains_key(kept), "{kept} should stay warm");
+        }
+    }
+
+    #[test]
+    fn pruning_only_removes_expired_lines() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        let expired = Line::new(now);
+        *expired.expires.lock().unwrap() = Some(now - Duration::from_secs(1));
+        let open = Line::new(now);
+        *open.expires.lock().unwrap() = Some(now + Duration::from_secs(60));
+        let opening = Line::new(now); // deadline unknown: a handshake is in flight
+        map.insert("https://expired.example".into(), expired);
+        map.insert("https://open.example".into(), open);
+        map.insert("https://opening.example".into(), opening);
+        prune_expired(&mut map, now);
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key("https://expired.example"));
+        assert!(map.contains_key("https://open.example"));
+        assert!(map.contains_key("https://opening.example"), "in-flight handshakes are not pruned");
+    }
+
+    /// `finish` must remove only the failed line; another line's live session survives.
+    #[tokio::test]
+    async fn failed_call_forgets_only_its_own_line() {
+        let _guard = sessions_lock();
+        clear_lines();
+        let now = Instant::now();
+        let other = line_for("https://other.example", now);
+        other.session.lock().await.replace(fixture());
+        let doomed = line_for("https://doomed.example", now);
+        doomed.session.lock().await.replace(fixture());
+        Lease {
+            origin: "https://doomed.example".into(),
+            session: doomed.session.clone(),
+            expires: doomed.expires.clone(),
+        }
+        .finish(true);
+        assert!(doomed.session.lock().await.is_none(), "the failing line is dropped");
+        assert!(
+            other.session.lock().await.is_some(),
+            "a different line's session must not be cleared"
+        );
+        // A successful call must leave its line in place for reuse.
+        Lease {
+            origin: "https://other.example".into(),
+            session: other.session.clone(),
+            expires: other.expires.clone(),
+        }
+        .finish(false);
+        assert!(other.session.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn switching_lines_opens_a_fresh_session_per_line() {
+        let _guard = sessions_lock();
+        clear_lines();
+        let now = Instant::now();
+        let a = line_for("https://line-a.example", now);
+        let b = line_for("https://line-b.example", now);
+        assert!(
+            !Arc::ptr_eq(&a.session, &b.session),
+            "each line owns its own session slot"
+        );
+        a.session.lock().await.replace(fixture());
+        assert!(b.session.lock().await.is_none(), "opening A cannot populate B");
+        let again = line_for("https://line-a.example", now);
+        assert!(Arc::ptr_eq(&a.session, &again.session), "returning to A reuses its slot");
+    }
+
+    /// 换线后旧线路的会话被淘汰，但没有「整体清空」：新线路自己的槽保留。
+    #[tokio::test]
+    async fn retaining_one_line_evicts_the_others_only() {
+        let _guard = sessions_lock();
+        clear_lines();
+        let now = Instant::now();
+        let old = line_for("https://old-line.example", now);
+        old.session.lock().await.replace(fixture());
+        let target = line_for("https://target-line.example", now);
+        target.session.lock().await.replace(fixture());
+        retain_line("https://target-line.example");
+        assert!(
+            !lines().contains_key("https://old-line.example"),
+            "the previous line is evicted after switching"
+        );
+        assert!(lines().contains_key("https://target-line.example"));
+        assert!(
+            target.session.lock().await.is_some(),
+            "the new line's own session survives, so it is not a blanket clear"
+        );
+        // Old slot's session was dropped, not just unmapped: its Arc is no longer alive.
+        assert_eq!(Arc::strong_count(&old.session), 1);
+        clear_lines();
     }
 
     #[tokio::test]

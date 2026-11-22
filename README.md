@@ -175,7 +175,7 @@ Windows GNU 测试环境若缺少 Common Controls v6 manifest，改用：
 ./scripts/test-windows-gnu.ps1
 ```
 
-当前浏览器行为基线为 **277 项**；Rust 离线基线为 **38 通过、10 项联网测试默认忽略**。发布时以 Release 的 `validation.json` 为准。测试中使用模拟媒体和原生窗口桩，**不能视为本轮 Windows 原生全屏按键实机测试**。macOS / Android 也不在本轮发布验证范围内。
+当前浏览器行为基线为 **327 项**；Rust 离线基线为 **54 通过、10 项联网测试默认忽略**。发布时以 Release 的 `validation.json` 为准。测试中使用模拟媒体和原生窗口桩，**不能视为本轮 Windows 原生全屏按键实机测试**。macOS / Android 也不在本轮发布验证范围内。
 
 默认测试不会提交评分、登录真实账号或批量请求上游。联网烟测需单独、按需选择；详情见 [验证说明](docs/verification.md)。
 

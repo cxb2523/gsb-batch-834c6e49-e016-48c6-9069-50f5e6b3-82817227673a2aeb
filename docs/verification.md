@@ -11,10 +11,11 @@
 | `discovery` | 62 | 启动放映、首页、探索分区、专题、标签、图文、热词、间距 |
 | `immersive` | 67 | 隐藏、返回、全屏尺寸、媒体状态保持、选集、综合分 |
 | `playback-retry` | 8 | 空媒体实例重试、换片、旧回包隔离 |
+| `playback-session` | 50 | 换集拆除、旧清单回包丢弃、同地址并发合并、预取交接、清单失败恢复 |
 | `security-settings` | 8 | 后端确认后生效、安全模式切换 |
 | `html-security` | 31 | 正文清洗、协议和链接处理 |
-| **浏览器合计** | **277** | 模拟业务 / 媒体 / 原生窗口接口 |
-| Rust 离线测试 | 38 通过 | 网络目标、缓存、会话、取址协议绑定、参数等 |
+| **浏览器合计** | **327** | 模拟业务 / 媒体 / 原生窗口接口 |
+| Rust 离线测试 | 54 通过 | 网络目标、缓存淘汰与释放、按线路会话、并发取址、取址协议绑定、参数等 |
 | Rust 联网测试 | 10 默认忽略 | 按需执行，不计入默认离线通过数 |
 
 增加文档和发布链接不会自动增加检查数量。历史文档中的计数对应当时版本；当前值以本表和本次发布结果为准。
@@ -34,6 +35,27 @@ Windows GNU 环境可用 `scripts/test-windows-gnu.ps1` 代替原始 cargo test�
 浏览器脚本使用独立 headless Edge 配置目录，自己启动 Vite；运行前请让 1420 端口空闲。它逐项读取测试页面的 JSON 结果，任一失败就返回非零状态，不访问真实用户浏览器。
 
 也可手动运行 `pnpm dev --host 127.0.0.1`，依次访问 `http://127.0.0.1:1420/tests/<名称>.html`。部分夹具需要直接阅读页面末尾的 JSON，不是完整可用客户端。
+
+### 换集 / 换线的播放一致性
+
+`playback-session` 全部使用本地构造的 m3u8 与模拟 `fetch`，不访问真实上游。它检查：
+
+- 正常取址：一个清单地址只创建一次 hls.js 实例，预取到的清单被播放器取走一次而非重复下载。
+- 同线路并发：同一 src 的三次并发加载共享一次请求；请求结束后记录释放，之后的新请求会重新取。
+- 快速换集：旧清单回包迟到时既不创建实例也不触发回调；连续切换四集只留下最后一段的实例，其余预取一并丢弃。
+- 清单失败：报错保留上游状态码、不建实例；下一集仍能正常播放。
+- 非 HLS 媒体：直接交给媒体元素，不经过 hls.js。
+- 组件层：`VideoSurface` 的 src 变化会销毁上一轮实例并解绑媒体节点，两个实例打开同一 src 时只发一次清单请求。
+
+Rust 侧的对应回归在 `cargo test --lib`：
+
+- `playback::tests::concurrent_callers_share_one_handshake_and_distinct_sequences`：同一线路 8 个并发取址只握手一次，序号互不重复。
+- `failed_call_forgets_only_its_own_line` / `retaining_one_line_evicts_the_others_only`：失败或换线只淘汰对应的那条线路，不整体清空。
+- `cache::tests::sweeping_releases_bytes_for_expired_entries` / `capacity_eviction_drops_the_strong_reference`：淘汰与过期都释放计数，缓存也不再持有 `Arc`。
+- `media::tests::evicted_covers_release_memory_and_can_be_fetched_again` / `evicted_playlists_...`：清空后再次请求会重新拉取。
+- `media::tests::seg_responses_distinguish_fragments_from_child_playlists_by_cache_header`：分片 `public, max-age=3600, immutable`，子清单 `no-store`，并带 `X-Media-Kind`。
+
+这些检查使用本地夹具，不能代替真实上游的可用性验证。
 
 ## 实际鼠标与视觉检查
 
@@ -63,7 +85,7 @@ node node_modules/@tauri-apps/cli/tauri.js build --no-bundle
 
 以上按需验证少量公开列表和综合分读取，不提交真实评分。测试所需代理通过正常用户配置传入，不把私人代理凭据写入仓库。
 
-`discovery-source.html` 是独立的公开网页结构快照测试，需要额外本地快照服务，不属于默认 277 项。仓库不发布采集的原网页正文、真实播放分片或用户账户数据。
+`discovery-source.html` 是独立的公开网页结构快照测试，需要额外本地快照服务，不属于默认 327 项。仓库不发布采集的原网页正文、真实播放分片或用户账户数据。
 
 ## 不能从这些结果推断什么
 

@@ -37,14 +37,26 @@ impl<T> BoundedCache<T> {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
         }
     }
-    pub fn get(&mut self, key: &str, now: Instant) -> Option<Arc<T>> {
-        if self
+    /// Drop every expired entry and return how many were released.
+    ///
+    /// Without this, an entry that is never requested again (a cover for a scrolled-away
+    /// card, a playlist for a finished episode) keeps its bytes alive well past the TTL:
+    /// expiry was only checked for the key being looked up.
+    pub fn sweep(&mut self, now: Instant) -> usize {
+        let expired: Vec<String> = self
             .entries
-            .get(key)
-            .is_some_and(|entry| now >= entry.expires)
-        {
-            self.remove(key);
+            .iter()
+            .filter(|(_, entry)| now >= entry.expires)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let released = expired.len();
+        for key in expired {
+            self.remove(&key);
         }
+        released
+    }
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<Arc<T>> {
+        self.sweep(now);
         self.clock = self.clock.saturating_add(1);
         self.entries.get_mut(key).map(|entry| {
             entry.used = self.clock;
@@ -99,6 +111,15 @@ impl<T> BoundedCache<T> {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// Bytes currently accounted to live entries (excludes clones still held by callers).
+    #[cfg(test)]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
     pub fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
@@ -139,5 +160,56 @@ mod tests {
         assert!(cache.get("late", now).is_none());
         cache.insert("fresh".into(), Arc::new(3), 5, now, cache.generation());
         assert!(cache.get("fresh", now).is_some());
+    }
+
+    /// An entry nobody asks for again must still be released once its TTL passes.
+    /// Before `sweep` existed, expiry was only checked for the key being looked up, so a
+    /// cover for a card scrolled out of view pinned its bytes for the whole process.
+    #[test]
+    fn sweeping_releases_bytes_for_expired_entries() {
+        let now = Instant::now();
+        let mut cache = BoundedCache::new(8, 1024, Duration::from_secs(30));
+        for i in 0..4 {
+            cache.insert(format!("k{i}"), Arc::new(i), 100, now, 0);
+        }
+        assert_eq!((cache.len(), cache.bytes()), (4, 400));
+        assert_eq!(cache.sweep(now + Duration::from_secs(29)), 0);
+        assert_eq!(cache.bytes(), 400);
+        assert_eq!(cache.sweep(now + Duration::from_secs(31)), 4);
+        assert_eq!((cache.len(), cache.bytes()), (0, 0));
+    }
+
+    /// A plain `get` of a live key is enough to notice that other entries have expired.
+    #[test]
+    fn get_reclaims_other_expired_entries_without_refetching() {
+        let now = Instant::now();
+        let mut cache = BoundedCache::new(8, 1024, Duration::from_secs(30));
+        cache.insert("drop".into(), Arc::new(2), 10, now, 0);
+        let later = now + Duration::from_secs(20);
+        cache.insert("keep".into(), Arc::new(1), 10, later, 0);
+        let scan = now + Duration::from_secs(35);
+        assert_eq!(cache.get("keep", scan).as_deref(), Some(&1), "a live entry survives the sweep");
+        assert!(cache.get("drop", scan).is_none());
+        assert_eq!(cache.bytes(), 10);
+        // Evicted content can be fetched again once the caller reinserts it.
+        cache.insert("drop".into(), Arc::new(22), 10, scan, 0);
+        assert_eq!(cache.get("drop", scan).as_deref(), Some(&22));
+    }
+
+    /// The value's allocation is released, not just forgotten: the cache must not keep an
+    /// `Arc` alive after capacity eviction.
+    #[test]
+    fn capacity_eviction_drops_the_strong_reference() {
+        let now = Instant::now();
+        let mut cache = BoundedCache::new(1, 1024, Duration::from_secs(600));
+        let first = Arc::new(vec![7u8; 128]);
+        cache.insert("first".into(), first.clone(), 128, now, 0);
+        cache.insert("second".into(), Arc::new(vec![8u8; 128]), 128, now, 0);
+        assert!(cache.get("first", now).is_none());
+        assert_eq!(
+            Arc::strong_count(&first),
+            1,
+            "cache dropped its only reference, so the buffer can be freed"
+        );
     }
 }

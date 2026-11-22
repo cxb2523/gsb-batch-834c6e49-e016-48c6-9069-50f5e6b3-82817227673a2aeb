@@ -76,6 +76,8 @@ pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, Stri
     let next = crate::net::set_base(&url)?;
     if previous != next {
         state.session.clear();
+        // 旧线路的播放会话签给了旧站点，不能带到新线路；逐条淘汰，不动正在使用的新线路。
+        crate::playback::retain_line(&next);
     }
     Ok(next)
 }
