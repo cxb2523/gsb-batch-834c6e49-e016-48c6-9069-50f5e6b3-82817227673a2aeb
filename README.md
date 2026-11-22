@@ -87,5 +87,19 @@ export default {
 
 [ ] Add more video transition effects (Fade, Wipe, etc.)
 
+## ✅ Local Verification
+
+The playback chain is implemented as a standalone state machine in `src/playerCore.js`
+(one draw loop + one active video at any moment; unified teardown/rebuild on switch,
+seek, pause/resume, replay and close; invalid fragments with `end <= start` are skipped).
+A dependency-free verification suite runs locally with Node:
+
+```bash
+npm test
+```
+
+It covers four scenarios with a mocked DOM: normal continuous playback, drag seeking,
+close/release (no lingering loops or listeners), and invalid fragments.
+
 📄 License
 MIT License

@@ -22,7 +22,6 @@ const component = (options) => {
   instance.vm = instance.$mount();
   instance.dom = instance.vm.$el;
   document.body.appendChild(instance.dom);
-  instance.vm.init();
   instance.dom.style.zIndex = seed + 1001;
   seed = 2;
   instance.vm.setFree = function () {
