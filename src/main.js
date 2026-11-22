@@ -1287,6 +1287,22 @@ class Game {
     const endTone = this.ending.takeTone();
     if (endTone) this.audio.finishTone(endTone, this.ending.won);
 
+    /* The car leaves the mix at the flag.
+     *
+     * `ending.holding` is the right predicate and not `p.finished`: a finished
+     * car with the ending disabled or skipped is still being driven by the
+     * player past the line, and taking its engine away would be the mix
+     * deleting a car that is still on the throttle. What makes the engine
+     * eligible to leave is that the ENDING has the car — it is braking to a
+     * stop under a held lens, and the picture says so.
+     *
+     * Idempotent, and safe to call every frame: `setPhase` returns without
+     * touching anything if the phase has not changed, which it must, because
+     * re-arming the ramp every frame would pin the gain at wherever it had
+     * got to and the fade would never complete. `resetRace` is what puts the
+     * phase back, so a restart always races again. */
+    this.audio.setPhase(this.ending.holding ? 'finish' : 'race');
+
     /* Automatic unstick. The AI has had one since the race system landed —
        race/index.js recovers a stranded bot after 2.5 s — but the player had
        nothing except an R key they have no way of knowing about, so a spin
@@ -1570,6 +1586,10 @@ class Game {
    */
   stepPause(dt, opening = false) {
     this.pause.update(dt);
+    /* The pause's own clock, run past the audio so the scheduled suspend lands
+       even though nothing else in the game is stepping. Offline this moves the
+       virtual clock; live it checks whether the duck has arrived. */
+    this.audio.advance(dt);
     const i = this.input;
     if (i.menuUpPressed) this.pause.move(-1);
     if (i.menuDownPressed) this.pause.move(1);
@@ -1610,34 +1630,37 @@ class Game {
    * Stop.
    *
    * The simulation is stopped by `step` returning early and the world stops
-   * being drawn by `frame` — see both. The only thing that needs doing here
-   * is the audio, and it needs doing explicitly: every other subsystem in
-   * this game advances because something calls it, but a Web Audio graph is
-   * running on its own thread and will happily keep the engine droning over a
-   * frozen picture.
+   * being drawn by `frame` — see both. What is left is the audio, and it needs
+   * doing explicitly: every other subsystem in this game advances because
+   * something calls it, but a Web Audio graph is running on its own thread and
+   * will happily keep the engine droning over a frozen picture.
    *
-   * `Audio.stop()` suspends the context, which is the correct instrument and
-   * not merely the cheap one. A suspended AudioContext does not advance
-   * `currentTime`, and every parameter in this engine is written against
-   * `ctx.currentTime` through setTargetAtTime — so nothing that was scheduled
-   * lands while the menu is up, no envelope runs to its end unheard, and on
-   * resume the graph picks up at exactly the phase it was suspended at rather
-   * than fast-forwarding through however long the player was reading a menu.
-   * That is the audio half of "no step of accumulated time dumped into the
-   * first frame", and like the simulation half it is structural.
-   */
+   * `Audio.pause()` ducks the output to silence over about a tenth of a second
+   * and only then freezes the context, so the picture and the sound stop
+   * together and the stop is not a cut. The context is suspended on the audio
+   * clock, from `advance` — a wall-clock timer could freeze the graph in the
+   * middle of its own fade, which is the click the fade exists to avoid.
+   *
+   * DUCK, NOT REBUILD, and the difference is the bug this replaced. Suspending
+   * alone froze the graph at whatever level the car was at, so a pause taken
+   * on a corner exit resumed with the tyres still screaming; the old comment
+   * argued that the suspend was "the correct instrument" because it kept every
+   * ramp in phase, and it was right about the ramps and wrong about the level.
+   * The two are separable: the duck is a level, the suspend is a clock, and
+   * doing both in that order keeps the phase AND arrives at silence. */
   openPause() {
     if (!this.pause.open()) return;
-    this.audio.stop();
+    this.audio.pause();
   }
 
-  /** Go. */
+  /** Go. Resumes the same graph from the same parameters — see Audio.resume. */
   closePause() {
     this.pause.close();
-    /* Resume rather than rebuild: start() on an existing context only calls
-       resume(), so the graph, its buffers and its scheduled ramps are the
-       ones that were there. */
-    this.audio.start();
+    /* Resume rather than rebuild: nothing in the graph is re-created, so the
+       engine's load, the tyre's slip and the shore latch are all exactly what
+       they were when the menu went up. The duck climbs back over the same time
+       constant it went down by. */
+    this.audio.resume();
   }
 
   /**
@@ -1754,6 +1777,13 @@ class Game {
        afterwards, which is the only caller that wants one. */
     this.title.skip();
     this.pause.close();
+    /* The audio is a race, not a menu. Without this the previous run's flag
+       chord, card stamp, rank notes and landing thumps are still in flight
+       over the new grid — they are scheduled on the audio clock and a restart
+       does not touch that clock — and the per-race one-shot latch would refuse
+       the new run's own flag. See Audio.resetRace, which owns the list. */
+    this.audio.resume();
+    this.audio.resetRace();
     this.resetSimClock();
     const p = this.player;
     p.placeAt(34, 0);
@@ -1840,6 +1870,11 @@ class Game {
     p.vertVel = 0; p.height = 0;
     this.effects.reset();
     this.hud.clearFeedback();
+    /* Not a new race, but the car is somewhere else: the airborne latch, the
+       one-shots of the last few seconds and the smoothed gear and slide are
+       all stale. The flag latch is NOT cleared — this is the same race, and
+       its finish is still owed. */
+    this.audio.resetMotion();
   }
 
   /**

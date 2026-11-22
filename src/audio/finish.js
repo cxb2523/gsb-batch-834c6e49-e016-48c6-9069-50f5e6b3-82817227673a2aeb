@@ -62,6 +62,11 @@ export class FinishTones {
   constructor(ctx, dest) {
     this.ctx = ctx;
     this.nodes = [];
+    /* Voices still ringing. The chord is 1.75 s long and the card lands 1.1 s
+       after the flag, so a restart pressed promptly happens while both are
+       still in the air — and those are exactly the two sounds the run being
+       restarted had just earned. flush() is how a restart takes them back. */
+    this.voices = new Set();
     const node = n => { this.nodes.push(n); return n; };
 
     this.out = node(ctx.createGain());
@@ -144,7 +149,7 @@ export class FinishTones {
     g.connect(this.out);
     osc.start(t);
     osc.stop(t + STAMP_DUR + 0.05);
-    osc.onended = () => { osc.disconnect(); g.disconnect(); };
+    this._track(osc, () => { osc.disconnect(); g.disconnect(); });
 
     this._voice('sine', TICK_HZ, TICK_LEVEL, 0, t, TICK_DUR, this.body);
   }
@@ -170,10 +175,38 @@ export class FinishTones {
     g.connect(dest);
     osc.start(t);
     osc.stop(t + dur + 0.05);
-    osc.onended = () => { osc.disconnect(); g.disconnect(); };
+    this._track(osc, () => { osc.disconnect(); g.disconnect(); });
+  }
+
+  _track(src, cleanup) {
+    this.voices.add(src);
+    src.onended = () => {
+      this.voices.delete(src);
+      cleanup();
+    };
+  }
+
+  /**
+   * Cut the flag and the card short.
+   *
+   * For a restart or a new stage, where the previous run's finish is no longer
+   * what the player is hearing — see the header. The permanent filters stay;
+   * only the per-shot oscillators are stopped, and their cleanup still runs.
+   *
+   * `t` is the caller's clock, not zero: offline the virtual clock starts at
+   * zero and the whole render is scheduled from frame one, so `stop(0)` would
+   * retrospectively prevent a chord that has already been issued. See
+   * impact.js, which carries the long version.
+   */
+  flush(t = this.ctx.currentTime) {
+    for (const src of this.voices) {
+      try { src.stop(t); } catch (_) {}
+    }
+    this.voices.clear();
   }
 
   dispose() {
+    this.flush();
     for (const n of this.nodes) n.disconnect();
   }
 }

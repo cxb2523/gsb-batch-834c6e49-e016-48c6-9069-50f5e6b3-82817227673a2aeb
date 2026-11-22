@@ -25,6 +25,10 @@ export class FeedbackVoices {
     this.sources = [];
     this.buf = buffers.white;
     this.boost = 0;
+    /* Position notes and pad ignitions still sounding. Both are the previous
+       run's news — a rank change and a pad it hit — so a restart has to take
+       them with it. See flush(). */
+    this.voices = new Set();
     const node = n => { this.nodes.push(n); return n; };
 
     /* The pad's second engine ------------------------------------------ */
@@ -152,7 +156,7 @@ export class FeedbackVoices {
     this.kickBand.frequency.exponentialRampToValueAtTime(1900 + rev * 1100, t + 0.18);
     src.start(t, 0.37);
     src.stop(t + 0.21);
-    src.onended = () => { src.disconnect(); g.disconnect(); };
+    this._track(src, () => { src.disconnect(); g.disconnect(); });
   }
 
   _tone(t, f0, f1, level, dur, type) {
@@ -169,10 +173,45 @@ export class FeedbackVoices {
     g.connect(this.positionOut);
     osc.start(t);
     osc.stop(t + dur + 0.03);
-    osc.onended = () => { osc.disconnect(); g.disconnect(); };
+    this._track(osc, () => { osc.disconnect(); g.disconnect(); });
+  }
+
+  _track(src, cleanup) {
+    this.voices.add(src);
+    src.onended = () => {
+      this.voices.delete(src);
+      cleanup();
+    };
+  }
+
+  /**
+   * Take back the previous run's punctuation.
+   *
+   * Position notes, pad ignitions and the sustain state that follows them.
+   * The sustained second motor is a permanent node, so it is not cut here —
+   * it is silenced by `resetRace` writing boostTimer to zero through the
+   * normal smoothed path, which is the only way to stop it without a click.
+   *
+   * `t` is the caller's clock, not zero, for the reason impact.js documents:
+   * offline, `stop(0)` would retrospectively prevent a note scheduled later
+   * in the render.
+   */
+  flush(t = this.ctx.currentTime) {
+    for (const src of this.voices) {
+      try { src.stop(t); } catch (_) {}
+    }
+    this.voices.clear();
+  }
+
+  /** Forget the previous race's boost. Smoothed, never stepped — see flush. */
+  resetRace(t) {
+    this.flush(t);
+    this.boost = 0;
+    if (this.boostOut) this.boostOut.gain.setTargetAtTime(0, t, 0.03);
   }
 
   dispose() {
+    this.flush();
     for (const s of this.sources) { try { s.stop(); } catch (_) {} }
     for (const n of this.nodes) n.disconnect();
     for (const s of this.sources) s.disconnect();

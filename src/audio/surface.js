@@ -304,6 +304,23 @@ export class SurfaceVoices {
     set(this.wind.gain, 0.0001 + 0.40 * v * v * lerp(1, 1.3, s.airborne ? 1 : 0));
   }
 
+  /**
+   * Forget the previous run's slide, grip and pan.
+   *
+   * Every one of these is an asymmetric `approach` in update(): quick in and
+   * slow out, which is right within a race and wrong across one. A restart
+   * that happened mid-drift would otherwise start the new race with the old
+   * run's screech still ringing down over three seconds, from the direction
+   * the car was last pointing. Zeroed here, the next update approaches from
+   * silence — which for a car on the grid is the correct starting state.
+   */
+  resetRace() {
+    this.screech = 0;
+    this.grit = 0;
+    this.chirp = 0;
+    this.pan = 0;
+  }
+
   dispose() {
     for (const s of this.sources) { try { s.stop(); } catch (_) {} }
     for (const n of this.nodes) n.disconnect();

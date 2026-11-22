@@ -21,6 +21,24 @@
  *   audio.positionTone(direction);     // 'gained' or 'lost'
  *   audio.boostTone(rpm);              // pad ignition; boostTimer sustains it
  *
+ * And the race lifecycle, which the game drives and the synthesis does not
+ * guess at:
+ *
+ *   audio.pause();                    // menu up: duck smoothly, then suspend
+ *   audio.resume();                   // menu down: pick up where it stopped
+ *   audio.setPhase('finish');         // at the line: car out, sea stays
+ *   audio.setPhase('race');           // back to a race (resetRace does this)
+ *   audio.resetRace();                // restart / new stage: forget the old run
+ *   audio.resetMotion();              // respawn: forget air/speed/gear only
+ *   audio.advance(dt);                // offline harness clock, no state fed
+ *
+ * WHY THESE EXIST AT ALL. The engine, tyres, surf and every one-shot are
+ * scheduled against the context clock, not against the game's frame loop, so a
+ * race that is paused, restarted or finished is an event the graph cannot
+ * infer from the state struct: a frame that is not delivered looks exactly
+ * like a car cruising, and the one-shots of the previous run are already in
+ * flight. These calls are how the game tells the graph which of those it is.
+ *
  * Every field is optional and the second line is the newer half:
  *
  *   landingForce   0..1, how hard the suspension took the landing. Read only
@@ -59,6 +77,26 @@ import { FeedbackVoices } from './feedback.js';
 
 const SEED = 4711;
 
+/* How the menu sounds. A duck that takes DUCK_TAU to reach its target and then
+   a suspend once it is essentially there: suspending a running AudioContext is
+   instantaneous and audible as a cut, so the graph is brought down first and
+   the context is only frozen while nothing is coming out of it. On resume the
+   gain climbs back from wherever the duck left it, which is why the parameter
+   is never stepped — a value that was 0.02 when the menu went up comes back up
+   over the same time constant rather than being reset to 1 and clicking.
+
+   Times are audio-clock seconds. A menu is opened by a key press, so this is
+   wall time in practice; the distinction has no partner here because nothing
+   else in the graph is scheduled against it. */
+const DUCK_LEVEL = 0.0;
+const DUCK_TAU = 0.09;
+const DUCK_SETTLE = 0.35;
+/* And the card. Past the line the car is no longer the subject — it is
+   rolling to a stop under a held lens while the card is read — so the engine
+   and tyres leave and the coast stays. Slow enough to read as the car
+   receding and not as a mix fault. */
+const CAR_EXIT_TAU = 0.55;
+
 export class Audio {
   /**
    * No AudioContext is created here. Constructing one before a user gesture
@@ -83,6 +121,20 @@ export class Audio {
     this._airborne = false;
     this._duck = 0;
     this._speed = 0;
+    /* Lifecycle, and every one of these is latched on purpose. `_paused` is
+       the game's request, not the context's state — a browser that refuses to
+       suspend (or an offline context, which never suspends at all) still has
+       to be silent, because the duck gain is what is doing the silencing.
+       `_suspendAt` is when that duck is far enough down to freeze the clock.
+       `phase` is 'race' or 'finish'; the car bus's own gain is `carFade`, and
+       this flag is what lets a return to racing reopen it. */
+    this._paused = false;
+    this._suspendAt = 0;
+    this._phase = 'race';
+    /* One-shots already fired for this race. The flag and the card are keyed
+       separately, and both are cleared by resetRace — which is the whole of
+       "a restart does not replay last run's chord". */
+    this._fired = { flag: false, card: false };
     /* Defaults chosen so the game sounds like a coast road before anything is
        wired: a road forty metres above the water with the sea somewhere off to
        the left is the setting, and a state struct that omits the new fields
@@ -162,7 +214,24 @@ export class Audio {
 
     this.master = ctx.createGain();
     this.master.gain.value = this.volume;
-    this.master.connect(this.limiter);
+
+    /* The menu duck, and the last thing before the clipper.
+     *
+     * It sits here rather than on the car bus because a pause silences the
+     * world as well as the car: the surf is part of the paused picture and a
+     * menu with the sea still washing under it is a menu that has not quite
+     * stopped. And it sits BEFORE the limiter rather than after it for the
+     * reason the whole output stage is ordered the way it is — the limiter's
+     * promise is about what reaches the device, so nothing may be added after
+     * it. A gain ahead of it can only make the output quieter, which is the
+     * one direction that cannot break the ceiling.
+     *
+     * `_silent()` drives it, and the context is suspended only once it has
+     * arrived at zero, so the cut is inaudible. */
+    this.pauseGain = ctx.createGain();
+    this.pauseGain.gain.value = 1;
+    this.master.connect(this.pauseGain);
+    this.pauseGain.connect(this.limiter);
 
     /* Rumble the speakers cannot reproduce still costs headroom, and the
        saturator below turns any of it into intermodulation across the whole
@@ -210,7 +279,29 @@ export class Audio {
        the balance between the car, the world and the hits can be set. */
     this.bus = ctx.createGain();
     this.bus.gain.value = 1.15;
-    this.bus.connect(this.duck);
+
+    /* The car as a thing that can leave.
+     *
+     * Past the flag the car is not the subject any more: it is rolling to a
+     * stop under a held lens while the card is read, and an engine that keeps
+     * revving through that is the mix disagreeing with the picture. But the
+     * coast is still there, and the sea in particular is the whole reason the
+     * stage looks the way it does — so the car's bus is put behind its own
+     * gain and faded out, while `amb` (surf, sea air, gulls) is not.
+     *
+     * The send to the cliff moves behind the fade as well. It is the sound of
+     * the rock reflecting the CAR, so it has to leave with the car; left
+     * upstream it would keep the engine audible in the reverb for a second
+     * after the dry signal had gone, which is the exact fingerprint of a bus
+     * that was faded in the wrong place. The hits keep their own send — a card
+     * stamp and the flag chord still belong in the cutting.
+     *
+     * The boost motor lives on this bus too, which is correct: it is part of
+     * the car and it is a no-op by the time the flag falls. */
+    this.carFade = ctx.createGain();
+    this.carFade.gain.value = 1;
+    this.bus.connect(this.carFade);
+    this.carFade.connect(this.duck);
 
     /* The car and the world are separate buses, and not for tidiness. The
        reverb below is the sound of the cliff reflecting the car, which is a
@@ -294,7 +385,7 @@ export class Audio {
     this.send = ctx.createGain();
     this.send.gain.value = 0.5;
     this.send.connect(this.verb);
-    this.bus.connect(this.send);
+    this.carFade.connect(this.send);
     /* Hits go to the cliff too — arguably more than anything else does, since
        a bang is the one signal short enough for a discrete reflection to be
        heard as a reflection rather than as a thickening. */
@@ -353,7 +444,9 @@ export class Audio {
     };
   }
 
-  /** Suspend. Cheap to reverse — start() picks the same graph back up. */
+  /** Suspend the context outright, for a caller that is tearing the graph
+      down rather than pausing it — the harness between scenarios. The pause
+      menu uses `pause()`, which ducks before it freezes. */
   stop() {
     this.running = false;
     if (this.ctx && !this.offline) this.ctx.suspend().catch(() => {});
@@ -370,14 +463,21 @@ export class Audio {
    * @param {object} state see the header — every field optional
    */
   update(dt, state) {
-    if (!this.ctx || !state) return;
+    if (!this.ctx) return;
     const step = clamp(dt || 0, 1 / 480, 0.1);
 
-    /* Offline renders run on a virtual clock: currentTime does not advance
-       until startRendering(), so everything would be scheduled at zero and
-       arrive as one instantaneous smear. Live, the context's own clock is the
-       only one that stays in step with the audio thread. */
+    /* The clock moves even while paused, and this is not tidiness.
+     *
+     * Live, the pause suspends the context and `currentTime` freezes on its
+     * own, so reading it here is already correct. Offline nothing suspends —
+     * `startRendering` runs the whole graph to completion — so if the virtual
+     * clock stopped while paused, every parameter the resume wrote would be
+     * scheduled at a time the render had already passed, and the duck would
+     * never be heard. The offline clock therefore has to keep advancing
+     * through the pause, which is also what the samples say: a paused second
+     * is a second of silence, not a second that did not happen. */
     this.now = this.offline ? this.now + step : this.ctx.currentTime;
+    if (this._paused || !state) return;
     const t = this.now;
 
     const speed = Math.max(0, state.speed || 0);
@@ -478,23 +578,246 @@ export class Audio {
     }
   }
 
+  /* ---- lifecycle ---------------------------------------------------------
+   *
+   * Everything below is state the graph cannot infer from `update()`. See the
+   * header for why these are calls rather than fields on the state struct:
+   * a missing frame and a paused frame are the same thing to a scheduler, and
+   * the one-shots of an ended race are already in flight by the time the game
+   * knows the race is over.
+   */
+
+  /** The clock to schedule a one-shot against. Offline it is the virtual one;
+      live it is the context's, never behind the value `update` last saw. */
+  _t() {
+    return this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
+  }
+
+  /** True while nothing may be added to the graph — the menu is up. One-shots
+      are refused rather than queued: a chord scheduled during a pause would
+      land the moment the menu came down, which is worse than losing it. */
+  _silent() {
+    return this._paused;
+  }
+
+  /**
+   * Duck and freeze, for the pause menu.
+   *
+   * Two stages, and the order is the point. The gain goes down first, over
+   * DUCK_TAU; the context is suspended only once it has arrived, so the freeze
+   * is inaudible rather than a cut. The suspend has to be scheduled on the
+   * audio clock — a `setTimeout` would fire at wall time and could freeze the
+   * graph before the ramp had finished, which is the click this is avoiding —
+   * so it is armed here and performed by `advance()`, which the game already
+   * calls every frame (and which the game loop advances offline as well).
+   *
+   * Idempotent: a second ESC while already paused does nothing. */
+  pause() {
+    if (!this.ctx || this._paused) return;
+    this._paused = true;
+    const t = this._t();
+    if (this.pauseGain) {
+      /* One smoothed target, and no anchoring — see the class note on why a
+         `gain.value` anchor is the wrong tool here. `setTargetAtTime` starts
+         from the parameter's computed value at `t`, so a second target
+         (a re-pause during a resume, a resume during a duck) continues from
+         wherever the level actually is rather than from an intrinsic 1. */
+      this.pauseGain.gain.setTargetAtTime(DUCK_LEVEL, t, DUCK_TAU);
+      this._suspendAt = t + DUCK_SETTLE;
+    }
+    /* Cut the one-shots short rather than letting them be frozen mid-envelope:
+       a chord suspended at its peak and resumed a minute later is a note that
+       starts in the menu. The engine and surf are continuous and are brought
+       down by the duck; these are the transient layer. */
+    this._flushOneShots(t);
+  }
+
+  /**
+   * Undo `pause()`, from wherever the parameters were left.
+   *
+   * THE WHOLE REASON THIS IS NOT `start()`. A rebuild re-creates the graph and
+   * every smoothed value in it — the engine's load, the tyre's slip, the shore
+   * latch — so the first frame after a resume is a car that has forgotten what
+   * it was doing and has to approach all of it again, which is heard as a
+   * swell. Nothing here is rebuilt: the same oscillators, the same buffers, the
+   * same filters, and the two continuous gains are simply asked to go back to
+   * where they were. The car's parameters were never changed by the pause, so
+   * there is nothing to restore — the mix picks up at the phase it was frozen
+   * at.
+   *
+   * If the context did get suspended, this resumes it; a live AudioContext
+   * resumes to the same `currentTime` it was frozen at, so the ramp written
+   * below starts on a clock that has not moved. */
+  resume() {
+    if (!this.ctx || !this._paused) return;
+    if (!this.offline && this.ctx.state === 'suspended') {
+      this.ctx.resume().catch(() => {});
+    }
+    this._paused = false;
+    const t = this._t();
+    if (this.pauseGain) {
+      /* Same one-target rule as pause(): from the level the duck left it at,
+         over the same time constant. Retargeting a setTarget is a redirection
+         and not a restart, so the return is continuous by construction. The
+         cancellation only matters if a duck is still in flight; dropping the
+         pending target without an anchor is safe precisely because the new
+         one begins where the old one had got to. */
+      this.pauseGain.gain.cancelScheduledValues(t);
+      this.pauseGain.gain.setTargetAtTime(1, t, DUCK_TAU);
+    }
+    this._suspendAt = 0;
+  }
+
+  /**
+   * Advance the engine's own clock without feeding it any state.
+   *
+   * Two jobs. The pause's scheduled suspend is performed here, because it has
+   * to happen on the audio clock and there is no timers in the graph. And an
+   * offline render of a scenario that is not the car — a menu, a fade-out with
+   * no driving — needs time to pass without inventing a state struct that
+   * would overwrite the engine's smoothed values. Offline that means moving
+   * `now`; live there is nothing to move, the context clock is already running.
+   */
+  advance(dt) {
+    const step = clamp(dt || 0, 0, 0.1);
+    /* Offline the virtual clock is the only one that moves. Live, `update()`
+       is what normally refreshes `now`, and it is not being called while the
+       menu is up — so the live clock is read here, which is the whole reason
+       the suspend was deferred to this method rather than to a timer. */
+    if (this.offline) this.now += step;
+    else if (this.ctx) this.now = this.ctx.currentTime;
+    if (this._paused && this._suspendAt && this.now >= this._suspendAt) {
+      this._suspendAt = 0;
+      /* Offline there is no audio thread to freeze — `startRendering` runs the
+         whole graph to completion — so the duck is the whole of the pause
+         there, and the harness measures it in the samples. Live, this is the
+         moment the context is put down. */
+      if (!this.offline && this.ctx.state === 'running') {
+        this.ctx.suspend().catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * The car has crossed the line: engine and tyres leave, the coast stays.
+   *
+   * A fade rather than a stop, because the car is still rolling and a mix that
+   * cuts on the flag is a mix that missed the shot. Set once — `update()`
+   * re-asserts it per frame, which is idempotent — and the ambience bus is
+   * untouched, so the sea carries the ending the way it carried the descent.
+   */
+  setPhase(phase) {
+    if (phase !== 'finish' && phase !== 'race') return;
+    /* Idempotent in the strong sense: a caller that asserts the phase every
+       frame — main.js does — must not re-arm the ramp every frame, because
+       cancelScheduledValues plus a fresh setTarget each frame pins the gain at
+       wherever it had got to and the fade never completes. Only a CHANGE
+       writes anything. */
+    if (phase === this._phase) return;
+    this._phase = phase;
+    if (!this.ctx || !this.carFade) return;
+    const t = this._t();
+    this.carFade.gain.cancelScheduledValues(t);
+    this.carFade.gain.setValueAtTime(this.carFade.gain.value, t);
+    this.carFade.gain.setTargetAtTime(phase === 'finish' ? 0 : 1, t, CAR_EXIT_TAU);
+    if (phase === 'finish') this._flushOneShots(t);
+  }
+
+  /**
+   * Forget the previous race, for a restart or a new stage.
+   *
+   * The whole list, in one place, because the failure mode of a restart is not
+   * a crash — it is a second race that is subtly carrying the first, which is
+   * the same defect class the determinism gates in tools/ chase. Cleared:
+   *
+   *   - every one-shot still in flight (flag chord, card stamp, start lights,
+   *     rank notes, pad ignitions, landings and impacts), because those belong
+   *     to the run being thrown away;
+   *   - the per-race one-shot latch, so the new run can sound its own flag;
+   *   - the airborne latch, so a restart while over a crest cannot fire a
+   *     landing on the first grounded frame of the new race;
+   *   - the speed held for the no-force landing fallback;
+   *   - the car and ambience smoothed state that is a property of a race
+   *     rather than of a stage (gear, shift, slide, pan, boost, near/side);
+   *   - the shore latch, back to the stage default, so a new stage does not
+   *     start with the previous one's coastline.
+   *
+   * NOT cleared: the master volume, the limiter, the buffers, the permanent
+   * filters, and the phase — a race is a race. `resetRace` is the only caller
+   * that sets the phase back to 'race', because `setPhase('finish')` is a
+   * one-way door for the run and a new run needs it reopened. */
+  resetRace() {
+    if (!this.ctx) return;
+    const t = this._t();
+    this._phase = 'race';
+    this.carFade.gain.cancelScheduledValues(t);
+    this.carFade.gain.setValueAtTime(this.carFade.gain.value, t);
+    this.carFade.gain.setTargetAtTime(1, t, 0.05);
+    this._fired.flag = false;
+    this._fired.card = false;
+    this._airborne = false;
+    this._duck = 0;
+    this._speed = 0;
+    this._shore = { distance: 70, drop: 40, side: -1 };
+    this.engine.resetRace?.();
+    this.surface.resetRace?.();
+    this.ambience.resetRace?.();
+    this.feedback.resetRace?.(t);
+    this._flushOneShots(t);
+  }
+
+  /**
+   * For a respawn rather than a restart: the car was put back on the road
+   * mid-race, so the one-shots of the previous seconds and the motion latches
+   * are stale, but the race, the phase and the one-shot latch are not.
+   */
+  resetMotion() {
+    if (!this.ctx) return;
+    this._airborne = false;
+    this._duck = 0;
+    this._speed = 0;
+    this.engine.resetRace?.();
+    this.surface.resetRace?.();
+    this._flushOneShots();
+  }
+
+  /**
+   * Take back every per-shot voice still ringing.
+   *
+   * Permanent filters and sources stay. The sustained boost motor is not a
+   * per-shot — it is silenced by `resetRace` through the normal smoothed
+   * `boostTimer` path, which is the only way to stop it without a click.
+   *
+   * The continuous layers are NOT flushed here — this is the transient layer.
+   * The car's own state is cleared by `resetRace`, which calls this after it
+   * has cleared the smoothed gains, so the next update approaches silence from
+   * values the one-shots can no longer disagree with.
+   */
+  _flushOneShots(t) {
+    const at = t ?? this._t();
+    this.impacts?.flush?.(at);
+    this.startTones?.flush?.(at);
+    this.finishTones?.flush?.(at);
+    this.feedback?.flush?.(at);
+  }
+
   /** One-shot collision. Rate limited internally; safe to call every frame. */
   impact(strength) {
-    if (!this.ctx || !this.impacts) return;
+    if (!this.ctx || !this.impacts || this._silent()) return;
     const s = clamp(strength || 0, 0, 1);
     /* Scheduling in the past silently becomes "now" and loses the envelope's
        attack, which is the only part of an impact that carries the hit. Live,
        the clock may have moved since update() read it. */
-    const t = this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
+    const t = this._t();
     this.impacts.fire(t, s, lerp(0.6, 1, s));
   }
 
   /** One start light. `go` is the release; anything else is a count. */
   startTone(go = false) {
-    if (!this.ctx || !this.startTones) return;
+    if (!this.ctx || !this.startTones || this._silent()) return;
+    const t = this._t();
     // Same clock discipline as impact(): scheduling in the past loses the
     // attack, which on a signal this short is most of the signal.
-    const t = this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
     /* Through the same sidechain an impact uses, and for exactly the argument
        written above it: a start light competes with a full-throttle engine
        for the same spectrum, the engine is continuous and the tone is a third
@@ -514,8 +837,21 @@ export class Audio {
    * @param {boolean} win the player came first
    */
   finishTone(kind = 'flag', win = false) {
-    if (!this.ctx || !this.finishTones) return;
-    const t = this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
+    if (!this.ctx || !this.finishTones || this._silent()) return;
+    /* ONE PER RACE. Not a defensive clamp: a game that re-reads its own tone
+       edge would otherwise stack two chords on the crossing frame, and a card
+       tone that lands on a frame where the flag has not been heard is worse
+       than one that does not land at all. Latched under the kind that fired,
+       and cleared only by resetRace — a restart is a new race and earns new
+       ones. See the header. */
+    if (kind === 'card') {
+      if (this._fired.card) return;
+      this._fired.card = true;
+    } else {
+      if (this._fired.flag) return;
+      this._fired.flag = true;
+    }
+    const t = this._t();
     /* Ducked like the start lights, and shallower than either of them. By
        this point the car is braking and the bus is emptying out on its own,
        so the dip is here to stop the chord's attack fighting whatever tyre
@@ -526,9 +862,9 @@ export class Audio {
 
   /** A settled change in the player's classification. */
   positionTone(direction = 'gained') {
-    if (!this.ctx || !this.feedback
+    if (!this.ctx || !this.feedback || this._silent()
       || (direction !== 'gained' && direction !== 'lost')) return;
-    const t = this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
+    const t = this._t();
     /* Reward gets a little more room than information. Both are shallower
        than a collision: the mix acknowledges a rank, it does not flinch. */
     if (this.impacts?.onFire) this.impacts.onFire(t, direction === 'gained' ? 0.30 : 0.17);
@@ -537,8 +873,8 @@ export class Audio {
 
   /** The boost-pad ignition. The continuous motor is driven by boostTimer. */
   boostTone(rpm = 0.5) {
-    if (!this.ctx || !this.feedback) return;
-    const t = this.offline ? this.now : Math.max(this.now, this.ctx.currentTime);
+    if (!this.ctx || !this.feedback || this._silent()) return;
+    const t = this._t();
     if (this.impacts?.onFire) this.impacts.onFire(t, 0.20);
     this.feedback.boostStart(t, rpm);
   }
@@ -584,9 +920,10 @@ export class Audio {
     this.startTones.dispose();
     this.finishTones.dispose();
     this.feedback.dispose();
-    for (const n of [this.bus, this.amb, this.hits, this.duck, this.send, this.verb,
+    for (const n of [this.bus, this.carFade, this.amb, this.hits, this.duck,
+      this.send, this.verb,
       this.wet, ...this.wetNet, ...this.wetThru, ...this.wetSwap,
-      this.comp, this.limiter, this.dcBlock, this.master]) n.disconnect();
+      this.comp, this.limiter, this.dcBlock, this.master, this.pauseGain]) n.disconnect();
     if (this._ownsContext && this.ctx.close) this.ctx.close().catch(() => {});
     this.ctx = null;
     this.running = false;

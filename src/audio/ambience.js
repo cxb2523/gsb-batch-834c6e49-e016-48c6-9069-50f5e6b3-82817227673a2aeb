@@ -378,6 +378,29 @@ export class Ambience {
     };
   }
 
+  /**
+   * Forget this stage's coast, without silencing it.
+   *
+   * A new race means a new car position, and on a new stage a new coastline:
+   * the smoothed `near` and `side` carried over from the previous run are a
+   * swell that starts at the wrong level and a sea that starts on the wrong
+   * side, easing across over a second. The gull clock is reset too — a long
+   * timer inherited from the last run is a gull that does not call for half a
+   * minute on the new stage, and that is audibly a stage where the gulls are
+   * broken.
+   *
+   * The continuous gains are left alone: unlike the latched fields this
+   * object smooths, they are already at whatever the last frame asked for,
+   * and re-zeroing them here would be a step. `update()` on the next frame
+   * moves them to the new position through the same setTargetAtTime path.
+   */
+  resetRace() {
+    this.near = 0;
+    this.side = 0;
+    this.swell = 0;
+    this.gullTimer = this.rand.f(3, 9);
+  }
+
   dispose() {
     for (const s of this.sources) { try { s.stop(); } catch (_) {} }
     for (const n of this.nodes) n.disconnect();

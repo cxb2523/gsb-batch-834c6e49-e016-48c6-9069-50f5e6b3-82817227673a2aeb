@@ -29,6 +29,12 @@ export class Impacts {
     this.last = -1e9;
     this.charged = -1e9;
     this.budget = BUDGET;
+    /* Every source this class has started and not yet seen end. A landing, a
+       collision and a card stamp are all in flight for a third of a second,
+       and a race that is restarted inside that window would otherwise hear
+       the previous run's last thump under its own grid. flush() is how the
+       game says "that race is over"; see index.js. */
+    this.voices = new Set();
     const node = (n) => { this.nodes.push(n); return n; };
 
     this.out = node(ctx.createGain());
@@ -114,7 +120,7 @@ export class Impacts {
       g.connect(dest);
       src.start(t, r.f(0, this.buf.duration - dur * rate - 0.01));
       src.stop(t + dur + 0.02);
-      src.onended = () => { src.disconnect(); g.disconnect(); };
+      this._track(src, () => { src.disconnect(); g.disconnect(); });
     };
 
     const hard = lerp(0.35, 1, tone);
@@ -139,7 +145,7 @@ export class Impacts {
     og.connect(this.out);
     osc.start(t);
     osc.stop(t + 0.4);
-    osc.onended = () => { osc.disconnect(); og.disconnect(); };
+    this._track(osc, () => { osc.disconnect(); og.disconnect(); });
 
     /* Sub.
      *
@@ -170,7 +176,7 @@ export class Impacts {
       sg.connect(this.out);
       sub.start(t);
       sub.stop(t + 0.55);
-      sub.onended = () => { sub.disconnect(); sg.disconnect(); };
+      this._track(sub, () => { sub.disconnect(); sg.disconnect(); });
     }
 
     /* Suspension. Only on the dull hits, which is to say landings: springs
@@ -186,7 +192,49 @@ export class Impacts {
     }
   }
 
+  _track(src, cleanup) {
+    this.voices.add(src);
+    src.onended = () => {
+      this.voices.delete(src);
+      cleanup();
+    };
+  }
+
+  /**
+   * Stop every one-shot in flight, right now.
+   *
+   * Called when the race these sounds belonged to is over — a restart, a new
+   * stage, back to the title. The stop time is the caller's clock and NOT
+   * zero, which is a bug this had in its first draft: offline, a virtual
+   * clock starts at zero and the whole render is scheduled from frame one, so
+   * `stop(0)` on a source started at 1.0 s does not mean "stop it now" — it
+   * means the source never played, retrospectively, and a flag issued at 1.0 s
+   * measured as silence in a render made at 1.6 s. Live it happened to work
+   * because "now" is a large number. Stopping at the current time truncates
+   * what is ringing and leaves a not-yet-started source stopped from its own
+   * start, which is the same intent expressed so it survives both clocks.
+   *
+   * The per-source cleanup still runs, so a voice cut early leaks nothing.
+   */
+  flush(t = this.ctx.currentTime) {
+    for (const src of this.voices) {
+      try { src.stop(t); } catch (_) {}
+    }
+    this.voices.clear();
+    /* The rate limiter is per-race state too. Left set, a restart's first
+       landing arrives inside the previous run's MIN_GAP and is swallowed. */
+    this.last = -1e9;
+    this.charged = -1e9;
+    this.budget = BUDGET;
+  }
+
   dispose() {
+    /* Not flush(): dispose runs after the render in the offline harness, where
+       `currentTime` is the end of the buffer and a stop at that time is a
+       no-op on voices that have already ended. Tearing the graph down does not
+       need the stop at all — disconnecting the permanent nodes below is what
+       silences it — and calling flush at the render's end would only re-zero
+       per-race bookkeeping nobody reads again. */
     for (const n of this.nodes) n.disconnect();
   }
 }

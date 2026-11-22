@@ -367,6 +367,29 @@ export class EngineVoice {
       up ? f0 * 0.40 : f0 * 2.3, t + dur);
   }
 
+  /**
+   * Forget the previous run's gear and shift, without touching the tone.
+   *
+   * `gear` is the other half of the "one shift per change" latch in update():
+   * it is compared against the incoming gear to decide whether a bark fires.
+   * A restart puts the car back in first with the old run's gear still held,
+   * so without this the first frame of the new race is a gearchange that never
+   * happened — and on a stage that starts in a higher gear, a bark on the
+   * grid. Setting it to null means the first update of the new race adopts
+   * whatever gear it is given silently, which is what a car sitting still
+   * should do.
+   *
+   * The smoothed levels are left alone. They are written by setTargetAtTime
+   * from update() and a restart is one frame later, so they are already on
+   * their way to the new values; zeroing them here would step a parameter,
+   * which is the one thing this file does not do.
+   */
+  resetRace() {
+    this.gear = null;
+    this.shift = 0;
+    this.shiftDir = 1;
+  }
+
   dispose() {
     for (const s of this.sources) { try { s.stop(); } catch (_) {} }
     for (const n of this.nodes) n.disconnect();

@@ -46,6 +46,10 @@ export class StartTones {
   constructor(ctx, dest) {
     this.ctx = ctx;
     this.nodes = [];
+    /* In-flight counts and releases. A restart during the go tone — which is
+       exactly the frame a player who jumped the start would press R — has to
+       take the old release with it. */
+    this.voices = new Set();
     const node = n => { this.nodes.push(n); return n; };
 
     this.out = node(ctx.createGain());
@@ -115,14 +119,33 @@ export class StartTones {
       g.connect(this.cut);
       osc.start(t);
       osc.stop(t + dur + 0.05);
-      osc.onended = () => { osc.disconnect(); g.disconnect(); };
+      this._track(osc, () => { osc.disconnect(); g.disconnect(); });
     };
 
     voice('triangle', 1, 1, 0);
     voice('sine', 2, go ? 0.34 : 0.26, 4);
   }
 
+  _track(src, cleanup) {
+    this.voices.add(src);
+    src.onended = () => {
+      this.voices.delete(src);
+      cleanup();
+    };
+  }
+
+  /** Cut any count or release still ringing — see the header. `t` is the
+      caller's clock for the reason impact.js documents: `stop(0)` offline
+      would prevent a tone scheduled later in the render. */
+  flush(t = this.ctx.currentTime) {
+    for (const src of this.voices) {
+      try { src.stop(t); } catch (_) {}
+    }
+    this.voices.clear();
+  }
+
   dispose() {
+    this.flush();
     for (const n of this.nodes) n.disconnect();
   }
 }
