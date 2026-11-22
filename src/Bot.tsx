@@ -247,6 +247,13 @@ export function Bot({
     if (eyes.current) eyes.current.scale.y = 0.05;
   }, [expression]);
 
+  // With no costume on, nothing may keep the head in a costume's tilt. The
+  // Costume resets pose on every handoff; this covers the "No costume" path,
+  // where it unmounts entirely.
+  useEffect(() => {
+    if (costume === null) Object.assign(pose.current, restPose());
+  }, [costume, pose]);
+
   useLayoutEffect(() => {
     shellMaterial.color.set(BODY);
   }, [BODY]);

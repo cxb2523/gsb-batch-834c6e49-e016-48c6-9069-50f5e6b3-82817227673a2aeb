@@ -79,6 +79,16 @@ export class Rig {
   private p: Vec = { x: 0, y: 0, z: 0 };
   private q: Vec = { x: 0, y: 0, z: 0 };
 
+  /**
+   * Back to a stationary rig: the clock restarts at the first frame asked and
+   * every spring and timer a motion stashed in `state` is dropped, so a costume
+   * never inherits another costume's progress. Part attachments are kept.
+   */
+  reset() {
+    this.state = {};
+    this.start = -1;
+  }
+
   /** Milliseconds since the first frame this rig was asked, given the clock in seconds. */
   since(seconds: number) {
     if (this.start < 0) this.start = seconds;

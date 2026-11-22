@@ -31,3 +31,23 @@ describe("Rig.deform", () => {
     positions(geometry).forEach((value, i) => expect(value).toBeCloseTo(POSITIONS[i], 4));
   });
 });
+
+describe("Rig.reset", () => {
+  it("drops spring state and restarts the time base while keeping attachments", () => {
+    const { rig } = rigged(PARTS[0][1]);
+    expect(rig.since(30)).toBe(0);
+    expect(rig.since(30.5)).toBe(500);
+    rig.state["flick"] = 1.5;
+    rig.state["flick.v"] = 0.25;
+    rig.state["flick.t"] = 500;
+
+    rig.reset();
+
+    expect(rig.state).toEqual({});
+    // The clock starts again from the next frame asked.
+    expect(rig.since(80)).toBe(0);
+    expect(rig.since(81)).toBe(1000);
+    // Part attachments survive a reset, so the remounted groups still pose.
+    expect(rig.group("part")).toBeDefined();
+  });
+});

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { useFrame } from "@react-three/fiber";
 import { Billboard } from "@react-three/drei";
 import {
@@ -18,8 +18,9 @@ import {
 } from "three";
 import { SVGLoader } from "three/examples/jsm/loaders/SVGLoader.js";
 import { costumeLoader, type CostumeName } from "./costumes.ts";
-import { growIn, MOTIONS } from "./costume-motion.ts";
 import { Flame, type FlameKind } from "./Flame.tsx";
+import { CostumeSession } from "./costume-handoff.ts";
+import { fireLight } from "./fire-light.ts";
 import { Rig, restPose, type Pose } from "./costume-rig.ts";
 import type { CostumeData } from "./costume-shapes.ts";
 
@@ -205,31 +206,40 @@ export function Costume({
     [built],
   );
 
+  // A fresh rig per costume: its clock and spring storage are born empty, and
+  // the handoff below resets them again explicitly so nothing carries over.
   const rig = useMemo(() => {
     const rig = new Rig();
     for (const [part, info] of Object.entries(current?.parts ?? {})) rig.define(part, info);
     return rig;
   }, [current]);
 
-  useEffect(() => () => void Object.assign(pose.current, restPose()), [pose, rig]);
-
   const root = useRef<ThreeGroup>(null);
-  const posed = useRef<Rig | null>(null);
+  const session = useRef<CostumeSession | null>(null);
 
-  useFrame(({ clock }) => {
-    if (!current) return;
-    if (reducedMotion) {
-      // Some parts (antennae, legs, a handle) only exist once their motion
-      // builds them: pose them once, as at t = 0, and hold still.
-      if (posed.current === rig) return;
-      posed.current = rig;
-      MOTIONS[name]?.(0, rig);
+  // The atomic handoff. Layout effects run before the next frame is drawn and
+  // before the newly mounted Flame measures this group, so the rig, pose,
+  // light and scale all start the new costume from rest in the same commit.
+  useLayoutEffect(() => {
+    // Clear whatever the previous costume left before anything else this commit.
+    Object.assign(pose.current, restPose());
+    fireLight.intensity = 0;
+    if (!current) {
+      // The next costume is still loading: leave the stage empty and dark.
+      session.current = null;
       return;
     }
-    const t = rig.since(clock.elapsedTime);
-    root.current?.scale.setScalar(Math.max(1e-3, growIn(t)));
-    const head = MOTIONS[name]?.(t, rig);
-    Object.assign(pose.current, restPose(), head);
+    session.current = CostumeSession.handoff(name, rig, pose.current, fireLight);
+    // Start collapsed: the first frame's growIn writes the matching tiny scale
+    // before any flame can measure a full-size one.
+    root.current?.scale.setScalar(1e-3);
+  }, [current, name, rig, pose]);
+
+  useFrame(({ clock }) => {
+    const active = session.current;
+    if (!current || !active || active.name !== name) return;
+    const { scale } = active.frame(clock.elapsedTime, reducedMotion);
+    root.current?.scale.setScalar(scale);
   });
 
   const meshes = (part?: string) => (
